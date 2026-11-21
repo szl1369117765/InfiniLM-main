@@ -51,7 +51,8 @@ class _ScratchCommit:
 class _TargetTransaction:
     def __init__(self, transport, batch, tables, tokens, verify_hidden=None,
                  proposal_laws=(), logits=None, *, omit_terminal=False, early_rejection=False,
-                 scratch_commit=None, batch_draft_seed=False, k1_graph_seed=False):
+                 scratch_commit=None, batch_draft_seed=False, k1_graph_seed=False,
+                 graph_k3_draft_seed=False):
         self.transport = transport
         self.batch = batch
         self.tables = tables
@@ -69,6 +70,7 @@ class _TargetTransaction:
         self.scratch_commit = scratch_commit
         self.batch_draft_seed = batch_draft_seed
         self.k1_graph_seed = k1_graph_seed
+        self.graph_k3_draft_seed = graph_k3_draft_seed
         self._resolved = None
         self.committed = False
 
@@ -253,9 +255,12 @@ class _TargetTransaction:
             # The first Draft row used the previous Target hidden state.
             # Rebuild each subsequent retained row from the committed Target state.
             if self._seed_next_anchor(intent, count, begin):
+                # Direct verify carries HC for the entire speculative span.
+                seed_input_hc = _slice_hidden(hidden, 0, count) if self.graph_k3_draft_seed else hidden
                 (token,), draft_hidden = self.transport._forward(
                     self.transport.draft, (*tokens[1:], intent.next_anchor), start, table,
-                    draft_hidden=hidden, sample_all_positions=False, return_hidden=not self.k1_graph_seed,
+                    draft_hidden=seed_input_hc, sample_all_positions=False, return_hidden=not self.k1_graph_seed,
+                    **({"graph_draft_seed": True} if self.graph_k3_draft_seed else {}),
                 )
                 page_count = (intent.retain_length - 1) // self.transport.page_size + 1
                 seed_hidden = () if self.k1_graph_seed else _slice_hidden(draft_hidden, count - 1, 1)
@@ -299,7 +304,7 @@ class _TargetTransaction:
 
     def _seed_next_anchor(self, intent, count, begin):
         """Fuse only when a retained suffix and another proposal both exist."""
-        if count < 2 or not (self.transport.reuse_seed or self.k1_graph_seed):
+        if count < 2 or not (self.transport.reuse_seed or self.k1_graph_seed or self.graph_k3_draft_seed):
             return False
         index = self.batch.input_offsets.index(begin)
         if self.proposal_laws and self.proposal_laws[index] is not None:
@@ -321,7 +326,8 @@ class _V4Transport:
                  batched_draft=False, last_logits=False, k1_graph_seed=False,
                  batched_target_replay=False, batched_draft_repair=False,
                  graph_packed_direct_available=False, graph_single_direct_available=False,
-                 graph_prefill_last_logits=False, graph_prefill_draft_cache_only=False):
+                 graph_prefill_last_logits=False, graph_prefill_draft_cache_only=False,
+                 graph_k3_draft_seed=False):
         self.target = target
         self.draft = draft
         self.core = core
@@ -330,6 +336,7 @@ class _V4Transport:
         self.direct_k23_commit = direct_k23_commit
         self.graph_prefill_last_logits = graph_prefill_last_logits
         self.graph_prefill_draft_cache_only = graph_prefill_draft_cache_only
+        self.graph_k3_draft_seed = graph_k3_draft_seed
         self.reuse_seed = reuse_seed
         self.draft_cache_only = draft_cache_only
         self.terminal_tail_trim = terminal_tail_trim
@@ -393,16 +400,22 @@ class _V4Transport:
 
     def _forward(self, engine, tokens, start, table, *, draft_hidden=None,
                  return_hidden=True, rollback=False, sample_all_positions=True,
-                 return_logits=False, cache_only=False, graph_fresh_prefill=False):
+                 return_logits=False, cache_only=False, graph_fresh_prefill=False,
+                 graph_draft_seed=False):
         if cache_only and (
             engine is not self.draft or not draft_hidden or return_hidden or rollback or return_logits
         ):
             raise ValueError("Classic NextN cache-only is limited to an output-free Draft cache write")
         end = start + len(tokens)
+        if graph_draft_seed:
+            # The reservation also holds pages written by rejected proposals.
+            # Only the retained span and its correction are visible to Draft.
+            table = table[:(end - 1) // self.page_size + 1]
         slots = self._slots(table, start, end)
         core = self.core
         last_logits = (
-            self.last_logits and engine is self.draft and draft_hidden and len(tokens) > 1
+            self.last_logits and not graph_draft_seed
+            and engine is self.draft and draft_hidden and len(tokens) > 1
             and return_hidden and not sample_all_positions and not return_logits and not rollback and not cache_only
         )
         result = engine.forward_raw(
@@ -422,9 +435,21 @@ class _V4Transport:
             **({"mtp_draft_cache_only": True} if cache_only else {}),
             **({"mtp_last_logits": True} if last_logits else {}),
             **({"mtp_graph_fresh_prefill": True} if graph_fresh_prefill else {}),
+            **({"mtp_graph_draft_seed": True} if graph_draft_seed else {}),
             **self._host_metadata_options(),
         )
-        if last_logits and result.get("mtp_last_logits_used") is not True:
+        if graph_draft_seed:
+            report = result.get("execution_report") or {}
+            segments = report.get("device_graph_segments")
+            hidden = result.get("hidden_states_by_rank")
+            if type(segments) is not int or segments <= 0:
+                raise RuntimeError("Classic NextN Graph Draft seed did not complete a device Graph")
+            if not hidden or len(hidden) != len(draft_hidden) or any(
+                tensor is None or len(tensor.shape) != 3 or tensor.shape[0] != len(tokens)
+                for tensor in hidden
+            ):
+                raise RuntimeError("Classic NextN Graph Draft seed did not return every rank's span HC")
+        if (last_logits or graph_draft_seed) and result.get("mtp_last_logits_used") is not True:
             raise RuntimeError("Classic NextN Draft seed did not select the last logits row")
         if cache_only:
             if result.get("mtp_draft_cache_only_used") is not True or any(
@@ -757,6 +782,7 @@ class _V4Transport:
             k1_graph_seed=self.k1_graph_seed and not stochastic and all(
                 len(request.draft_tokens) == 1 for request in batch.requests
             ),
+            graph_k3_draft_seed=self.graph_k3_draft_seed and len(tables) == 1 and direct_tables is not None,
         )
         with self._publishing(transaction):
             yield transaction
@@ -1017,6 +1043,16 @@ def _graph_k3_prefill_modes(config, engine_type):
     return last_logits, cache_only
 
 
+def _graph_k3_draft_seed_enabled(config, graph_direct, engine_type):
+    if os.environ.get("INFINILM_MTP_GRAPH_K3_DRAFT_SEED") != "1" or not graph_direct:
+        return False
+    if config.pipeline_parallel_size != 1 or config.nextn_branch_execution != "serial":
+        return False
+    if getattr(engine_type, "mtp_graph_draft_seed_version", 0) != 1:
+        raise RuntimeError("Classic NextN Graph Draft seed requires native owned Draft HC")
+    return True
+
+
 def create_deepseek_v4_mtp_transport(config, target_engine, device):
     from infinilm import _core
     from infinilm.cache import PagedKVCacheConfig
@@ -1047,6 +1083,9 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         and config.block_size == 256 and config.nextn_branch_draft_lengths is None
         and getattr(target_engine, "mtp_graph_packed_direct_commit_version", 0) == 1
         and getattr(target_engine, "deepseek_v4_raw_ring_rows", None) == (16, 256)
+    )
+    graph_k3_draft_seed = _graph_k3_draft_seed_enabled(
+        config, graph_direct_available and config.max_batch_size == 1, InferEngine,
     )
     draft_cache_only = _draft_cache_only_enabled(config, InferEngine)
     batched_draft = _batched_draft_enabled(config)
@@ -1104,13 +1143,14 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         "draft_seed=%s draft_cache_only=%s batched_draft=%s k1_graph_seed=%s last_logits=%s terminal_tail_trim=%s "
         "cpu_metadata_shadow=%s shared_compression_plan=%s stepwise_direct_commit=%s "
         "batched_target_replay=%s batched_draft_repair=%s "
-        "graph_prefill_last_logits=%s graph_prefill_draft_cache_only=%s",
+        "graph_prefill_last_logits=%s graph_prefill_draft_cache_only=%s graph_k3_draft_seed=%s",
         config.num_draft_tokens, config.enable_graph, config.nextn_branch_draft_lengths,
         config.nextn_branch_execution, direct_k1_commit, direct_k23_commit, reuse_seed,
         draft_cache_only, batched_draft, k1_graph_seed, last_logits, terminal_tail_trim,
         cpu_metadata_shadow or shared_compression_plan,
         shared_compression_plan, stepwise_direct_commit, batched_target_replay, batched_draft_repair,
         graph_prefill_last_logits, graph_prefill_draft_cache_only,
+        graph_k3_draft_seed,
     )
     return _V4Transport(
         target_engine, draft, _core, config.block_size,
@@ -1125,4 +1165,5 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         graph_single_direct_available=graph_direct_available and config.max_batch_size == 1,
         graph_prefill_last_logits=graph_prefill_last_logits,
         graph_prefill_draft_cache_only=graph_prefill_draft_cache_only,
+        graph_k3_draft_seed=graph_k3_draft_seed,
     )

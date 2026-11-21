@@ -542,6 +542,7 @@ InferEngine::Input::to_model_input(
     input.mtp_scratch_step = mtp_scratch_step;
     input.mtp_last_logits = mtp_last_logits;
     input.mtp_graph_direct_commit = mtp_graph_direct_commit;
+    input.mtp_graph_draft_seed = mtp_graph_draft_seed;
 
     auto &attn_metadata = forward_context.attn_metadata;
     attn_metadata = {
@@ -672,7 +673,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             || input.return_draft_hidden_states != input.mtp_last_logits
             || input.sample_all_positions != input.mtp_draft_cache_only
             || input.target_hidden_states || input.rollback_v4_cache || input.mtp_scratch_step
-            || input.mtp_graph_direct_commit
+            || input.mtp_graph_direct_commit || input.mtp_graph_draft_seed
             || input.mtp_cpu_metadata_shadow || input.mtp_shared_compression_plan
             || input.top_k != 1 || input.random_values || input.sampling_rows) {
             throw std::invalid_argument("Classic NextN Graph prefill requires a fresh greedy Target or Draft");
@@ -708,7 +709,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             }
         }
     }
-    bool last_logits_expected = false;
+    bool last_logits_expected = input.mtp_graph_draft_seed;
     if (input.mtp_last_logits) {
         using namespace infinilm::runtime;
         const auto type = model_config_->get<std::string>("model_type");
@@ -843,6 +844,23 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             }
         }
     }
+    if (input.mtp_graph_draft_seed) {
+        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+        const auto &dist = communication_group_.get_dist_config();
+        const auto *enabled = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED");
+        if (!enabled || std::string_view(enabled) != "1" || !enable_graph_compiling_
+            || model_config_->get<std::string>("model_type") != "deepseek_v4_mtp"
+            || nsa_pool_epoch_ || dist.pp_size != 1 || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1
+            || !paged || paged->max_batch_size() != 1 || paged->block_size() != models::deepseek_v4::kV4PageSize
+            || !rank_hidden || input.target_hidden_states || !input.return_draft_hidden_states
+            || input.sample_all_positions || input.top_k != 1 || input.sampling_rows || input.random_values
+            || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_last_logits
+            || input.mtp_graph_direct_commit || input.mtp_draft_cache_only || input.mtp_graph_fresh_prefill
+            || input.mtp_cpu_metadata_shadow || input.mtp_shared_compression_plan) {
+            throw std::invalid_argument("Classic NextN Graph Draft seed requires one TP8 greedy Draft owner and per-rank HC");
+        }
+        validate_packed_direct_metadata(input, *paged, model_config_->get<size_t>("vocab_size"), 1);
+    }
     if (rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
         const auto type = model_config_->get<std::string>("model_type");
         if ((type != "deepseek_v4" && type != "deepseek_v4_mtp")
@@ -903,8 +921,9 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     };
     output.output_ids = completed_view(output.output_ids);
     output.logits = completed_view(output.logits);
-    const bool owns_graph_hc =
-        (input.mtp_scratch_step || input.mtp_graph_direct_commit) && input.return_draft_hidden_states;
+    const bool explicit_graph_hc = input.mtp_graph_direct_commit || input.mtp_graph_draft_seed;
+    const bool owns_graph_hc = (input.mtp_scratch_step || explicit_graph_hc)
+        && input.return_draft_hidden_states;
     if (!owns_graph_hc) {
         output.hidden_states = completed_view(output.hidden_states);
     }
@@ -915,11 +934,15 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         for (const auto &worker : workers_) {
             auto rank_output = worker->get_output();
+            if (input.mtp_graph_draft_seed &&
+                (!rank_output.graph_execution || rank_output.graph_execution->device_graph_segments == 0)) {
+                throw std::runtime_error("Classic NextN Draft seed did not run a device Graph on every rank");
+            }
             auto hidden = std::move(rank_output.hidden_states);
             if (!hidden) {
                 throw std::runtime_error("V4 MTP did not return hidden states on every rank");
             }
-            if (input.mtp_last_logits
+            if ((input.mtp_last_logits || input.mtp_graph_draft_seed)
                 && (rank_output.mtp_last_logits_used != last_logits_expected
                     || hidden->ndim() != 3 || hidden->size(0) != (*input.input_ids)->numel())) {
                 throw std::runtime_error("Classic NextN last logits receipt or HC rows differ across ranks");

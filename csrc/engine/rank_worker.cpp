@@ -831,7 +831,7 @@ void RankWorker::thread_loop() {
                         // positions. Draft prefill/repair still request all rows.
                         const bool mtp_graph_candidate = graph_enabled && !local_args.mtp_draft_cache_only &&
                             (local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
-                            local_args.mtp_graph_direct_commit ||
+                            local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed ||
                             (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions &&
                              !local_args.return_draft_hidden_states));
                         std::shared_ptr<const nsa::Proof> nsa_proof;
@@ -1145,7 +1145,11 @@ void RankWorker::thread_loop() {
                                 if (model_sampled_ids) {
                                     // Preserve the legacy RNG sequence across greedy and stochastic requests.
                                     if (!local_args.random_values) {
-                                        (void)std::uniform_real_distribution<float>(0, 1)(rng_);
+                                        const auto draws = local_args.mtp_graph_draft_seed
+                                            ? local_args.input_ids.value()->numel() : 1;
+                                        for (size_t i = 0; i < draws; ++i) {
+                                            (void)std::uniform_real_distribution<float>(0, 1)(rng_);
+                                        }
                                     }
                                 } else if (batch_greedy) {
                                     float random_val = 0.0f;
@@ -1207,11 +1211,9 @@ void RankWorker::thread_loop() {
                             }
                             if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
                                 runtime_->syncStream();
-                                if (!local_args.mtp_graph_direct_commit) {
-                                    graph_execution.reset();
-                                }
+                                const bool return_graph = local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed;
                                 output_ = Output{{}, {}, std::move(hidden_states),
-                                                 std::move(graph_execution), eager_reason};
+                                                 return_graph ? std::move(graph_execution) : std::nullopt, eager_reason};
                                 output_.mtp_last_logits_used = last_logits_used;
                             } else if (local_args.mtp_scratch_step && rank_info_.tp_rank != 0) {
                                 // Scratch is reused or released after this packed step.

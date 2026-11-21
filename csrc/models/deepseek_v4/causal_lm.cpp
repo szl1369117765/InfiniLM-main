@@ -599,6 +599,9 @@ public:
             input.return_draft_hidden_states && !input.rollback_v4_cache;
         const bool short_target = !cfg_.is_mtp && !hc &&
             (input.mtp_scratch_step || direct_hc || (input.rollback_v4_cache && short_verify));
+        const bool draft_seed_graph = input.mtp_graph_draft_seed && cfg_.is_mtp && hc &&
+            input.return_draft_hidden_states && !input.sample_all_positions && !input.rollback_v4_cache &&
+            batch.query_offsets.size() == 2 && short_verify;
         // The K1 proposal already wrote its anchor. Repair and the next seed
         // form one two-row Draft span with only the last prediction sampled.
         const bool short_draft = cfg_.is_mtp && hc && !input.rollback_v4_cache &&
@@ -607,16 +610,19 @@ public:
                                   batch.query_offsets.front() == 0 && batch.query_offsets.back() == 2));
         const bool scratch_hc = input.mtp_scratch_step && input.return_draft_hidden_states &&
             short_target && !input.rollback_v4_cache;
-        const bool owned_hc = scratch_hc || direct_hc;
+        const bool owned_hc = scratch_hc || direct_hc || draft_seed_graph;
         // Eligibility must agree across ranks before any capture or collective.
         const bool capture_mtp = mtp_graph_barrier && mtp_graph_barrier->all(
-            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft));
+            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph));
         // Both arms share the same immutable routes. No multi-row Fill is recorded.
         batch.packed_shared_constants = capture_mtp && packed_target &&
             (input.rollback_v4_cache || direct_hc) &&
             packed_shared_constants_prepared_ && packed_shared_constants_enabled();
         if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
             throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
+        }
+        if (input.mtp_graph_draft_seed && !capture_mtp) {
+            throw std::runtime_error("Classic NextN Graph Draft seed requires a device Graph with owned Draft HC");
         }
         if (input.rollback_v4_cache) {
             if (!ctx.mtp_snapshot_barrier)
@@ -639,7 +645,7 @@ public:
                 table_width <= kC4IndexMaxUnscoredPages &&
                 env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
-                          false, hc, true, owned_hc, direct_hc);
+                          draft_seed_graph, hc, true, owned_hc, direct_hc, draft_seed_graph);
         }
         return forward_logits(rt,ids,batch,hc,input.return_draft_hidden_states,input.mtp_last_logits);
     }
@@ -665,6 +671,7 @@ public:
         cache::validate_backend_cache_config(requested,backend);
         decode_plans_ = {};
         mtp_decode_plans_ = {};
+        draft_seed_decode_plans_ = {};
         snapshot_backup_.reset();
         if (!requested) {
             caches_.clear();
@@ -739,8 +746,9 @@ private:
 
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
                   bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
-                  bool return_hc = false, bool packed_direct = false) const {
-        auto &plans = classic_mtp ? mtp_decode_plans_ : decode_plans_;
+                  bool return_hc = false, bool packed_direct = false, bool draft_seed_graph = false) const {
+        auto &plans = draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
+            : (classic_mtp ? mtp_decode_plans_ : decode_plans_);
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
@@ -820,7 +828,7 @@ private:
             rt.startGraphRecording(true);
             try {
                 auto recorded = forward_logits(
-                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc);
+                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph);
                 candidate.logits = std::move(recorded.logits);
                 candidate.hidden_states = std::move(recorded.hidden_states);
                 if (greedy && sampling_rank_) {
@@ -851,8 +859,9 @@ private:
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
-        return {recent->logits, std::move(hidden_states), std::move(report),
-                recent->sampled_ids};
+        Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
+        output.mtp_last_logits_used = draft_seed_graph;
+        return output;
     }
 
     V4Config cfg_;
@@ -872,6 +881,8 @@ private:
     // The two most recent shapes cover both sides of adjacent page boundaries.
     mutable std::array<std::optional<DecodePlan>, 2> decode_plans_;
     mutable std::array<std::optional<DecodePlan>, 2> mtp_decode_plans_;
+    // q2, q3 and q4 repair plans do not evict the proposal plans or one another.
+    mutable std::array<std::array<std::optional<DecodePlan>, 2>, 3> draft_seed_decode_plans_;
 };
 
 } // namespace
