@@ -952,9 +952,18 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
     direct_k23_commit = _direct_k23_commit_enabled(config, target_engine)
     draft_cache_only = _draft_cache_only_enabled(config, InferEngine)
     batched_draft = _batched_draft_enabled(config)
+    # The protected verify still rolls back in Graph mode. Only the subsequent
+    # materialization of its retained rows is batched, using the eager HC path.
+    if config.enable_graph:
+        replay_requested = (
+            os.getenv("INFINILM_MTP_GRAPH_BATCHED_TARGET_REPLAY") == "1"
+            and config.num_draft_tokens == 3
+            and not graph_direct_k3_commit
+        )
+    else:
+        replay_requested = os.getenv("INFINILM_MTP_BATCHED_TARGET_REPLAY") == "1"
     batched_target_replay = (
-        os.environ.get("INFINILM_MTP_BATCHED_TARGET_REPLAY") == "1"
-        and not config.enable_graph and config.max_batch_size in (2, 3)
+        replay_requested and config.max_batch_size in (2, 3)
         and config.nextn_branch_draft_lengths is None
     )
     k1_graph_seed = _k1_graph_seed_enabled(config, InferEngine)
