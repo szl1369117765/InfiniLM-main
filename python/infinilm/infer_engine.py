@@ -371,6 +371,7 @@ class InferEngine(_infinilm.InferEngine):
         mtp_scratch_step=False,
         mtp_last_logits=False,
         mtp_graph_direct_commit=False,
+        mtp_graph_fresh_prefill=False,
     ):
         def unwrap_tensor(tensor):
             return (
@@ -451,6 +452,12 @@ class InferEngine(_infinilm.InferEngine):
             if getattr(self, "mtp_last_logits_version", 0) != 1:
                 raise RuntimeError("Classic NextN last logits require native head selection support")
             mtp_arguments["mtp_last_logits"] = True
+        if mtp_graph_fresh_prefill is not False:
+            if mtp_graph_fresh_prefill is not True:
+                raise ValueError("mtp_graph_fresh_prefill must be a bool")
+            if getattr(self, "mtp_graph_fresh_prefill_version", 0) != 1:
+                raise RuntimeError("Classic NextN Graph prefill requires native support")
+            mtp_arguments["mtp_graph_fresh_prefill"] = True
 
         return super().Input(
             input_ids,
@@ -620,6 +627,7 @@ class InferEngine(_infinilm.InferEngine):
         mtp_scratch_step=False,
         mtp_last_logits=False,
         mtp_graph_direct_commit=False,
+        mtp_graph_fresh_prefill=False,
     ):
         try:
             output = super().forward(
@@ -652,6 +660,7 @@ class InferEngine(_infinilm.InferEngine):
                     mtp_scratch_step=mtp_scratch_step,
                     mtp_last_logits=mtp_last_logits,
                     mtp_graph_direct_commit=mtp_graph_direct_commit,
+                    mtp_graph_fresh_prefill=mtp_graph_fresh_prefill,
                 )
             )
             metadata_evidence = {}

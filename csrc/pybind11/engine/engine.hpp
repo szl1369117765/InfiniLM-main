@@ -78,6 +78,7 @@ inline void bind_infer_engine(py::module &m) {
     infer_engine.attr("mtp_scratch_hc_version") = 1;
     infer_engine.attr("mtp_last_logits_version") = 1;
     infer_engine.attr("mtp_k1_graph_seed_version") = 1;
+    infer_engine.attr("mtp_graph_fresh_prefill_version") = 1;
 
     infer_engine
         .def(py::init([](
@@ -254,6 +255,7 @@ inline void bind_infer_engine(py::module &m) {
                     "mtp_scratch_step",
                     "mtp_last_logits",
                     "mtp_graph_direct_commit",
+                    "mtp_graph_fresh_prefill",
                 };
 
                 for (auto &item : kwargs) {
@@ -311,6 +313,11 @@ inline void bind_infer_engine(py::module &m) {
                             throw py::value_error("mtp_graph_direct_commit must be a bool");
                         }
                         input.mtp_graph_direct_commit = py::cast<bool>(item.second);
+                    } else if (key == "mtp_graph_fresh_prefill") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_graph_fresh_prefill must be a bool");
+                        }
+                        input.mtp_graph_fresh_prefill = py::cast<bool>(item.second);
                     } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);

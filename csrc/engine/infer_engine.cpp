@@ -655,13 +655,66 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         validate_packed_direct_metadata(input, *paged, model_config_->get<size_t>("vocab_size"), owners);
     }
+    using namespace infinilm::runtime;
+    const auto cpu_vector = [](const std::optional<Tensor> &value, DataType type) {
+        return value && *value && (*value)->device().type() == Device::Type::kCpu
+            && (*value)->dtype() == type && (*value)->is_contiguous() && (*value)->ndim() == 1;
+    };
+    if (input.mtp_graph_fresh_prefill) {
+        // Graph-enabled engines still run this prefill eagerly. Permit only the
+        // initial Target head selection or the initial output-free Draft write.
+        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+        if (!enable_graph_compiling_ || communication_group_.get_dist_config().pp_size != 1
+            || !paged || paged->max_batch_size() != 1
+            || (input.mtp_last_logits && !classic_mtp_target_)
+            || input.mtp_last_logits == input.mtp_draft_cache_only
+            || input.mtp_last_logits == rank_hidden.has_value()
+            || input.return_draft_hidden_states != input.mtp_last_logits
+            || input.sample_all_positions != input.mtp_draft_cache_only
+            || input.target_hidden_states || input.rollback_v4_cache || input.mtp_scratch_step
+            || input.mtp_graph_direct_commit
+            || input.mtp_cpu_metadata_shadow || input.mtp_shared_compression_plan
+            || input.top_k != 1 || input.random_values || input.sampling_rows) {
+            throw std::invalid_argument("Classic NextN Graph prefill requires a fresh greedy Target or Draft");
+        }
+        const auto &ids = input.input_ids;
+        const auto &offsets = input.input_offsets;
+        const auto &past = input.past_sequence_lengths;
+        const auto &total = input.total_sequence_lengths;
+        const auto &positions = input.position_ids;
+        const bool positions_i64 = cpu_vector(positions, DataType::kInt64);
+        if (!ids || !*ids || (*ids)->ndim() != 2 || (*ids)->size(0) != 1
+            || !cpu_vector(offsets, DataType::kInt32) || (*offsets)->numel() != 2
+            || !cpu_vector(past, DataType::kInt32) || (*past)->numel() != 1
+            || !cpu_vector(total, DataType::kInt32) || (*total)->numel() != 1
+            || (!positions_i64 && !cpu_vector(positions, DataType::kInt32))
+            || (*positions)->numel() != (*ids)->numel()) {
+            throw std::invalid_argument("Classic NextN Graph prefill requires one packed span and CPU metadata");
+        }
+        const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
+        const auto past_rows = *reinterpret_cast<const int32_t *>((*past)->data());
+        const auto total_rows = *reinterpret_cast<const int32_t *>((*total)->data());
+        if (bounds[0] != 0 || bounds[1] <= (input.mtp_last_logits ? 1 : 0)
+            || static_cast<size_t>(bounds[1]) != (*ids)->numel() || past_rows != 0
+            || total_rows != bounds[1]) {
+            throw std::invalid_argument("Classic NextN Graph prefill requires a nonempty zero-past span");
+        }
+        for (int32_t row = 0; row < bounds[1]; ++row) {
+            const auto position = positions_i64
+                ? reinterpret_cast<const int64_t *>((*positions)->data())[row]
+                : reinterpret_cast<const int32_t *>((*positions)->data())[row];
+            if (position != row) {
+                throw std::invalid_argument("Classic NextN Graph prefill positions must begin at zero and be contiguous");
+            }
+        }
+    }
     bool last_logits_expected = false;
     if (input.mtp_last_logits) {
         using namespace infinilm::runtime;
         const auto type = model_config_->get<std::string>("model_type");
         const bool target = type == "deepseek_v4" && !rank_hidden;
         const bool draft = type == "deepseek_v4_mtp" && rank_hidden.has_value();
-        if ((!target && !draft) || enable_graph_compiling_
+        if ((!target && !draft) || (enable_graph_compiling_ && !input.mtp_graph_fresh_prefill)
             || communication_group_.get_dist_config().pp_size != 1
             || input.target_hidden_states || !input.return_draft_hidden_states
             || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_draft_cache_only
@@ -670,10 +723,6 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             throw std::invalid_argument(
                 "Classic NextN last logits require eager greedy Target prefill or Draft repair with full returned HC");
         }
-        const auto cpu_vector = [](const std::optional<Tensor> &value, DataType type) {
-            return value && *value && (*value)->device().type() == Device::Type::kCpu
-                && (*value)->dtype() == type && (*value)->is_contiguous() && (*value)->ndim() == 1;
-        };
         const auto &ids = input.input_ids;
         const auto &offsets = input.input_offsets;
         const auto &past = input.past_sequence_lengths;
@@ -711,7 +760,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
     if (input.mtp_draft_cache_only) {
         if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp" ||
-            communication_group_.get_dist_config().pp_size != 1 || enable_graph_compiling_ ||
+            communication_group_.get_dist_config().pp_size != 1 ||
+            (enable_graph_compiling_ && !input.mtp_graph_fresh_prefill) ||
             !rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
             throw std::invalid_argument("Classic NextN cache-only requires an eager Draft with rank-local input HC and no outputs");
         }
