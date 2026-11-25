@@ -860,8 +860,11 @@ void RankWorker::thread_loop() {
                                 }
                             }
                             size_t logical_kv_upper_bound = 0;
-                            if (local_v4_host_batch && (finite_paged_decode_profile_ || graph_enabled)) {
-                                throw std::logic_error("V4 host batch cannot use Graph or worker-side page-table rewriting");
+                            if (local_v4_host_batch &&
+                                (finite_paged_decode_profile_ ||
+                                 (graph_enabled && (!local_args.mtp_graph_direct_commit ||
+                                                    !local_v4_host_batch->plans())))) {
+                                throw std::logic_error("V4 host batch requires a validated direct Graph or eager metadata");
                             }
                             if (finite_paged_decode_profile_
                                 && !local_args.sample_all_positions

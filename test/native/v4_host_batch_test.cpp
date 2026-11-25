@@ -115,6 +115,38 @@ void compare_short_query(size_t query, bool classic_mtp_target) {
         DeepSeekV4HostBatch::prepare_short(pos, off, table, loc, query, 4, true);
     });
 }
+
+void compare_packed_target() {
+    constexpr size_t rows = 9;
+    int64_t positions[rows];
+    int64_t slots[rows];
+    int32_t offsets[] = {0, 2, 5, 9};
+    int32_t pages[] = {3, 1, 5, 7, 8, 2};
+    for (size_t owner = 0; owner < 3; ++owner) {
+        for (auto row = offsets[owner]; row < offsets[owner + 1]; ++row) {
+            const size_t position = page_size - 1 + row - offsets[owner];
+            positions[row] = position;
+            slots[row] = pages[owner * 2 + position / page_size] * page_size + position % page_size;
+        }
+    }
+    const auto pos = Tensor::from_blob(positions, {rows}, DataType::kInt64, cpu);
+    const auto loc = Tensor::from_blob(slots, {rows}, DataType::kInt64, cpu);
+    const auto off = Tensor::from_blob(offsets, {4}, DataType::kInt32, cpu);
+    const auto table = Tensor::from_blob(pages, {3, 2}, DataType::kInt32, cpu);
+    const auto shared = DeepSeekV4HostBatch::prepare_short(pos, off, table, loc, rows, 9, true, true);
+    require(shared && shared->plans(), "packed Target lost its shared plan");
+    const auto reference = build_deepseek_v4_attention_metadata(table, loc, pos, off, std::nullopt, page_size, true);
+    const auto c4 = build_deepseek_v4_compression_plan(reference, pos, off, 4);
+    const auto c128 = build_deepseek_v4_compression_plan(reference, pos, off, 128);
+    const auto &plans = *shared->plans();
+    same(plans.attention.raw_out_loc, reference.raw_out_loc);
+    same(plans.attention.c4_out_loc, reference.c4_out_loc);
+    same(plans.attention.c128_out_loc, reference.c128_out_loc);
+    same(plans.c4.sources, c4.sources);
+    same(plans.c4.state_slots, c4.state_slots);
+    same(plans.c128.sources, c128.sources);
+    same(plans.c128.state_slots, c128.state_slots);
+}
 } // namespace
 
 int main() {
@@ -123,6 +155,7 @@ int main() {
             compare_short_query(query, false);
             compare_short_query(query, true);
         }
+        compare_packed_target();
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

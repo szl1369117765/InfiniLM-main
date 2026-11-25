@@ -579,22 +579,27 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
     std::shared_ptr<const DeepSeekV4HostBatch> v4_host_batch;
     std::optional<Input> frozen_dispatch;
-    if ((original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan)
-        && !enable_graph_compiling_ && communication_group_.get_dist_config().pp_size == 1
+    const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+    const auto *direct_plan = std::getenv("INFINILM_MTP_GRAPH_C3_SHARED_TARGET_PLAN");
+    // This native-only path freezes the exact tensors used by the direct-write admission below.
+    const bool direct_host_plan = original.mtp_graph_direct_commit && enable_graph_compiling_
+        && paged && paged->max_batch_size() == 3 && direct_plan && std::string_view(direct_plan) == "1";
+    const bool eager_host_batch = !enable_graph_compiling_
+        && (original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan);
+    if ((direct_host_plan || eager_host_batch) && communication_group_.get_dist_config().pp_size == 1
         && original.input_ids && *original.input_ids && (*original.input_ids)->ndim() == 2
         && (*original.input_ids)->size(0) == 1) {
         const auto type = model_config_->get<std::string>("model_type");
         const bool classic = (type == "deepseek_v4" &&
                               (original.return_draft_hidden_states || original.rollback_v4_cache))
             || (type == "deepseek_v4_mtp" && original.target_hidden_states_by_rank);
-        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
         if (classic && paged && paged->block_size() == models::deepseek_v4::kV4PageSize
             && original.position_ids && original.input_offsets &&
             original.block_tables && original.slot_mapping) {
             v4_host_batch = DeepSeekV4HostBatch::prepare_short(
                 *original.position_ids, *original.input_offsets, *original.block_tables,
                 *original.slot_mapping, (*original.input_ids)->numel(), paged->num_blocks(),
-                original.mtp_shared_compression_plan, classic_mtp_target_);
+                direct_host_plan || original.mtp_shared_compression_plan, classic_mtp_target_);
             if (v4_host_batch) {
                 frozen_dispatch.emplace(original);
                 frozen_dispatch->position_ids = v4_host_batch->positions();
@@ -637,7 +642,6 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
     const auto &rank_hidden = input.target_hidden_states_by_rank;
     if (input.mtp_graph_direct_commit) {
-        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
         const auto &dist = communication_group_.get_dist_config();
         const auto owners = paged ? paged->max_batch_size() : 0;
         const auto *enabled = std::getenv(owners == 1
