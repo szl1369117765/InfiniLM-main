@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -50,5 +51,35 @@ DeepSeekV4CompressionPlan build_deepseek_v4_compression_plan(
     const runtime::Tensor &position_ids,
     const runtime::Tensor &input_offsets,
     size_t ratio);
+
+// CPU inputs frozen once for an eager classic MTP dispatch. The worker uses
+// these same handles for its effective input and host planning. The object is
+// private to native dispatch and never constructed from a Python plan handle.
+class DeepSeekV4HostBatch {
+public:
+    struct Plans {
+        DeepSeekV4AttentionMetadata attention;
+        DeepSeekV4CompressionPlan c4;
+        DeepSeekV4CompressionPlan c128;
+    };
+
+    static std::shared_ptr<const DeepSeekV4HostBatch> prepare_short(
+        const runtime::Tensor &positions, const runtime::Tensor &offsets,
+        const runtime::Tensor &tables, const runtime::Tensor &slots,
+        size_t rows, size_t page_count, bool share_plan);
+
+    const runtime::Tensor &positions() const { return positions_; }
+    const runtime::Tensor &offsets() const { return offsets_; }
+    const runtime::Tensor &tables() const { return tables_; }
+    const runtime::Tensor &slots() const { return slots_; }
+    const std::optional<Plans> &plans() const { return plans_; }
+
+private:
+    DeepSeekV4HostBatch(runtime::Tensor positions, runtime::Tensor offsets,
+                        runtime::Tensor tables, runtime::Tensor slots,
+                        std::optional<Plans> plans);
+    const runtime::Tensor positions_, offsets_, tables_, slots_;
+    const std::optional<Plans> plans_;
+};
 
 } // namespace infinilm::engine

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace infinilm::engine {
 namespace {
@@ -226,6 +227,95 @@ int32_t state_loc_for_mapped_position(
 }
 
 } // namespace
+
+DeepSeekV4HostBatch::DeepSeekV4HostBatch(
+    runtime::Tensor positions, runtime::Tensor offsets, runtime::Tensor tables,
+    runtime::Tensor slots, std::optional<Plans> plans)
+    : positions_(std::move(positions)), offsets_(std::move(offsets)),
+      tables_(std::move(tables)), slots_(std::move(slots)), plans_(std::move(plans)) {}
+
+namespace {
+template <typename T>
+runtime::Tensor copy_host_batch_tensor(const runtime::Tensor &tensor) {
+    auto owner = std::make_shared<std::vector<T>>(tensor->numel());
+    std::memcpy(owner->data(), tensor->data(), owner->size() * sizeof(T));
+    return runtime::Tensor::from_blob(owner->data(), tensor->shape(), tensor->dtype(), kCpu, owner);
+}
+} // namespace
+
+std::shared_ptr<const DeepSeekV4HostBatch> DeepSeekV4HostBatch::prepare_short(
+    const runtime::Tensor &positions, const runtime::Tensor &offsets,
+    const runtime::Tensor &tables, const runtime::Tensor &slots,
+    size_t rows, size_t page_count, bool share_plan) {
+    using runtime::DataType;
+    constexpr auto block_size = models::deepseek_v4::kV4PageSize;
+    const auto host = [](const runtime::Tensor &tensor, size_t rank) {
+        return tensor && tensor->device().type() == runtime::Device::Type::kCpu
+            && tensor->is_contiguous() && tensor->ndim() == rank;
+    };
+    if (rows == 0 || rows > 12 || page_count == 0 ||
+        page_count > static_cast<size_t>(std::numeric_limits<int32_t>::max()) / block_size ||
+        !host(positions, 1) || !host(offsets, 1) || !host(tables, 2) || !host(slots, 1) ||
+        (positions->dtype() != DataType::kInt32 && positions->dtype() != DataType::kInt64) ||
+        offsets->dtype() != DataType::kInt32 || tables->dtype() != DataType::kInt32 ||
+        slots->dtype() != DataType::kInt64 || positions->numel() != rows || slots->numel() != rows ||
+        tables->size(0) < 1 || tables->size(0) > 3 ||
+        tables->size(1) < 1 || tables->size(1) > page_count ||
+        offsets->numel() != tables->size(0) + 1) {
+        return {};
+    }
+
+    auto owned_offsets = copy_host_batch_tensor<int32_t>(offsets);
+    const auto *offset_values = reinterpret_cast<const int32_t *>(owned_offsets->data());
+    const auto requests = tables->size(0);
+    if (offset_values[0] != 0 || offset_values[requests] != static_cast<int32_t>(rows)) {
+        throw std::invalid_argument("DeepSeek V4 host batch offsets do not cover input IDs");
+    }
+    for (size_t row = 0; row < requests; ++row) {
+        const auto query = static_cast<int64_t>(offset_values[row + 1]) - offset_values[row];
+        if (query <= 0) {
+            throw std::invalid_argument("DeepSeek V4 host batch offsets must increase");
+        }
+        if (query > 4) {
+            return {};
+        }
+    }
+
+    auto owned_positions = positions->dtype() == DataType::kInt32
+        ? copy_host_batch_tensor<int32_t>(positions) : copy_host_batch_tensor<int64_t>(positions);
+    auto owned_tables = copy_host_batch_tensor<int32_t>(tables);
+    auto owned_slots = copy_host_batch_tensor<int64_t>(slots);
+    const auto *table_values = reinterpret_cast<const int32_t *>(owned_tables->data());
+    const auto *slot_values = reinterpret_cast<const int64_t *>(owned_slots->data());
+    for (size_t i = 0; i < owned_tables->numel(); ++i) {
+        const auto page = table_values[i];
+        if (page < -1 || (page >= 0 && static_cast<size_t>(page) >= page_count)) {
+            throw std::out_of_range("DeepSeek V4 host batch table exceeds the page pool");
+        }
+    }
+    const auto columns = owned_tables->size(1);
+    for (size_t request = 0; request < requests; ++request) {
+        for (auto row = offset_values[request]; row < offset_values[request + 1]; ++row) {
+            const auto position = read_position(owned_positions->data(), owned_positions->dtype(), row);
+            const auto slot = slot_for_position(table_values + request * columns, columns,
+                                                position, block_size);
+            if (slot < 0 || slot != slot_values[row]) {
+                throw std::invalid_argument("DeepSeek V4 host batch slot and page table disagree");
+            }
+        }
+    }
+    std::optional<Plans> plans;
+    if (share_plan) {
+        auto metadata = build_deepseek_v4_attention_metadata(
+            owned_tables, owned_slots, owned_positions, owned_offsets, std::nullopt, block_size);
+        auto c4 = build_deepseek_v4_compression_plan(metadata, owned_positions, owned_offsets, 4);
+        auto c128 = build_deepseek_v4_compression_plan(metadata, owned_positions, owned_offsets, 128);
+        plans.emplace(Plans{std::move(metadata), std::move(c4), std::move(c128)});
+    }
+    return std::shared_ptr<const DeepSeekV4HostBatch>(new DeepSeekV4HostBatch(
+        std::move(owned_positions), std::move(owned_offsets), std::move(owned_tables),
+        std::move(owned_slots), std::move(plans)));
+}
 
 DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
     const runtime::Tensor &block_tables,

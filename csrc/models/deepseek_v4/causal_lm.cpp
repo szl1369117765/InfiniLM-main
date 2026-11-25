@@ -176,12 +176,18 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
         out->copy_from(rt,t);
         return out;
     };
-    const auto positions = host(input.position_ids);
-    const auto offsets = host(input.input_offsets);
-    const auto metadata = engine::build_deepseek_v4_attention_metadata(
-        host(input.block_tables), host(input.slot_mapping), positions, offsets, std::nullopt, kV4PageSize);
-    const auto c4 = engine::build_deepseek_v4_compression_plan(metadata, positions, offsets, 4);
-    const auto c128 = engine::build_deepseek_v4_compression_plan(metadata, positions, offsets, 128);
+    const auto &prepared = input.deepseek_v4_host_batch;
+    const auto positions = prepared ? prepared->positions() : host(input.position_ids);
+    const auto offsets = prepared ? prepared->offsets() : host(input.input_offsets);
+    const auto *plans = prepared && prepared->plans() ? &*prepared->plans() : nullptr;
+    const auto metadata = plans ? plans->attention : engine::build_deepseek_v4_attention_metadata(
+        prepared ? prepared->tables() : host(input.block_tables),
+        prepared ? prepared->slots() : host(input.slot_mapping),
+        positions, offsets, std::nullopt, kV4PageSize);
+    const auto c4 = plans ? plans->c4 : engine::build_deepseek_v4_compression_plan(
+        metadata, positions, offsets, 4);
+    const auto c128 = plans ? plans->c128 : engine::build_deepseek_v4_compression_plan(
+        metadata, positions, offsets, 128);
     if (writes) {
         *writes = {metadata.raw_out_loc, metadata.c4_out_loc, metadata.c128_out_loc,
                    c4.state_slots, c128.state_slots};
@@ -449,7 +455,7 @@ public:
     std::pair<Tensor,Tensor> forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
                    const std::vector<LayerPagedCache> &caches,
                    const Tensor &swa_rope, const Tensor &compressed_rope,
-                   const Tensor &target_hc, bool return_hc) const {
+                   const Tensor &target_hc, bool return_hc, bool cache_only = false) const {
         const auto rows = tokens->numel();
         const Shape hc_shape{rows,streams_,hidden_};
         if (is_mtp_ && (!target_hc || target_hc->shape() != hc_shape ||
@@ -476,6 +482,9 @@ public:
         for (size_t i=0;i<layers_.size();++i) {
             residual = layers_[i]->forward(rt,residual,tokens,batch,caches[i],
                                            caches[i].compression_ratio ? compressed_rope : swa_rope);
+        }
+        if (cache_only) {
+            return {};
         }
         Tensor hc_output;
         if (return_hc) {
@@ -509,6 +518,8 @@ public:
         model_config_ = std::move(config);
         const auto *reuse = std::getenv("INFINILM_MTP_REUSE_SNAPSHOT_BUFFER");
         reuse_snapshot_buffer_ = reuse && std::string_view(reuse) == "1";
+        const auto *k1_seed = std::getenv("INFINILM_MTP_K1_GRAPH_SEED");
+        k1_graph_seed_ = cfg_.is_mtp && k1_seed && std::string_view(k1_seed) == "1";
         backbone_ = bind_child("model",std::make_shared<Backbone>(rt,cfg_,rank));
         head_ = bind_child("lm_head",std::make_shared<ColumnLinear>(
             rt,cfg_.hidden,cfg_.vocab,false,DataType::kBFloat16,rank.tp_rank,rank.tp_size));
@@ -521,19 +532,37 @@ public:
         auto ids = (*input.input_ids)->view({(*input.input_ids)->numel()});
         PagedCacheWriteSet writes;
         auto batch = make_batch(rt,input,input.rollback_v4_cache ? &writes : nullptr);
+        if (input.mtp_draft_cache_only) {
+            if (!cfg_.is_mtp || input.return_draft_hidden_states || input.rollback_v4_cache ||
+                ctx.model_decode_barrier || ctx.mtp_graph_barrier) {
+                throw std::invalid_argument("Classic NextN cache-only is an eager Draft write");
+            }
+            backbone_->forward(rt, ids, batch, caches_, swa_rope_, compressed_rope_,
+                               input.target_hidden_states.value_or(Tensor{}), false, true);
+            Output output{};
+            output.mtp_draft_cache_only_used = true;
+            return output;
+        }
         if (ctx.model_decode_barrier && batch.single_decode) {
             return decode(rt, std::move(ids), std::move(batch), *ctx.model_decode_barrier,
                           ctx.model_decode_greedy);
         }
         const auto hc = input.target_hidden_states.value_or(Tensor{});
         auto *mtp_graph_barrier = ctx.mtp_graph_barrier;
-        const bool short_target = !cfg_.is_mtp && !hc && input.rollback_v4_cache &&
-            short_verify_layout(batch.query_offsets, ids->numel());
+        const bool short_target = !cfg_.is_mtp && !hc &&
+            (input.mtp_scratch_step || (input.rollback_v4_cache &&
+                short_verify_layout(batch.query_offsets, ids->numel())));
+        // The K1 proposal already wrote its anchor. Repair and the next seed
+        // form one two-row Draft span with only the last prediction sampled.
         const bool short_draft = cfg_.is_mtp && hc && !input.rollback_v4_cache &&
-            ids->numel() == 1 && batch.query_offsets.size() == 2;
+            batch.query_offsets.size() == 2 &&
+            (ids->numel() == 1 || (k1_graph_seed_ && ids->numel() == 2 && !input.sample_all_positions &&
+                                  batch.query_offsets.front() == 0 && batch.query_offsets.back() == 2));
+        const bool scratch_hc = input.mtp_scratch_step && input.return_draft_hidden_states &&
+            short_target && !input.rollback_v4_cache;
         // Eligibility must agree across ranks before any capture or collective.
         const bool capture_mtp = mtp_graph_barrier && mtp_graph_barrier->all(
-            !input.return_draft_hidden_states && (short_target || short_draft));
+            (!input.return_draft_hidden_states || scratch_hc) && (short_target || short_draft));
         if (input.rollback_v4_cache) {
             if (!ctx.mtp_snapshot_barrier)
                 throw std::invalid_argument("Classic NextN verify requires a snapshot rendezvous");
@@ -549,13 +578,24 @@ public:
             return output;
         }
         if (capture_mtp) {
-            return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier, false, hc, true);
+            return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
+                          false, hc, true, scratch_hc);
         }
-        return forward_logits(rt,ids,batch,hc,input.return_draft_hidden_states);
+        return forward_logits(rt,ids,batch,hc,input.return_draft_hidden_states,input.mtp_last_logits);
     }
 
     bool owns_paged_decode_graph() const override {
         return !cfg_.is_mtp;
+    }
+
+    void clone_v4_cache_pages(
+        const std::vector<std::pair<size_t, size_t>> &copies,
+        global_state::ForwardContext &ctx, engine::RankBarrier &barrier) const override {
+        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+        if (cfg_.is_mtp || !paged || paged->block_size() != kV4PageSize) {
+            throw std::invalid_argument("V4 cache page clone requires a paged DeepSeek V4 Target");
+        }
+        clone_cache_pages(ctx.require_runtime(), caches_, paged->num_blocks(), copies, barrier);
     }
 
     void reset_cache(const cache::CacheConfig *requested,global_state::ForwardContext &ctx,
@@ -598,12 +638,14 @@ private:
         BatchMetadata batch;
         Tensor target_hc;
         Tensor logits;
+        Tensor hidden_states;
         Tensor sampled_ids;
         bool greedy;
+        bool return_hc;
         std::shared_ptr<execution::graph::Graph> graph;
     };
 
-    static Tensor copy_graph_input(Runtime &rt, const Tensor &source) {
+    static Tensor copy_graph_tensor(Runtime &rt, const Tensor &source) {
         if (!source) {
             return {};
         }
@@ -613,27 +655,36 @@ private:
     }
 
     Output forward_logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch,
-                          const Tensor &target_hc = {},bool return_hc = false) const {
+                          const Tensor &target_hc = {},bool return_hc = false,
+                          bool last_logits = false) const {
         auto [hidden,hc] = backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc);
         // A per-token projection retains the reference's M=1 accumulation boundary
-        // while preserving the all-position logits requested by existing callers.
-        auto output = Tensor::empty(rt,{ids->numel(),cfg_.vocab},hidden->dtype());
-        for (size_t row=0;row<ids->numel();++row) {
+        // and leaves full packed HC available to seed or repair Draft.
+        const auto requests = batch.query_offsets.size() - 1;
+        const bool select_last = last_logits && requests < ids->numel();
+        const auto rows = select_last ? requests : ids->numel();
+        auto output = Tensor::empty(rt,{rows,cfg_.vocab},hidden->dtype());
+        for (size_t out_row=0;out_row<rows;++out_row) {
+            const auto row = select_last ? batch.query_offsets[out_row + 1] - 1 : out_row;
             auto input = hidden->narrow({{0,row,1}});
             auto local = head_->forward(rt,input);
-            engine::distributed::allgather_(rt,output->narrow({{0,row,1}}),local,comm_);
+            engine::distributed::allgather_(rt,output->narrow({{0,out_row,1}}),local,comm_);
         }
-        return {output->view({1,ids->numel(),cfg_.vocab}),std::move(hc),std::nullopt,{}};
+        Output result{output->view({1,rows,cfg_.vocab}),std::move(hc),std::nullopt,{}};
+        result.mtp_last_logits_used = select_last;
+        return result;
     }
 
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
-                  bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false) const {
+                  bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
+                  bool return_hc = false) const {
         auto &plans = classic_mtp ? mtp_decode_plans_ : decode_plans_;
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
         auto matches = [&](const std::optional<DecodePlan> &plan) {
-            if (!plan || plan->greedy != greedy || ids->shape() != plan->ids->shape() ||
+            if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
+                ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
                 return false;
             }
@@ -687,18 +738,20 @@ private:
                 // from the current call. Only the stable plan buffers go into
                 // the recorder; all other batch tensors were already allocated
                 // by make_batch on this worker.
-                ids = copy_graph_input(rt, ids);
-                batch.position = copy_graph_input(rt, batch.position);
+                ids = copy_graph_tensor(rt, ids);
+                batch.position = copy_graph_tensor(rt, batch.position);
             }
             DecodePlan candidate{std::move(ids), std::move(batch),
-                                 copy_graph_input(rt, target_hc), {}, {}, greedy, {}};
+                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc, {}};
             if (classic_mtp) {
                 barrier.wait();
             }
             rt.startGraphRecording(true);
             try {
-                candidate.logits = forward_logits(
-                    rt, candidate.ids, candidate.batch, candidate.target_hc).logits;
+                auto recorded = forward_logits(
+                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc);
+                candidate.logits = std::move(recorded.logits);
+                candidate.hidden_states = std::move(recorded.hidden_states);
                 if (greedy && sampling_rank_) {
                     candidate.sampled_ids = Tensor::empty(rt, {1}, DataType::kInt64);
                     execution::submit<infini::ops::Argmax>(
@@ -720,7 +773,11 @@ private:
             recent = std::move(candidate);
         }
         recent->graph->run();
-        return {recent->logits, {}, recent->graph->execution_report(), recent->sampled_ids};
+        // Publish a new allocation from the recording worker's stream. Its
+        // return-HC completion fence runs before the Draft consumes this tensor.
+        auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
+        return {recent->logits, std::move(hidden_states), recent->graph->execution_report(),
+                recent->sampled_ids};
     }
 
     V4Config cfg_;
@@ -730,6 +787,7 @@ private:
     const bool sampling_rank_;
     std::vector<LayerPagedCache> caches_;
     bool reuse_snapshot_buffer_ = false;
+    bool k1_graph_seed_ = false;
     // The rank worker serializes verify calls; rollback synchronizes before
     // the next request can reuse or resize this device buffer.
     mutable Tensor snapshot_backup_;

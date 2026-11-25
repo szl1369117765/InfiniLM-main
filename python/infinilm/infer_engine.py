@@ -362,6 +362,11 @@ class InferEngine(_infinilm.InferEngine):
         return_draft_hidden_states=False,
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
+        mtp_draft_cache_only=False,
+        mtp_cpu_metadata_shadow=False,
+        mtp_shared_compression_plan=False,
+        mtp_scratch_step=False,
+        mtp_last_logits=False,
     ):
         def unwrap_tensor(tensor):
             return (
@@ -408,6 +413,34 @@ class InferEngine(_infinilm.InferEngine):
                     else None
                 ),
             }
+        if mtp_draft_cache_only is not False:
+            if mtp_draft_cache_only is not True:
+                raise ValueError("mtp_draft_cache_only must be a bool")
+            if getattr(self, "mtp_draft_cache_only_version", 0) != 1:
+                raise RuntimeError("Classic NextN Draft cache-only requires the native output policy")
+            mtp_arguments["mtp_draft_cache_only"] = True
+        for key, enabled in (
+            ("mtp_cpu_metadata_shadow", mtp_cpu_metadata_shadow),
+            ("mtp_shared_compression_plan", mtp_shared_compression_plan),
+        ):
+            if type(enabled) is not bool:
+                raise ValueError(f"{key} must be a bool")
+            if enabled:
+                if getattr(self, f"{key}_version", 0) != 1:
+                    raise RuntimeError(f"{key} requires native Classic NextN host metadata support")
+                mtp_arguments[key] = True
+        if mtp_scratch_step is not False:
+            if mtp_scratch_step is not True:
+                raise ValueError("mtp_scratch_step must be a bool")
+            if getattr(self, "mtp_scratch_step_version", 0) != 1:
+                raise RuntimeError("Classic NextN scratch steps require native q1 support")
+            mtp_arguments["mtp_scratch_step"] = True
+        if mtp_last_logits is not False:
+            if mtp_last_logits is not True:
+                raise ValueError("mtp_last_logits must be a bool")
+            if getattr(self, "mtp_last_logits_version", 0) != 1:
+                raise RuntimeError("Classic NextN last logits require native head selection support")
+            mtp_arguments["mtp_last_logits"] = True
 
         return super().Input(
             input_ids,
@@ -571,6 +604,11 @@ class InferEngine(_infinilm.InferEngine):
         return_draft_hidden_states=False,
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
+        mtp_draft_cache_only=False,
+        mtp_cpu_metadata_shadow=False,
+        mtp_shared_compression_plan=False,
+        mtp_scratch_step=False,
+        mtp_last_logits=False,
     ):
         try:
             output = super().forward(
@@ -597,18 +635,44 @@ class InferEngine(_infinilm.InferEngine):
                     return_draft_hidden_states=return_draft_hidden_states,
                     rollback_v4_cache=rollback_v4_cache,
                     target_hidden_states_by_rank=target_hidden_states_by_rank,
+                    mtp_draft_cache_only=mtp_draft_cache_only,
+                    mtp_cpu_metadata_shadow=mtp_cpu_metadata_shadow,
+                    mtp_shared_compression_plan=mtp_shared_compression_plan,
+                    mtp_scratch_step=mtp_scratch_step,
+                    mtp_last_logits=mtp_last_logits,
                 )
             )
+            metadata_evidence = {}
+            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan:
+                metadata_evidence["mtp_cpu_metadata_shadow_used"] = output.mtp_cpu_metadata_shadow_used
+                if mtp_shared_compression_plan:
+                    metadata_evidence["mtp_shared_compression_plan_used"] = output.mtp_shared_compression_plan_used
+            if mtp_draft_cache_only:
+                if not output.mtp_draft_cache_only_used or any(
+                    (output.output_ids, output.logits, output.hidden_states)
+                ):
+                    raise RuntimeError("Classic NextN Draft cache-only did not return a completed cache write")
+                return {
+                    "output_ids": None,
+                    "logits": None,
+                    "hidden_states": None,
+                    "execution_report": output.execution_report,
+                    "mtp_draft_cache_only_used": True,
+                    **metadata_evidence,
+                }
             result = {
                 "output_ids": infinicore.Tensor(output.output_ids),
                 "logits": infinicore.Tensor(output.logits),
                 "hidden_states": infinicore.Tensor(output.hidden_states),
                 "execution_report": output.execution_report,
+                **metadata_evidence,
             }
             if return_draft_hidden_states:
                 result["hidden_states_by_rank"] = tuple(
                     infinicore.Tensor(tensor) for tensor in output.hidden_states_by_rank
                 )
+            if mtp_last_logits:
+                result["mtp_last_logits_used"] = output.mtp_last_logits_used
             return result
         except BaseException as e:
             handle_oom_and_exit(e)

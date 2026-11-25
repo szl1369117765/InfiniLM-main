@@ -696,6 +696,7 @@ class LLM:
         chunked_prefill_size: int = 0,
         enable_deepseek_v4_mtp: bool = False,
         nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None,
+        nextn_branch_execution: str = "serial",
     ):
         """Initialize LLM.
 
@@ -738,6 +739,7 @@ class LLM:
             chunked_prefill_size=chunked_prefill_size,
             enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
             nextn_branch_draft_lengths=nextn_branch_draft_lengths,
+            nextn_branch_execution=nextn_branch_execution,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,
@@ -930,6 +932,7 @@ class AsyncLLMEngine:
         chunked_prefill_size: int = 0,
         enable_deepseek_v4_mtp: bool = False,
         nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None,
+        nextn_branch_execution: str = "serial",
     ):
         """Initialize AsyncLLMEngine.
 
@@ -976,6 +979,7 @@ class AsyncLLMEngine:
             chunked_prefill_size=chunked_prefill_size,
             enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
             nextn_branch_draft_lengths=nextn_branch_draft_lengths,
+            nextn_branch_execution=nextn_branch_execution,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,

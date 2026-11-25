@@ -144,6 +144,7 @@ class ModelRunner:
                 config.num_blocks * config.block_size,
                 num_draft_tokens=config.num_draft_tokens,
                 branch_draft_lengths=config.nextn_branch_draft_lengths,
+                branch_execution=config.nextn_branch_execution,
                 allow_stochastic=not config.enable_graph,
             )
         elif config.draft_model_path is not None:

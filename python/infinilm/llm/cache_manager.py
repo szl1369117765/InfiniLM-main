@@ -243,6 +243,33 @@ class BlockManager:
             raise
         return block_table, slots
 
+    def allocate_private_blocks(self, count: int) -> list[int]:
+        """Allocate unpublished pages for an isolated verification."""
+        if not self.can_allocate(count) and not self.try_free_blocks(count):
+            raise RuntimeError("No available cache blocks for packed NextN branches")
+        pages = [0] * count
+        allocated = 0
+        try:
+            for index in range(count):
+                pages[index] = self._allocate_block().block_id
+                allocated += 1
+        except BaseException:
+            self.release_private_blocks(pages[:allocated])
+            raise
+        return pages
+
+    def release_private_blocks(self, pages: Sequence[int]) -> None:
+        if len(pages) != len(set(pages)) or any(
+            page not in self.used_block_ids
+            or self.blocks[page].ref_count != 1
+            or self.blocks[page].hash != EMPTY_BLOCK_HASH
+            for page in pages
+        ):
+            raise RuntimeError("packed NextN scratch pages must be privately owned")
+        for page in pages:
+            self.blocks[page].ref_count = 0
+            self._deallocate_block(page)
+
     def _validate_truncate_blocks(self, block_table, keep_num_tokens):
         if keep_num_tokens <= 0:
             raise ValueError("keep_num_tokens must be greater than 0")

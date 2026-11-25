@@ -10,7 +10,7 @@ from .deepseek_v4_mtp_verify import GreedyVerifyBatch, GreedyVerifyRequest
 class DeepSeekV4MTPRunner:
     def __init__(
         self, target, transport, cache_token_capacity, *, num_draft_tokens=1,
-        branch_draft_lengths=None, allow_stochastic=False,
+        branch_draft_lengths=None, branch_execution="serial", allow_stochastic=False,
     ):
         self.target = target
         self.transport = transport
@@ -18,6 +18,8 @@ class DeepSeekV4MTPRunner:
         self.branch_draft_lengths = tuple(
             k for k in (branch_draft_lengths or ()) if k <= num_draft_tokens
         )
+        self.branch_execution = branch_execution
+        self.cache_token_capacity = cache_token_capacity
         self.allow_stochastic = allow_stochastic
         self.max_context = min(
             target.hf_config["max_position_embeddings"], cache_token_capacity
@@ -50,6 +52,14 @@ class DeepSeekV4MTPRunner:
             )
         if request.get_prompt_length() + params.max_tokens > self.max_context:
             raise ValueError("classic DeepSeek V4 MTP request exceeds available context")
+        if self.branch_execution in ("packed", "packed-stepwise") and params.max_tokens >= 4:
+            count = len(set(min(k, params.max_tokens - 2) for k in self.branch_draft_lengths))
+            if count > 1:
+                page_size = self.transport.page_size
+                last_input = request.get_prompt_length() + params.max_tokens - 1
+                pages = (last_input + page_size - 1) // page_size
+                if pages * (count + 1) > self.cache_token_capacity // page_size:
+                    raise ValueError("classic NextN packed branches exceed available private cache pages")
 
     def retire(self):
         if self.failed:
@@ -77,7 +87,7 @@ class DeepSeekV4MTPRunner:
             for request in requests:
                 self.validate_request(request)
             if self.branch_draft_lengths and len(requests) != 1:
-                raise RuntimeError("classic NextN serial branches require one scheduled owner")
+                raise RuntimeError("classic NextN branches require one scheduled owner")
             if scheduler_output.is_prefill:
                 return self._prefill(requests, model_input)
             for request in requests:
@@ -136,10 +146,9 @@ class DeepSeekV4MTPRunner:
         self.requests.update(zip(owners, requests))
         return anchors
 
-    def _propose(self, candidate, table):
+    def _proposal_request(self, candidate):
         request = candidate["req"]
         start = candidate["base_len"] - 1
-        count = candidate["draft_count"]
         owner, anchor = request.request_id, request.generated_token_ids[-1]
         eos = request.eos_token_ids or self.target.eos_token_id or ()
         if isinstance(eos, int):
@@ -147,9 +156,16 @@ class DeepSeekV4MTPRunner:
         stop_ids = frozenset(request.sampling_params.stop_token_ids)
         if not request.sampling_params.ignore_eos:
             stop_ids = stop_ids.union(eos)
-        if request.sampling_params.do_sample:
+        return GreedyVerifyRequest(owner, start, candidate["remaining"] + 1, anchor, (), stop_ids)
+
+    def _propose(self, candidate, table):
+        request = self._proposal_request(candidate)
+        owner, anchor, start = request.owner, request.anchor, request.start
+        count, stop_ids = candidate["draft_count"], request.eos_token_ids
+        source = candidate["req"]
+        if source.sampling_params.do_sample:
             proposals = self.transport.propose_many(
-                owner, anchor, start, table, count, stop_ids, sampling=RequestSampling(request)
+                owner, anchor, start, table, count, stop_ids, sampling=RequestSampling(source)
             )
         elif count == 1:
             proposals = (self.transport.propose(owner, anchor, start, table),)
@@ -157,19 +173,40 @@ class DeepSeekV4MTPRunner:
             proposals = self.transport.propose_many(
                 owner, anchor, start, table, count, stop_ids
             )
-        return GreedyVerifyRequest(
-            owner, start, candidate["remaining"] + 1, anchor, proposals, stop_ids
-        )
+        return replace(request, draft_tokens=proposals)
 
     def _verify(self, cache_ops, candidates):
         with cache_ops.verify_batch(candidates) as reservation:
+            scratch_tables = ()
+            if self.branch_execution in ("packed", "packed-stepwise"):
+                (parent,) = candidates
+                planned_depths = dict.fromkeys(
+                    min(k, parent["draft_count"]) for k in self.branch_draft_lengths
+                )
+                if len(planned_depths) > 1:
+                    scratch_tables = reservation.reserve_branch_tables(
+                        tuple(parent["base_len"] + k for k in planned_depths)
+                    )
             # The proposal also writes native cache state. Keep provisional pages
             # reserved until the transport has resolved the full transaction.
             reservation.mark_submitted()
             tables = tuple(tuple(candidate["block_table"]) for candidate in candidates)
-            requests = [
-                self._propose(candidate, table) for candidate, table in zip(candidates, tables)
-            ]
+            batched = (
+                getattr(self.transport, "batched_draft", False)
+                and not self.branch_draft_lengths
+                and (self.num_draft_tokens == 1 or len(candidates) > 1)
+                and all(not candidate["req"].sampling_params.do_sample for candidate in candidates)
+            )
+            if batched:
+                proposals = [self._proposal_request(candidate) for candidate in candidates]
+                counts = tuple(candidate["draft_count"] for candidate in candidates)
+                chains = self.transport.propose_batched(proposals, tables, counts)
+                requests = [replace(request, draft_tokens=chain)
+                            for request, chain in zip(proposals, chains, strict=True)]
+            else:
+                requests = [
+                    self._propose(candidate, table) for candidate, table in zip(candidates, tables)
+                ]
             if self.branch_draft_lengths:
                 (request,) = requests
                 depths = dict.fromkeys(
@@ -182,20 +219,29 @@ class DeepSeekV4MTPRunner:
                     )
                     for k in depths
                 )
-                with self.transport.serial_branch_transaction(branches, tables[0]) as (
-                    transaction, winner,
-                ):
+                if scratch_tables and len(branches) > 1:
+                    verify = (
+                        self.transport.stepwise_branch_transaction if self.branch_execution == "packed-stepwise"
+                        else self.transport.packed_branch_transaction
+                    )
+                    branch_verify = verify(branches, tables[0], scratch_tables[:len(branches)], self.max_context)
+                else:
+                    branch_verify = self.transport.serial_branch_transaction(branches, tables[0])
+                with branch_verify as (transaction, winner):
                     intents = (winner,)
                     transaction.commit(winner)
             else:
                 batch = GreedyVerifyBatch.pack(requests, self.max_context)
                 with self.transport.target_transaction(
                     batch, tables[0] if len(candidates) == 1 else tables,
+                    **({"batch_draft_seed": True} if batched and self.num_draft_tokens == 1 else {}),
                 ) as transaction:
                     intents = (
                         transaction.resolve_stochastic()
                         if any(row["req"].sampling_params.do_sample for row in candidates)
-                        else batch.resolve(transaction.rows)
+                        else batch.resolve(
+                            transaction.rows, omit_terminal=getattr(transaction, "omit_terminal", False),
+                        )
                     )
                     transaction.commit(intents[0] if len(candidates) == 1 else intents)
             reservation.mark_completed()

@@ -63,6 +63,7 @@ class BaseConfig:
         self.num_draft_tokens = self.args.num_draft_tokens
         self.enable_deepseek_v4_mtp = self.args.enable_deepseek_v4_mtp
         self.nextn_branch_draft_lengths = self.args.nextn_branch_draft_lengths
+        self.nextn_branch_execution = self.args.nextn_branch_execution
         self.device = self.args.device
         self.tp = self.args.tp
         self.pp = self.args.pp
@@ -183,7 +184,11 @@ class BaseConfig:
             "--nextn-branch-draft-lengths",
             type=int,
             nargs="+",
-            help="ordered draft depths for serial eager classic NextN branches (C1 only)",
+            help="ordered draft depths for classic NextN branches (C1 only)",
+        )
+        self.parser.add_argument(
+            "--nextn-branch-execution", choices=("serial", "packed", "packed-stepwise"), default="serial",
+            help="verify classic NextN candidates serially, packed once, or packed one row at a time",
         )
         self.parser.add_argument(
             "--device",

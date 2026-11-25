@@ -3,7 +3,12 @@
 #include "cache_geometry.hpp"
 #include "runtime/tensor.hpp"
 
+#include <utility>
 #include <vector>
+
+namespace infinilm::engine {
+class RankBarrier;
+}
 
 namespace infinilm::models::deepseek_v4 {
 
@@ -30,6 +35,13 @@ struct LayerPagedCache {
 LayerPagedCache allocate_layer_paged_cache(
     runtime::Runtime &runtime, size_t full_blocks, size_t swa_blocks,
     size_t compression_ratio, size_t index_head_dim = 128);
+
+// The caller owns the source pages and all private destination leases.
+void validate_cache_page_copies(
+    const std::vector<std::pair<size_t, size_t>> &copies, size_t page_count);
+void clone_cache_pages(
+    runtime::Runtime &runtime, const std::vector<LayerPagedCache> &layers, size_t page_count,
+    const std::vector<std::pair<size_t, size_t>> &copies, engine::RankBarrier &barrier);
 
 // Writable locations from the host attention metadata and compression plans.
 // All tensors are contiguous int32 row vectors. A value of -1 skips that write.

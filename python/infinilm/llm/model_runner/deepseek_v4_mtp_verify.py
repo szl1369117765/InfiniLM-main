@@ -73,7 +73,7 @@ class GreedyVerifyBatch:
 
     @classmethod
     def pack(
-        cls, requests: Iterable[GreedyVerifyRequest], max_context: int
+        cls, requests: Iterable[GreedyVerifyRequest], max_context: int, *, scratch_step: bool = False,
     ) -> "GreedyVerifyBatch":
         requests = tuple(requests)
         if not requests or type(max_context) is not int or not 1 <= max_context <= _INT32_MAX:
@@ -91,7 +91,10 @@ class GreedyVerifyBatch:
             tokens = (request.anchor, *request.draft_tokens)
             if (
                 type(request.remaining) is not int
-                or not 2 <= len(tokens) <= min(4, request.remaining)
+                or not (
+                    len(tokens) == request.remaining == 1 if scratch_step
+                    else 2 <= len(tokens) <= min(4, request.remaining)
+                )
             ):
                 raise ValueError(f"invalid classic MTP verify query or output budget for {owner}")
             if (
@@ -121,14 +124,34 @@ class GreedyVerifyBatch:
             requests, tuple(rows), tuple(offsets), tuple(past), tuple(total), tuple(cumulative)
         )
 
-    def resolve(self, output: Sequence[TargetVerifyRow]) -> tuple[GreedyCommitIntent, ...]:
-        if len(output) != len(self.rows):
+    @property
+    def ends_in_known_stop(self) -> bool:
+        return (
+            len(self.requests) == 1 and len(self.rows) >= 2
+            and self.rows[-1].input_token in self.requests[0].eos_token_ids
+        )
+
+    def resolve(
+        self, output: Sequence[TargetVerifyRow], *, omit_terminal: bool = False,
+        early_rejection: bool = False,
+    ) -> tuple[GreedyCommitIntent, ...]:
+        if omit_terminal and not self.ends_in_known_stop:
+            raise ValueError("Target verify can omit only a known terminal proposal")
+        if early_rejection and (omit_terminal or len(self.requests) != 1 or not 1 <= len(output) <= len(self.rows)):
+            raise ValueError("Stepwise Target verification requires one nonempty branch prefix")
+        submitted_rows = self.rows[:len(output)] if early_rejection else (
+            self.rows[:-1] if omit_terminal else self.rows
+        )
+        if len(output) != len(submitted_rows):
             raise ValueError("Target verify result count differs from the submitted batch")
-        for expected, result in zip(self.rows, output):
+        for expected, result in zip(submitted_rows, output):
             if result.row is not expected:
                 raise ValueError("Target verify result does not belong to the submitted row")
             if not _is_token(result.predicted_token):
                 raise ValueError("Target verify requires non-negative int64 token IDs")
+        if (early_rejection and len(output) < len(self.rows)
+                and output[-1].predicted_token == self.rows[len(output)].input_token):
+            raise ValueError("Stepwise Target verification omitted a matching Draft row")
 
         intentions = []
         for index, request in enumerate(self.requests):
@@ -139,10 +162,16 @@ class GreedyVerifyBatch:
                 if proposed != output[accepted_end - 1].predicted_token:
                     break
                 accepted_end += 1
+            if early_rejection and accepted_end != len(submitted_rows):
+                raise ValueError("Stepwise Target verification continued past a rejection")
 
-            retained = self.rows[begin:accepted_end]
-            emitted = tuple(row.input_token for row in retained)
+            accepted = self.rows[begin:accepted_end]
+            emitted = tuple(row.input_token for row in accepted)
             terminal = len(emitted) == request.remaining or emitted[-1] in request.eos_token_ids
+            # The preceding prediction verifies a terminal proposal. An accepted
+            # stop is emitted, but the input that would predict its successor
+            # was not submitted and does not own a retained cache row.
+            retained = submitted_rows[begin:accepted_end]
             anchor, kind = None, None
             if not terminal:
                 anchor = output[accepted_end - 1].predicted_token

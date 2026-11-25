@@ -1,5 +1,6 @@
 #include "paged_cache.hpp"
 
+#include "engine/rank_barrier.hpp"
 #include "runtime/runtime.hpp"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace infinilm::models::deepseek_v4 {
 namespace {
@@ -124,6 +126,116 @@ LayerPagedCache allocate_layer_paged_cache(runtime::Runtime &rt, size_t full_blo
         cache.indexer_state = zeros(rt, state_rows, product(2 * coeff, index_head_dim), DataType::kFloat32);
     }
     return cache;
+}
+
+void validate_cache_page_copies(
+    const std::vector<std::pair<size_t, size_t>> &copies, size_t page_count) {
+    if (copies.empty() || copies.size() > page_count) {
+        throw std::invalid_argument("V4 cache page clone requires a bounded nonempty copy list");
+    }
+    std::unordered_set<size_t> sources;
+    std::unordered_set<size_t> destinations;
+    for (const auto &[source, destination] : copies) {
+        if (source >= page_count || destination >= page_count) {
+            throw std::out_of_range("V4 cache page clone exceeds the current page pool");
+        }
+        sources.insert(source);
+        if (!destinations.insert(destination).second) {
+            throw std::invalid_argument("V4 cache page clone destinations must be unique");
+        }
+    }
+    for (const auto destination : destinations) {
+        if (sources.count(destination)) {
+            throw std::invalid_argument("V4 cache page clone sources and destinations overlap");
+        }
+    }
+}
+
+void clone_cache_pages(
+    runtime::Runtime &rt, const std::vector<LayerPagedCache> &layers, size_t page_count,
+    const std::vector<std::pair<size_t, size_t>> &copies, engine::RankBarrier &barrier) {
+    rt.assertOwnerThread();
+    if (rt.isGraphRecording() || layers.empty()) {
+        throw std::logic_error("V4 cache page clone needs initialized eager paged caches");
+    }
+    // InferEngine has already validated the copy-list structure. Recheck the
+    // bounds against each worker's actual pool and inspect its local stores
+    // before permitting any rank to submit a write.
+    for (const auto &[source, destination] : copies) {
+        if (source >= page_count || destination >= page_count) {
+            throw std::out_of_range("V4 cache page clone exceeds a worker's page pool");
+        }
+    }
+    struct Store {
+        std::byte *data;
+        size_t page_bytes;
+    };
+    std::vector<Store> stores;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+    using runtime::DataType;
+    auto append = [&](runtime::Tensor storage, DataType type, size_t rows_per_page, size_t padded_rows) {
+        if (!storage || storage->device() != rt.device() || storage->dtype() != type ||
+            storage->ndim() != 2 || !storage->is_contiguous() ||
+            storage->size(0) != padded_rows || !storage->size(1) ||
+            storage->allocation_owner().get() != &rt || !storage->data()) {
+            throw std::invalid_argument("Invalid V4 cache page clone storage");
+        }
+        auto *data = storage->data();
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        const auto row_bytes = product(storage->size(1), runtime::dsize(type));
+        const auto bytes = product(storage->size(0), row_bytes);
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) {
+            throw std::overflow_error("V4 cache page clone storage address overflows");
+        }
+        ranges.emplace_back(address, address + bytes);
+        stores.push_back({data, product(rows_per_page, row_bytes)});
+    };
+    for (const auto &layer : layers) {
+        if (layer.full_blocks != page_count || layer.swa_blocks != page_count) {
+            throw std::invalid_argument("V4 cache page clone requires paired full and SWA pages");
+        }
+        append(layer.swa, DataType::kUInt8, 1, page_count);
+        const auto ratio = layer.compression_ratio;
+        if (ratio == 0) {
+            continue;
+        }
+        if (ratio != 4 && ratio != 128) {
+            throw std::invalid_argument("Invalid V4 cache page clone compression ratio");
+        }
+        const auto ring = compressor_ring_rows(ratio);
+        if (page_count > std::numeric_limits<size_t>::max() / ring - 2) {
+            throw std::overflow_error("V4 cache page clone ring size overflows");
+        }
+        // Match allocation, including the extra raw-ring padding rows. A
+        // copied physical page never spans the padding.
+        const auto state_rows = align((page_count + 1) * ring + 1, ratio);
+        append(layer.compressed, DataType::kUInt8, 1, page_count);
+        append(layer.compressor_state, DataType::kFloat32, ring, state_rows);
+        if (ratio == 4) {
+            append(layer.indexer, DataType::kUInt8, 1, page_count);
+            append(layer.indexer_state, DataType::kFloat32, ring, state_rows);
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i - 1].second > ranges[i].first) {
+            throw std::invalid_argument("V4 cache page clone stores alias");
+        }
+    }
+    barrier.wait();
+    try {
+        for (const auto &store : stores) {
+            for (const auto &[source, destination] : copies) {
+                rt.memcpyD2D(store.data + destination * store.page_bytes,
+                             store.data + source * store.page_bytes, store.page_bytes);
+            }
+        }
+    } catch (...) {
+        // A failed enqueue can follow successful enqueues on the same stream.
+        drain_or_terminate(rt);
+        throw;
+    }
+    rt.syncStream();
 }
 
 PagedCacheSnapshot::PagedCacheSnapshot(runtime::Runtime &rt,

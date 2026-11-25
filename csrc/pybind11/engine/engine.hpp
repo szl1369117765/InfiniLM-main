@@ -73,6 +73,13 @@ inline void bind_infer_engine(py::module &m) {
     infer_engine.attr("deepseek_v4_raw_ring_rows") = py::make_tuple(
         models::deepseek_v4::compressor_ring_rows(4),
         models::deepseek_v4::compressor_ring_rows(128));
+    infer_engine.attr("mtp_draft_cache_only_version") = 1;
+    infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
+    infer_engine.attr("mtp_shared_compression_plan_version") = 1;
+    infer_engine.attr("mtp_scratch_step_version") = 1;
+    infer_engine.attr("mtp_scratch_hc_version") = 1;
+    infer_engine.attr("mtp_last_logits_version") = 1;
+    infer_engine.attr("mtp_k1_graph_seed_version") = 1;
 
     infer_engine
         .def(py::init([](
@@ -144,6 +151,9 @@ inline void bind_infer_engine(py::module &m) {
                 py::gil_scoped_release release;
                 return self.forward(frozen_input); }, "Run inference on all ranks with arbitrary arguments")
         .def("reset_cache", [](InferEngine &self, std::shared_ptr<cache::CacheConfig> cfg) { self.reset_cache(cfg ? cfg.get() : nullptr); }, py::arg("cache_config") = py::none(), py::call_guard<py::gil_scoped_release>())
+        .def("clone_v4_cache_pages", &InferEngine::clone_v4_cache_pages, py::arg("copies"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Clone leased V4 physical pages to private destinations, then drain all ranks")
         .def("get_kv_cache", &InferEngine::get_kv_cache, py::call_guard<py::gil_scoped_release>(), "Get per-rank kv cache list")
         .def("get_nsa_pool_epoch", [](InferEngine &self) {
             py::gil_scoped_release release;
@@ -240,6 +250,11 @@ inline void bind_infer_engine(py::module &m) {
                     "return_draft_hidden_states",
                     "rollback_v4_cache",
                     "target_hidden_states_by_rank",
+                    "mtp_draft_cache_only",
+                    "mtp_cpu_metadata_shadow",
+                    "mtp_shared_compression_plan",
+                    "mtp_scratch_step",
+                    "mtp_last_logits",
                 };
 
                 for (auto &item : kwargs) {
@@ -273,6 +288,25 @@ inline void bind_infer_engine(py::module &m) {
                         input.return_draft_hidden_states = py::cast<bool>(item.second);
                     } else if (key == "rollback_v4_cache") {
                         input.rollback_v4_cache = py::cast<bool>(item.second);
+                    } else if (key == "mtp_draft_cache_only") {
+                        input.mtp_draft_cache_only = py::cast<bool>(item.second);
+                    } else if (key == "mtp_cpu_metadata_shadow" || key == "mtp_shared_compression_plan") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error(key + " must be a bool");
+                        }
+                        auto &flag = key == "mtp_cpu_metadata_shadow"
+                            ? input.mtp_cpu_metadata_shadow : input.mtp_shared_compression_plan;
+                        flag = py::cast<bool>(item.second);
+                    } else if (key == "mtp_scratch_step") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_scratch_step must be a bool");
+                        }
+                        input.mtp_scratch_step = py::cast<bool>(item.second);
+                    } else if (key == "mtp_last_logits") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_last_logits must be a bool");
+                        }
+                        input.mtp_last_logits = py::cast<bool>(item.second);
                     } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
@@ -328,6 +362,10 @@ inline void bind_infer_engine(py::module &m) {
         .def_readwrite("logits", &InferEngine::Output::logits, "Raw logits tensor")
         .def_readwrite("hidden_states", &InferEngine::Output::hidden_states, "Raw hidden states tensor")
         .def_readonly("hidden_states_by_rank", &InferEngine::Output::hidden_states_by_rank)
+        .def_readonly("mtp_draft_cache_only_used", &InferEngine::Output::mtp_draft_cache_only_used)
+        .def_readonly("mtp_cpu_metadata_shadow_used", &InferEngine::Output::mtp_cpu_metadata_shadow_used)
+        .def_readonly("mtp_shared_compression_plan_used", &InferEngine::Output::mtp_shared_compression_plan_used)
+        .def_readonly("mtp_last_logits_used", &InferEngine::Output::mtp_last_logits_used)
         .def_property_readonly("execution_report", [](const InferEngine::Output &output) {
             py::dict result;
             const auto *graph = output.graph_execution ? &*output.graph_execution : nullptr;

@@ -368,7 +368,7 @@ std::vector<std::string> RankWorker::state_required_keys() {
 //------------------------------------------------------
 // run -- asynchronous
 //------------------------------------------------------
-void RankWorker::run(const Input &args) {
+void RankWorker::run(const Input &args, std::shared_ptr<const DeepSeekV4HostBatch> v4_host_batch) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (should_exit_) {
@@ -379,10 +379,30 @@ void RankWorker::run(const Input &args) {
     }
 
     pending_args_ = args;
+    pending_v4_host_batch_ = std::move(v4_host_batch);
     job_cmd_ = Command::RUN;
     has_job_ = true;
     job_done_ = false;
 
+    cv_.notify_all();
+}
+
+void RankWorker::clone_v4_cache_pages(
+    std::shared_ptr<const std::vector<std::pair<size_t, size_t>>> copies) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!copies || !barrier_) {
+        throw std::invalid_argument("V4 cache page clone needs the rank copy list and rendezvous");
+    }
+    if (should_exit_) {
+        if (failure_) {
+            std::rethrow_exception(failure_);
+        }
+        throw std::runtime_error("RankWorker is closing; cannot clone V4 cache pages");
+    }
+    pending_v4_page_copies_ = std::move(copies);
+    job_cmd_ = Command::CLONE_V4_CACHE_PAGES;
+    has_job_ = true;
+    job_done_ = false;
     cv_.notify_all();
 }
 
@@ -627,6 +647,8 @@ void RankWorker::thread_loop() {
             std::unordered_map<std::string, infinilm::runtime::Tensor> local_params;
             bool local_params_strict = true;
             Input local_args;
+            std::shared_ptr<const DeepSeekV4HostBatch> local_v4_host_batch;
+            std::shared_ptr<const std::vector<std::pair<size_t, size_t>>> local_v4_page_copies;
             std::unique_ptr<cache::CacheConfig> local_cache_config;
             std::uint64_t local_nsa_pool_epoch = 0;
 
@@ -655,6 +677,9 @@ void RankWorker::thread_loop() {
 
                 } else if (local_cmd == Command::RUN) {
                     local_args = pending_args_;
+                    local_v4_host_batch = std::move(pending_v4_host_batch_);
+                } else if (local_cmd == Command::CLONE_V4_CACHE_PAGES) {
+                    local_v4_page_copies = std::move(pending_v4_page_copies_);
                 } else if (local_cmd == Command::RESET_CACHE) {
                     // Epoch follows the actual serialized reset command payload.
                     local_nsa_pool_epoch = pending_nsa_pool_epoch_;
@@ -781,6 +806,8 @@ void RankWorker::thread_loop() {
                         infinilm::runtime::Tensor hidden_states;
                         std::optional<infinilm::execution::graph::Graph::ExecutionReport> graph_execution;
                         infinilm::runtime::Tensor model_sampled_ids;
+                        bool draft_cache_only_used = false;
+                        bool last_logits_used = false;
                         const auto parameter_greedy = [&] {
                             if (local_args.sampling_rows) {
                                 return std::all_of(local_args.sampling_rows->begin(), local_args.sampling_rows->end(),
@@ -797,11 +824,12 @@ void RankWorker::thread_loop() {
                             throw std::invalid_argument("V4 MTP requires a single pipeline stage");
                         }
                         const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states ||
-                            local_args.rollback_v4_cache;
+                            local_args.rollback_v4_cache || local_args.mtp_scratch_step;
                         const bool graph_enabled = enable_graph_compiling_ && rank_info_.pp_size == 1;
                         // For a one-row Draft proposal, the last token is all
                         // positions. Draft prefill/repair still request all rows.
-                        const bool mtp_graph_candidate = graph_enabled && (local_args.rollback_v4_cache ||
+                        const bool mtp_graph_candidate = graph_enabled && !local_args.mtp_draft_cache_only &&
+                            (local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
                             (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions &&
                              !local_args.return_draft_hidden_states));
                         std::shared_ptr<const nsa::Proof> nsa_proof;
@@ -830,6 +858,9 @@ void RankWorker::thread_loop() {
                                 }
                             }
                             size_t logical_kv_upper_bound = 0;
+                            if (local_v4_host_batch && (finite_paged_decode_profile_ || graph_enabled)) {
+                                throw std::logic_error("V4 host batch cannot use Graph or worker-side page-table rewriting");
+                            }
                             if (finite_paged_decode_profile_
                                 && !local_args.sample_all_positions
                                 && effective_args.input_ids && *effective_args.input_ids
@@ -934,6 +965,7 @@ void RankWorker::thread_loop() {
                                     attention_backend_ == backends::AttentionBackend::STATIC_ATTN,
                                     false,
                                     logical_kv_upper_bound, nsa_proof);
+                                model_args.deepseek_v4_host_batch = local_v4_host_batch;
                                 if (attention_backend_ == backends::AttentionBackend::STATIC_ATTN
                                     && model_config_->get_kv_quant_scheme() == quantization::KVQuantAlgo::NONE
                                     && model_args.input_ids && model_args.input_ids.value()->ndim() == 2
@@ -1014,6 +1046,29 @@ void RankWorker::thread_loop() {
                                 logits = model_output.logits;
                                 hidden_states = model_output.hidden_states;
                                 model_sampled_ids = std::move(model_output.model_sampled_ids);
+                                draft_cache_only_used = model_output.mtp_draft_cache_only_used;
+                                last_logits_used = model_output.mtp_last_logits_used;
+                            }
+
+                            if (local_args.mtp_draft_cache_only) {
+                                if (!draft_cache_only_used || logits || hidden_states || model_sampled_ids ||
+                                    graph_execution) {
+                                    throw std::runtime_error("Classic NextN Draft cache-only forward produced outputs");
+                                }
+                                if (rank_info_.tp_rank == 0 && !local_args.random_values) {
+                                    const size_t n_out = local_args.sample_all_positions
+                                                           ? local_args.input_ids.value()->numel()
+                                                           : 1;
+                                    for (size_t i = 0; i < n_out; ++i) {
+                                        (void)std::uniform_real_distribution<float>(0, 1)(rng_);
+                                    }
+                                }
+                                // All Draft ranks have completed the KV write before
+                                // the caller releases or consumes their input HC.
+                                runtime_->syncStream();
+                                output_ = Output{};
+                                output_.eager_reason = eager_reason;
+                                output_.mtp_draft_cache_only_used = true;
                             }
 
                             if (rank_info_.pp_size > 1 && rank_info_.pp_stage + 1 != rank_info_.pp_size) {
@@ -1047,7 +1102,7 @@ void RankWorker::thread_loop() {
                             }
 
                             // Random sampling (rank 0 only)
-                            if (rank_info_.tp_rank == 0) {
+                            if (!local_args.mtp_draft_cache_only && rank_info_.tp_rank == 0) {
                                 auto temperature{local_args.temperature};
                                 auto top_p{local_args.top_p};
                                 auto top_k{local_args.top_k};
@@ -1063,6 +1118,9 @@ void RankWorker::thread_loop() {
                                 const bool sample_all_positions = local_args.sample_all_positions;
                                 const size_t logits_positions = batch_size * total_len;
                                 const bool logits_are_last_token_only = !sample_all_positions && logits_positions == n_req;
+                                if (last_logits_used && !logits_are_last_token_only) {
+                                    throw std::runtime_error("Classic NextN last logits require one row per request");
+                                }
                                 const size_t n_out = sample_all_positions ? static_cast<size_t>(input_offsets[n_req]) : n_req;
                                 auto output_ids = model_sampled_ids
                                                       ? model_sampled_ids
@@ -1132,12 +1190,17 @@ void RankWorker::thread_loop() {
 
                                 auto out{Output{output_ids, logits, hidden_states,
                                                 std::move(graph_execution), eager_reason}};
+                                out.mtp_last_logits_used = last_logits_used;
 
                                 output_ = std::move(out);
                             }
                             if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
                                 runtime_->syncStream();
                                 output_ = Output{{}, {}, std::move(hidden_states), {}, eager_reason};
+                                output_.mtp_last_logits_used = last_logits_used;
+                            } else if (local_args.mtp_scratch_step && rank_info_.tp_rank != 0) {
+                                // Scratch is reused or released after this packed step.
+                                runtime_->syncStream();
                             }
 
                             if (nsa_pool_epoch_ && rank_info_.tp_rank != 0) {
@@ -1170,6 +1233,18 @@ void RankWorker::thread_loop() {
                         (void)drain_nsa_owner_noexcept();
                     }
                     fail("forward", error); // original error stays primary
+                    break;
+                }
+            } else if (local_cmd == Command::CLONE_V4_CACHE_PAGES) {
+                try {
+                    model_->clone_v4_cache_pages(*local_v4_page_copies, forward_context_, *barrier_);
+                    {
+                        std::lock_guard<std::mutex> lk(mutex_);
+                        job_done_ = true;
+                    }
+                    cv_.notify_all();
+                } catch (...) {
+                    fail("clone_v4_cache_pages", std::current_exception());
                     break;
                 }
             } else if (local_cmd == Command::RESET_CACHE) {

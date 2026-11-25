@@ -10,11 +10,16 @@
 #include "execution/graph/graph.hpp"
 
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace infinilm {
 namespace engine::distributed {
 struct RankInfo;
+}
+namespace engine {
+class RankBarrier;
+class DeepSeekV4HostBatch;
 }
 namespace global_state {
 struct ForwardContext;
@@ -70,6 +75,10 @@ public:
         size_t logical_kv_upper_bound{0};
         bool return_draft_hidden_states{false};
         bool rollback_v4_cache{false};
+        bool mtp_draft_cache_only{false};
+        std::shared_ptr<const engine::DeepSeekV4HostBatch> deepseek_v4_host_batch;
+        bool mtp_scratch_step{false};
+        bool mtp_last_logits{false};
     };
 
     struct Output {
@@ -80,6 +89,8 @@ public:
         std::optional<execution::graph::Graph::ExecutionReport> model_graph_execution;
         // Rank 0 may produce greedy token IDs in its model-owned decode graph.
         infinilm::runtime::Tensor model_sampled_ids{};
+        bool mtp_draft_cache_only_used{false};
+        bool mtp_last_logits_used{false};
     };
 
     virtual ~InfinilmModel() = default;
@@ -90,6 +101,10 @@ public:
                              global_state::ForwardContext &forward_context,
                              backends::AttentionBackend attention_backend,
                              const engine::distributed::RankInfo &rank);
+    virtual void clone_v4_cache_pages(
+        const std::vector<std::pair<size_t, size_t>> &copies,
+        global_state::ForwardContext &forward_context,
+        engine::RankBarrier &barrier) const;
     virtual const cache::CacheConfig *get_cache_config() const {
         return cache_config_.get();
     }

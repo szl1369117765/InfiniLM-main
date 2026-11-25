@@ -22,6 +22,12 @@ void InfinilmModel::reset_cache(const cache::CacheConfig *cache_config,
     reset_default_cache(cache_config, forward_context, attention_backend, rank);
 }
 
+void InfinilmModel::clone_v4_cache_pages(
+    const std::vector<std::pair<size_t, size_t>> &,
+    global_state::ForwardContext &, engine::RankBarrier &) const {
+    throw std::invalid_argument("V4 cache page cloning requires a DeepSeek V4 Target");
+}
+
 void InfinilmModel::reset_default_cache(
     const cache::CacheConfig *cache_config,
     global_state::ForwardContext &forward_context,

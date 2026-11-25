@@ -13,7 +13,8 @@ class EngineConfig:
         draft_model_path: Optional Eagle/MTP draft model directory.
         num_draft_tokens: Number of draft tokens to verify per step.
         enable_deepseek_v4_mtp: Opt in to classic DeepSeek V4 NextN (C1-C3, K1-K3).
-        nextn_branch_draft_lengths: Ordered extra candidate depths for single-owner eager NextN.
+        nextn_branch_draft_lengths: Ordered candidate depths for single-owner NextN.
+        nextn_branch_execution: Serial verification or packed verification on private cache pages.
         device: Device type string ('cpu', 'cuda', 'mlu', etc.).
         dtype: Data type string ('float16', 'bfloat16', 'float32').
         tensor_parallel_size: Number of devices for tensor parallelism.
@@ -74,6 +75,7 @@ class EngineConfig:
     chunked_prefill_size: int = 0
     enable_deepseek_v4_mtp: bool = False
     nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None
+    nextn_branch_execution: str = "serial"
 
     def __post_init__(self) -> None:
         if self.enable_deepseek_v4_mtp and (
@@ -99,10 +101,13 @@ class EngineConfig:
                 "and TP expert placement"
             )
         lengths = self.nextn_branch_draft_lengths
+        execution = self.nextn_branch_execution
+        if execution not in ("serial", "packed", "packed-stepwise") or (execution != "serial" and lengths is None):
+            raise ValueError("classic NextN branch execution requires serial, packed or packed-stepwise with candidate depths")
         if lengths is not None:
             if (
                 not self.enable_deepseek_v4_mtp
-                or self.enable_graph
+                or (self.enable_graph and execution == "serial")
                 or self.max_batch_size != 1
                 or not isinstance(lengths, (list, tuple))
                 or not lengths
@@ -110,8 +115,11 @@ class EngineConfig:
                 or len(set(lengths)) != len(lengths)
                 or min(lengths) > self.num_draft_tokens
             ):
+                required_mode = (
+                    "serial branches require eager C1" if execution == "serial" else "packed branches require C1"
+                )
                 raise ValueError(
-                    "classic NextN serial branches require eager C1 and distinct "
+                    f"classic NextN {required_mode} and distinct "
                     "K1/K2/K3 candidate depths with at least one within the draft limit"
                 )
             self.nextn_branch_draft_lengths = tuple(lengths)

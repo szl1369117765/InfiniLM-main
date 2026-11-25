@@ -23,6 +23,7 @@ class _SpeculativeCacheReservation:
     def __init__(self, ops):
         self.ops = ops
         self.rows = []  # (request, base length, original table, provisional table, draft count)
+        self.scratch_pages = ()
         self.submitted = False
         self.completed = False
 
@@ -39,10 +40,35 @@ class _SpeculativeCacheReservation:
             raise RuntimeError("verification reservation cannot be submitted twice")
         self.submitted = True
 
+    def reserve_branch_tables(self, ends):
+        """Give candidates private page tables within this single-owner verify."""
+        self._assert_active()
+        if self.submitted or self.scratch_pages or len(self.rows) != 1:
+            raise RuntimeError("packed NextN branches require an unused single-owner reservation")
+        _, base, _, _, draft_count = self.rows[0]
+        if not 2 <= len(ends) <= 3 or any(not base < end <= base + draft_count for end in ends):
+            raise ValueError("packed NextN branch exceeds its verification reservation")
+        manager = self.ops._cache_manager
+        page_size = manager.block_size
+        counts = [(end + page_size - 1) // page_size for end in ends]
+        self.scratch_pages = manager.allocate_private_blocks(sum(counts))
+        tables = []
+        offset = 0
+        for count in counts:
+            tables.append(tuple(self.scratch_pages[offset:offset + count]))
+            offset += count
+        return tuple(tables)
+
+    def release_branch_tables(self):
+        if self.scratch_pages:
+            self.ops._cache_manager.release_private_blocks(self.scratch_pages)
+            self.scratch_pages = ()
+
     def mark_completed(self):
         self._assert_active()
         if not self.submitted or self.completed:
             raise RuntimeError("verification has no unfinished submitted reservation")
+        self.release_branch_tables()
         self.completed = True
 
     def commit(self, keep_lengths):
@@ -143,6 +169,7 @@ class SpeculativeCacheOps:
                     self._scheduler._completion_failed = True
                 else:
                     try:
+                        batch.release_branch_tables()
                         self._cache_manager.truncate_blocks_many(
                             [table for _, _, _, table, _ in batch.rows],
                             [base for _, base, _, _, _ in batch.rows],

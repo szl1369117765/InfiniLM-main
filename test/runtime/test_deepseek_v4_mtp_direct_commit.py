@@ -16,6 +16,8 @@ from direct_commit_test_runner.deepseek_v4_mtp_transport import (
     _V4Transport,
     _direct_k1_commit_enabled,
     _direct_k23_commit_enabled,
+    _draft_cache_only_enabled,
+    _host_metadata_modes,
 )
 from direct_commit_test_runner.deepseek_v4_mtp_verify import GreedyVerifyBatch, GreedyVerifyRequest
 
@@ -54,17 +56,26 @@ def output(ids, source=None, *, rows=2):
     return result
 
 
+def cache_write_receipt():
+    return {"mtp_draft_cache_only_used": True, "output_ids": None, "logits": None, "hidden_states": None}
+
+
 class DirectCommitTest(unittest.TestCase):
-    def make_step(self, accept, *, direct=True, remaining=4, missing_hidden=False):
+    def make_step(self, accept, *, direct=True, remaining=4, missing_hidden=False,
+                  draft_cache_only=False, reuse_seed=False):
         verify = [9, 10] if accept else [8, 10]
         target = Engine(output([7], "prefill"), output(verify, None if missing_hidden else "verify"))
         if not direct:
             target.responses.append(output(verify if accept else verify[:1], "replay"))
-        draft = Engine(output([1]), output([9]))
+        draft = Engine(cache_write_receipt() if draft_cache_only else output([1]), output([9]))
         if accept and remaining > 2 and not missing_hidden:
-            draft.responses.append(output([10]))
+            repair = output([10], "seed" if reuse_seed else None)
+            if draft_cache_only and not reuse_seed:
+                repair = cache_write_receipt()
+            draft.responses.append(repair)
         core = types.SimpleNamespace(from_list=lambda data, dtype: Tensor(data), int64=64, int32=32)
-        port = _V4Transport(target, draft, core, 256, direct_k1_commit=direct)
+        port = _V4Transport(target, draft, core, 256, direct_k1_commit=direct,
+                            draft_cache_only=draft_cache_only, reuse_seed=reuse_seed)
         prompt = dict(input_ids=Tensor([[1, 3]]), block_tables=Tensor([[6]]), past_kv_lengths=Tensor([0]))
         self.assertEqual(port.prefill("r", prompt), 7)
         self.assertEqual(port.propose("r", 7, 2, [6]), 9)
@@ -120,6 +131,96 @@ class DirectCommitTest(unittest.TestCase):
         self.assertFalse(target.calls[1]["return_draft_hidden_states"])
         self.assertEqual(target.calls[2]["input_ids"].values, [[7]])
         self.assert_hidden_row(port.hidden, "replay", 0)
+
+    def test_host_metadata_modes_preserve_protected_target_queries(self):
+        core = types.SimpleNamespace(from_list=lambda data, dtype: Tensor(data), int64=64, int32=32)
+        for shadow, shared, kwargs in (
+            (False, False, {}),
+            (True, False, {"mtp_cpu_metadata_shadow": True}),
+            (False, True, {"mtp_shared_compression_plan": True}),
+        ):
+            for query in (2, 3, 4):
+                with self.subTest(shadow=shadow, shared=shared, query=query):
+                    tokens = tuple(range(query))
+                    target = Engine(output(list(tokens)))
+                    port = _V4Transport(
+                        target, None, core, 256, cpu_metadata_shadow=shadow,
+                        shared_compression_plan=shared,
+                    )
+                    self.assertEqual(
+                        port._forward(target, tokens, 255, (3, 1), return_hidden=False, rollback=True),
+                        (tokens, None),
+                    )
+                    call = target.calls[0]
+                    self.assertEqual(call["input_offsets"].values, [0, query])
+                    self.assertTrue(call["rollback_v4_cache"])
+                    self.assertEqual(
+                        {key: value for key, value in call.items() if key.startswith("mtp_")},
+                        kwargs,
+                    )
+
+    def test_host_metadata_requires_the_requested_eager_native_capability(self):
+        eager = types.SimpleNamespace(enable_graph=False)
+        graph = types.SimpleNamespace(enable_graph=True)
+        native = types.SimpleNamespace(mtp_cpu_metadata_shadow_version=1)
+        with patch.dict(os.environ, {
+            "INFINILM_MTP_CPU_METADATA_SHADOW": "0",
+            "INFINILM_MTP_SHARED_COMPRESSION_PLAN": "1",
+        }):
+            self.assertEqual(_host_metadata_modes(graph, object()), (False, False))
+            with self.assertRaisesRegex(RuntimeError, "host metadata shadow"):
+                _host_metadata_modes(eager, object())
+            with self.assertRaisesRegex(RuntimeError, "shared compression plan"):
+                _host_metadata_modes(eager, native)
+            native.mtp_shared_compression_plan_version = 1
+            self.assertEqual(_host_metadata_modes(eager, native), (False, True))
+
+    def test_cache_only_writes_prefill_and_draft_repair_but_keeps_verify_and_replay(self):
+        port, target, draft, batch = self.make_step(True, direct=False, draft_cache_only=True)
+        self.commit(port, batch)
+        self.assertEqual([call.get("mtp_draft_cache_only", False) for call in draft.calls],
+                         [True, False, True])
+        self.assertTrue(all("mtp_draft_cache_only" not in call for call in target.calls))
+        self.assertTrue(target.calls[1]["rollback_v4_cache"])
+        self.assertEqual(target.calls[2]["input_ids"].values, [[7, 9]])
+        self.assertEqual((port.anchor, port.position), (10, 4))
+        self.assert_hidden_row(port.hidden, "replay", 1)
+
+    def test_cache_only_preserves_seed_output_and_rejects_nonwrite_calls(self):
+        port, target, draft, batch = self.make_step(True, remaining=5, draft_cache_only=True, reuse_seed=True)
+        self.commit(port, batch)
+        self.assertEqual([call.get("mtp_draft_cache_only", False) for call in draft.calls],
+                         [True, False, False])
+        self.assertTrue(draft.calls[-1]["return_draft_hidden_states"])
+        self.assertEqual(port.propose("r", 10, 4, [6]), 10)
+        self.assertEqual(len(draft.calls), 3)
+        for engine, options in (
+            (target, {"return_hidden": False}),
+            (draft, {"return_hidden": True}),
+            (draft, {"return_hidden": False, "return_logits": True}),
+            (draft, {"return_hidden": False, "rollback": True}),
+        ):
+            with self.assertRaisesRegex(ValueError, "output-free Draft cache write"):
+                port._forward(engine, (10,), 3, [6], draft_hidden=port.hidden, cache_only=True, **options)
+
+    def test_cache_only_does_not_accept_a_missing_completion_receipt(self):
+        port, _, draft, _ = self.make_step(True, draft_cache_only=True)
+        draft.responses.clear()
+        draft.responses.append(output([10]))
+        with self.assertRaisesRegex(RuntimeError, "completed cache write"):
+            port._write_draft_cache((10,), 2, [6], port.hidden)
+
+    def test_cache_only_opt_in_requires_eager_and_native_capability(self):
+        eager = types.SimpleNamespace(enable_graph=False)
+        graph = types.SimpleNamespace(enable_graph=True)
+        native = types.SimpleNamespace(mtp_draft_cache_only_version=1)
+        with patch.dict(os.environ, {"INFINILM_MTP_DRAFT_CACHE_ONLY": "0"}):
+            self.assertFalse(_draft_cache_only_enabled(eager, native))
+        with patch.dict(os.environ, {"INFINILM_MTP_DRAFT_CACHE_ONLY": "1"}):
+            self.assertTrue(_draft_cache_only_enabled(eager, native))
+            self.assertFalse(_draft_cache_only_enabled(graph, object()))
+            with self.assertRaisesRegex(RuntimeError, "requires the native output policy"):
+                _draft_cache_only_enabled(eager, object())
 
     def test_missing_verify_hidden_raises_before_replay(self):
         port, target, draft, batch = self.make_step(False, missing_hidden=True)

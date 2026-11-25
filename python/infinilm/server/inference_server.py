@@ -154,6 +154,7 @@ class InferenceServer:
         num_draft_tokens: int = 4,
         enable_deepseek_v4_mtp: bool = False,
         nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None,
+        nextn_branch_execution: str = "serial",
     ):
         """Initialize inference server.
 
@@ -223,6 +224,7 @@ class InferenceServer:
         self.num_draft_tokens = num_draft_tokens
         self.enable_deepseek_v4_mtp = enable_deepseek_v4_mtp
         self.nextn_branch_draft_lengths = nextn_branch_draft_lengths
+        self.nextn_branch_execution = nextn_branch_execution
 
         self.engine: AsyncLLMEngine = None
         self._standalone_mtp = False
@@ -260,6 +262,7 @@ class InferenceServer:
                 num_draft_tokens=self.num_draft_tokens,
                 enable_deepseek_v4_mtp=self.enable_deepseek_v4_mtp,
                 nextn_branch_draft_lengths=self.nextn_branch_draft_lengths,
+                nextn_branch_execution=self.nextn_branch_execution,
                 device=self.device,
                 dtype=self.dtype,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -831,6 +834,7 @@ def main():
         num_draft_tokens=cfg.num_draft_tokens if cfg.enable_deepseek_v4_mtp else 4,
         enable_deepseek_v4_mtp=cfg.enable_deepseek_v4_mtp,
         nextn_branch_draft_lengths=cfg.nextn_branch_draft_lengths,
+        nextn_branch_execution=cfg.nextn_branch_execution,
         device=device,
         dtype=cfg.dtype,
         tensor_parallel_size=cfg.tp,
