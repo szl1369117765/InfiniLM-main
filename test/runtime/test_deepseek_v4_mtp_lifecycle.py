@@ -433,7 +433,7 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
         self.assertTrue(self.engine.step())
         active.abort()
         waiting.abort()
-        self.engine.step()
+        # After the canceled decode, admit the replacement in the same step.
         self.assertTrue(self.engine.step())
         self.assertFalse(self.engine.step())
         self.assertEqual(
