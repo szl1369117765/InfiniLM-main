@@ -277,10 +277,13 @@ class LLMEngine:
         self.model_runner.close()
 
     def _on_scheduler_abort(self, req: InferenceRequest) -> None:
-        # The async queue owns both the terminal reason and final output.
-        # A standalone synchronous engine has no such queue.
-        if not self._async_abort_owner:
-            _finalize_aborted_request(req, FinishReason.CANCELED)
+        with req._terminal_lock:
+            # Preserve the async queue's terminal reason once it owns the abort.
+            # Classic MTP also permits a caller to abort the request directly.
+            if not self._async_abort_owner or (
+                self.config.enable_deepseek_v4_mtp and not req._abort_enqueued
+            ):
+                _finalize_aborted_request(req, FinishReason.CANCELED)
 
     def step(self) -> bool:
         """Run one inference step.
@@ -327,11 +330,14 @@ class LLMEngine:
             return False
 
         requests = tuple(scheduler_output.scheduled_requests)
-        if mtp_runner is not None and not self._async_abort_owner:
-            aborted = [req for req in requests if req.is_aborted()]
-            if aborted:
-                for req in aborted:
+        if mtp_runner is not None:
+            aborted = []
+            for req in requests:
+                if req.is_aborted():
                     self._on_scheduler_abort(req)
+                    if req.is_finished():
+                        aborted.append(req)
+            if aborted:
                 self.scheduler.complete_requests(aborted)
                 requests = tuple(req for req in requests if req not in aborted)
                 if not requests:
@@ -450,8 +456,7 @@ class LLMEngine:
                     logger.info(
                         f"Request {req.request_id} aborted by client, skipping update"
                     )
-                    if not self._async_abort_owner:
-                        _finalize_aborted_request(req, FinishReason.CANCELED)
+                    self._on_scheduler_abort(req)
                     continue
                 req.num_computed_tokens = (
                     req.num_local_cached_tokens + req.num_scheduled_tokens
@@ -467,8 +472,7 @@ class LLMEngine:
                 logger.info(
                     f"Request {req.request_id} aborted by client, skipping update"
                 )
-                if not self._async_abort_owner:
-                    _finalize_aborted_request(req, FinishReason.CANCELED)
+                self._on_scheduler_abort(req)
                 continue
 
             if isinstance(token_ids, (list, tuple)):

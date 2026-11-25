@@ -1,10 +1,12 @@
 """Exercise classic MTP request retirement through the real paged LLM engine."""
 
 import ast
+import asyncio
 from contextlib import contextmanager
 import importlib
 import queue
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -466,27 +468,31 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
         self.assert_usable_pages(4)
 
     def test_abort_after_c3_schedule_preserves_uncanceled_prefill_rows(self):
-        self.engine = self.make_engine(max_batch_size=3)
-        canceled = self.enqueue("canceled", budget=1)
-        remaining = [self.enqueue(owner, budget=1) for owner in ("left", "right")]
-        schedule = self.engine.scheduler.schedule
+        for async_owner in (False, True):
+            with self.subTest(async_owner=async_owner):
+                self.transport.calls.clear()
+                self.engine = self.make_engine(max_batch_size=3)
+                self.engine._async_abort_owner = async_owner
+                canceled = self.enqueue("canceled", budget=1)
+                remaining = [self.enqueue(owner, budget=1) for owner in ("left", "right")]
+                schedule = self.engine.scheduler.schedule
 
-        def cancel_one():
-            batch = schedule()
-            self.assertEqual(batch.num_requests, 3)
-            canceled.abort()
-            return batch
+                def cancel_one():
+                    batch = schedule()
+                    self.assertEqual(batch.num_requests, 3)
+                    canceled.abort()
+                    return batch
 
-        with patch.object(self.engine.scheduler, "schedule", cancel_one):
-            self.assertTrue(self.engine.step())
-        self.assertEqual(self.outputs(canceled), [(-1, True, self.reason.CANCELED)])
-        for request in remaining:
-            self.assertEqual(self.outputs(request), [(71, True, self.reason.LENGTH)])
-        self.assertEqual(
-            self.transport.calls,
-            [("prefill_many", ("left", "right")), ("release", "left"), ("release", "right")],
-        )
-        self.assert_usable_pages(4)
+                with patch.object(self.engine.scheduler, "schedule", cancel_one):
+                    self.assertTrue(self.engine.step())
+                self.assertEqual(self.outputs(canceled), [(-1, True, self.reason.CANCELED)])
+                for request in remaining:
+                    self.assertEqual(self.outputs(request), [(71, True, self.reason.LENGTH)])
+                self.assertEqual(
+                    self.transport.calls,
+                    [("prefill_many", ("left", "right")), ("release", "left"), ("release", "right")],
+                )
+                self.assert_usable_pages(4)
 
     def test_inflight_abort_blocks_token_and_releases_request(self):
         for checkpoint in ("native", "tokenizer"):
@@ -513,6 +519,143 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
                     [("prefill", checkpoint), ("release", checkpoint)],
                 )
                 self.assert_usable_pages(4)
+
+    def test_async_owner_flag_only_abort_retires_running_and_waiting(self):
+        self.engine._async_abort_owner = True
+        active = self.enqueue("async-active")
+        waiting = self.enqueue("async-waiting")
+        self.assertTrue(self.engine.step())
+        active.abort()
+        waiting.abort()
+
+        native_result = SimpleNamespace(to_numpy=lambda: SimpleNamespace(tolist=lambda: [72]))
+        with patch.object(self.target, "forward", return_value=native_result, create=True) as tail:
+            self.engine.step()
+            self.engine.step()
+            tail.assert_not_called()
+        self.assertEqual(
+            self.outputs(active), [(71, False, None), (-1, True, self.reason.CANCELED)]
+        )
+        self.assertEqual(self.outputs(waiting), [(-1, True, self.reason.CANCELED)])
+        self.assertEqual(
+            self.transport.calls, [("prefill", "async-active"), ("release", "async-active")]
+        )
+        self.assertFalse(self.engine.step())
+        self.assertFalse(self.engine.model_runner.deepseek_v4_mtp_runner.requests)
+        self.assert_usable_pages(4)
+
+    def test_async_owner_flag_only_abort_during_native_or_tokenization(self):
+        for checkpoint in ("native", "tokenizer", "close"):
+            with self.subTest(checkpoint=checkpoint):
+                self.transport = NativeTransport()
+                self.engine = self.make_engine()
+                self.engine._async_abort_owner = True
+                request = self.enqueue(f"async-{checkpoint}")
+                if checkpoint == "tokenizer":
+                    def abort_in_decode(tokens):
+                        request.abort()
+                        return "discarded"
+
+                    with patch.object(self.tokenizer, "decode", abort_in_decode):
+                        self.assertTrue(self.engine.step())
+                elif checkpoint == "close":
+                    async def wait_closed():
+                        return None
+
+                    async def wait_for(awaitable, timeout):
+                        return await awaitable
+
+                    def close_request():
+                        with patch.object(asyncio, "wait_for", wait_for):
+                            with self.assertRaises(StopIteration):
+                                request.close().send(None)
+
+                    stream = request.output_queue
+                    stream.async_q = queue.Queue()
+                    stream.close = lambda: None
+                    stream.wait_closed = wait_closed
+                    self.transport.after_prefill = close_request
+                    with patch.object(stream.sync_q, "put_nowait", side_effect=RuntimeError("queue closed")):
+                        self.assertTrue(self.engine.step())
+                else:
+                    self.transport.after_prefill = request.abort
+                    self.assertTrue(self.engine.step())
+                wanted = [] if checkpoint == "close" else [(-1, True, self.reason.CANCELED)]
+                self.assertEqual(self.outputs(request), wanted)
+                self.assertEqual(request.finish_reason, self.reason.CANCELED)
+                self.assertEqual(list(request.generated_token_ids), [])
+                self.assertFalse(self.engine.model_runner.deepseek_v4_mtp_runner.requests)
+                self.assert_usable_pages(4)
+
+    def test_async_abort_during_packed_cross_page_commit_retires_only_that_owner(self):
+        self.engine = self.make_engine(max_batch_size=3, num_draft_tokens=3)
+        self.engine._async_abort_owner = True
+        canceled = self.llm.InferenceRequest(
+            "cross-page", prompt_token_ids=[7] * 255,
+            sampling_params=self.llm.SamplingParams(max_tokens=5),
+        )
+        canceled.output_queue
+        self.engine.add_request(canceled)
+        peers = [self.enqueue(owner, budget=5) for owner in ("peer-a", "peer-b")]
+        self.assertTrue(self.engine.step())
+        original = tuple(canceled.block_table)
+        self.assertEqual(len(original), 1)
+        cache_ops = self.engine.scheduler.speculative_cache_ops
+
+        def propose_many(owner, anchor, position, table, count, stop_ids):
+            return tuple(range(anchor + 1, anchor + count + 1))
+
+        @contextmanager
+        def target_transaction(batch, tables):
+            self.assertEqual(batch.input_offsets, (0, 4, 8, 12))
+            self.assertEqual([len(table) for table in tables], [2, 1, 1])
+            rows = tuple(self.verify_row(row, row.input_token + 1) for row in batch.rows)
+
+            def commit(intents):
+                self.assertEqual(intents[0].retain_length, 259)
+                self.assertTrue(cache_ops._pending.submitted)
+                self.assertEqual(self.engine.scheduler.cache_manager.get_total_usable_blocks(), 0)
+                canceled.abort()
+
+            yield SimpleNamespace(rows=rows, commit=commit)
+
+        with (
+            patch.object(self.transport, "propose_many", propose_many, create=True),
+            patch.object(self.transport, "target_transaction", target_transaction, create=True),
+        ):
+            self.assertTrue(self.engine.step())
+
+        self.assertEqual(tuple(canceled.block_table), original)
+        self.assertIsNone(cache_ops._pending)
+        self.assertEqual(self.outputs(canceled), [(71, False, None), (-1, True, self.reason.CANCELED)])
+        for peer in peers:
+            self.assertEqual(list(peer.generated_token_ids), [71, 72, 73, 74, 75])
+            self.assertEqual(peer.finish_reason, self.reason.LENGTH)
+        self.assertFalse(self.engine.model_runner.deepseek_v4_mtp_runner.requests)
+        self.assert_usable_pages(4)
+
+    def test_async_queued_timeout_owns_terminal_reason_after_prefill(self):
+        self.engine._async_abort_owner = True
+        async_engine = self.llm.AsyncLLMEngine.__new__(self.llm.AsyncLLMEngine)
+        async_engine._abort_queue = SimpleNamespace(sync_q=queue.Queue())
+        async_engine._stop_lock = threading.Lock()
+        async_engine._healthy = True
+        request = self.enqueue("async-queued")
+        self.transport.after_prefill = lambda: async_engine.add_aborted_req(
+            request, self.reason.TIMEOUT
+        )
+
+        self.assertTrue(self.engine.step())
+        self.assertFalse(request.is_finished())
+        self.assertEqual(self.outputs(request), [])
+        self.assertTrue(request._abort_enqueued)
+        async_engine._drain_abort_queue()
+        self.assertFalse(self.engine.step())
+        self.assertEqual(self.outputs(request), [(-1, True, self.reason.TIMEOUT)])
+        self.assertEqual(
+            self.transport.calls, [("prefill", "async-queued"), ("release", "async-queued")]
+        )
+        self.assert_usable_pages(4)
 
     def test_release_failure_preserves_delivered_terminal_and_notifies_waiter(self):
         complete = self.enqueue("complete", budget=1)
