@@ -136,10 +136,17 @@ struct MixWeights {
 
 // Three short verify spans can contribute up to four rows apiece.
 constexpr size_t kPackedSharedExpertRows = 3 * 4;
+constexpr size_t kC4IndexWidth = 128;
+constexpr size_t kC4IndexTopK = 512;
+constexpr size_t kC4IndexMaxUnscoredPages = kC4IndexTopK / (kV4PageSize / 4);
+
+bool env_enabled(const char *name) {
+    const auto *mode = std::getenv(name);
+    return mode && std::string_view(mode) == "1";
+}
 
 bool packed_shared_constants_enabled() {
-    const auto *mode = std::getenv("INFINILM_MTP_GRAPH_PACKED_SHARED_EXPERT_CONSTANTS");
-    return mode && std::string_view(mode) == "1";
+    return env_enabled("INFINILM_MTP_GRAPH_PACKED_SHARED_EXPERT_CONSTANTS");
 }
 
 struct BatchMetadata {
@@ -149,6 +156,7 @@ struct BatchMetadata {
     std::vector<size_t> query_offsets;
     bool single_decode{};
     bool packed_shared_constants{};
+    bool short_c4_index{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -272,14 +280,20 @@ public:
             auto key = index_compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
                                                  cache.indexer_state,batch.c4_positions,frequencies,batch.query_offsets);
             key = cast(rt,key,DataType::kBFloat16);
-            auto query = index_query_->forward(rt,q_lora)->view({rows,index_heads_,128});
-            apply_rotary_tail(rt,query,batch.position,frequencies);
-            auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
-                auto input = part.slice(x);
-                return index_weights_->forward(rt, input);
-            });
-            // A positive scalar common to all candidates does not change top-k.
-            indices = Tensor::empty(rt,{rows,512},DataType::kInt32);
+            Tensor query, weights;
+            if (batch.short_c4_index) {
+                // This table is too short for scoring. The key still updates the cache.
+                query = key->view({rows, 1, kC4IndexWidth});
+                weights = key->view({key->numel()})->narrow({{0, 0, rows}})->view({rows, 1});
+            } else {
+                query = index_query_->forward(rt,q_lora)->view({rows,index_heads_,kC4IndexWidth});
+                apply_rotary_tail(rt,query,batch.position,frequencies);
+                weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+                    auto input = part.slice(x);
+                    return index_weights_->forward(rt, input);
+                });
+            }
+            indices = Tensor::empty(rt,{rows,kC4IndexTopK},DataType::kInt32);
             submit<infini::ops::DeepseekV4C4Index>(rt,key,batch.c4_slots,query,weights,batch.page_table,
                                                   batch.c4_lengths,cache.indexer,indices);
             lengths = batch.c4_sparse_lengths;
@@ -619,6 +633,11 @@ public:
             return output;
         }
         if (capture_mtp) {
+            const auto table_width = batch.page_table->size(1);
+            batch.short_c4_index = direct_hc && batch.query_offsets.size() == 2 &&
+                rt.device().type() == Device::Type::kHygon && table_width > 0 &&
+                table_width <= kC4IndexMaxUnscoredPages &&
+                env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
                           false, hc, true, owned_hc, direct_hc);
         }
@@ -684,6 +703,7 @@ private:
         Tensor sampled_ids;
         bool greedy;
         bool return_hc;
+        std::array<bool, 3> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
     };
 
@@ -724,9 +744,16 @@ private:
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
+        const std::array short_kernel_modes{
+            env_enabled("INFINIOPS_V4_C128_POOL_SHORT"),
+            env_enabled("INFINI_HYGON_MOE_Q4_GROUP"),
+            env_enabled("INFINIOPS_V4_I8_PROJECTION_Q4"),
+        };
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
                 plan->batch.packed_shared_constants != batch.packed_shared_constants ||
+                plan->batch.short_c4_index != batch.short_c4_index ||
+                plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
                 return false;
@@ -785,7 +812,8 @@ private:
                 batch.position = copy_graph_tensor(rt, batch.position);
             }
             DecodePlan candidate{std::move(ids), std::move(batch),
-                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc, {}};
+                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc,
+                                 short_kernel_modes, {}};
             if (classic_mtp) {
                 barrier.wait();
             }
