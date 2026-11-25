@@ -65,6 +65,7 @@ public:
         bool capture_attempted = false;
         std::string fallback_reason;
         const char *mtp_graph_plan = nullptr;
+        bool mtp_c128_state_only = false;
     };
 
     Graph();

@@ -35,11 +35,10 @@ std::vector<std::shared_ptr<weights::ModelWeights>> Compressor::loading_children
     return children;
 }
 
-runtime::Tensor Compressor::forward(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
-                                    const runtime::Tensor &sources, const runtime::Tensor &state_slots,
-                                    const runtime::Tensor &state, const runtime::Tensor &positions,
-                                    const runtime::Tensor &cos_sin,
-                                    const std::vector<size_t> &query_offsets) const {
+runtime::Tensor Compressor::compress(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                                     const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                                     const runtime::Tensor &state,
+                                     const std::vector<size_t> &query_offsets) const {
     if (!hidden_states || hidden_states->ndim() != 2 || !sources || sources->ndim() != 2) {
         throw std::invalid_argument("DeepSeek V4 compressor requires rank-two input and source rows");
     }
@@ -53,6 +52,22 @@ runtime::Tensor Compressor::forward(runtime::Runtime &runtime, const runtime::Te
     execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
                           Op::DefaultConfig(runtime.device().type()), projection, ape_, sources,
                           state_slots, state, output);
+    return output;
+}
+
+void Compressor::update_state(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                              const runtime::Tensor &state_slots, const runtime::Tensor &state,
+                              const std::vector<size_t> &query_offsets) const {
+    auto sources = runtime::Tensor::empty(runtime, {0, 128}, runtime::DataType::kInt32);
+    compress(runtime, hidden_states, sources, state_slots, state, query_offsets);
+}
+
+runtime::Tensor Compressor::forward(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                                    const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                                    const runtime::Tensor &state, const runtime::Tensor &positions,
+                                    const runtime::Tensor &cos_sin,
+                                    const std::vector<size_t> &query_offsets) const {
+    auto output = compress(runtime, hidden_states, sources, state_slots, state, query_offsets);
     auto kv = norm_->forward(runtime, output);
     apply_rotary_tail(runtime, kv, positions, cos_sin);
     return kv;

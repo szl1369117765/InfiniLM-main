@@ -403,6 +403,7 @@ inline void bind_infer_engine(py::module &m) {
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
             if (graph && graph->mtp_graph_plan) {
                 result["mtp_graph_plan"] = graph->mtp_graph_plan;
+                result["mtp_c128_state_only"] = graph->mtp_c128_state_only;
             }
             if (!output.mtp_graph_direct_rank_reports.empty()) {
                 py::list rank_reports;
@@ -415,6 +416,7 @@ inline void bind_infer_engine(py::module &m) {
                     entry["operator_count"] = report.operator_count;
                     if (report.mtp_graph_plan) {
                         entry["mtp_graph_plan"] = report.mtp_graph_plan;
+                        entry["mtp_c128_state_only"] = report.mtp_c128_state_only;
                     }
                     rank_reports.append(std::move(entry));
                 }

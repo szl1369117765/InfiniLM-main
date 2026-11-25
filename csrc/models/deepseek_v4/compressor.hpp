@@ -16,9 +16,19 @@ public:
                             const runtime::Tensor &cos_sin,
                             const std::vector<size_t> &query_offsets) const;
 
+    // C128 short verification with no compressed cache row to publish.
+    void update_state(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                      const runtime::Tensor &state_slots, const runtime::Tensor &state,
+                      const std::vector<size_t> &query_offsets) const;
+
     std::vector<std::shared_ptr<weights::ModelWeights>> loading_children() const override;
 
 private:
+    runtime::Tensor compress(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                             const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                             const runtime::Tensor &state,
+                             const std::vector<size_t> &query_offsets) const;
+
     size_t head_dim_;
     runtime::Tensor ape_;
     std::shared_ptr<layers::linear::GateUpParallelLinear> projection_;
