@@ -20,7 +20,7 @@ DIRECT = {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": "1"}
 
 
 def run_arm(proposal, repair, *, specs=SPECS, rounds=2, permit_direct=True):
-    runner, requests, draft, core = make_case(
+    runner, requests, draft, _ = make_case(
         False, 3, specs, transport_options=OPTIONS, modes=(proposal, repair),
     )
     transport = runner.transport
@@ -53,7 +53,6 @@ def run_arm(proposal, repair, *, specs=SPECS, rounds=2, permit_direct=True):
 
     owner_state = {owner: (state.anchor, state.position, [tensor.rows for tensor in state.hidden])
                    for owner, state in transport.states.items()}
-    assert core.device == "caller" and not core.pending
     return (outputs, tables, owner_state, draft.cache, draft.input_hidden, transport.target.cache), calls
 
 

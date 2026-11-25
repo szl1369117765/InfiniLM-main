@@ -488,23 +488,6 @@ class _V4Transport:
             **({"graph_fresh_prefill": True} if graph_fresh_prefill else {}),
         )
 
-    def _join_draft_hidden(self, segments):
-        core = self.core
-        # Native returns completed rank-local views. Cat submits on the frontend
-        # runtime for each device. Finish those writes before the Draft workers
-        # consume the joined tensors on their separate rank streams.
-        hidden = tuple(core.cat(rank_rows, dim=0) for rank_rows in zip(
-            *(segment.hidden for segment in segments), strict=True,
-        ))
-        previous = core.get_device()
-        try:
-            for tensor in hidden:
-                core.set_device(tensor.device)
-                core.sync_stream()
-        finally:
-            core.set_device(previous)
-        return hidden
-
     def _forward_draft_segments(self, segments, *, return_hidden):
         if len(segments) == 1:
             (segment,) = segments
@@ -529,6 +512,8 @@ class _V4Transport:
             tables.append(list(table) + [-1] * (width - len(table)))
         if len(set(slots)) != len(slots):
             raise ValueError("MTP packed Draft has overlapping physical slots")
+        # Each Draft worker joins its own rank's HC views in packed token order.
+        hidden_segments_by_rank = tuple(zip(*(segment.hidden for segment in segments), strict=True))
         core = self.core
         result = self.draft.forward_raw(
             input_ids=core.from_list([tokens], dtype=core.int64),
@@ -542,7 +527,7 @@ class _V4Transport:
             sample_all_positions=False,
             top_k=1,
             return_draft_hidden_states=return_hidden,
-            target_hidden_states_by_rank=self._join_draft_hidden(segments),
+            target_hidden_segments_by_rank=hidden_segments_by_rank,
             **self._host_metadata_options(),
         )
         return self._decode(result, len(segments))

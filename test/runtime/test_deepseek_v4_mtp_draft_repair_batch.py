@@ -8,7 +8,7 @@ from test_deepseek_v4_mtp_batched_draft import decode, make_case
 
 def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
     specs = (("long", 1, 12, first_stop), ("reject", 4, 9, ()), ("partial", 7, 12, ()))
-    runner, requests, draft, core = make_case(False, 3, specs)
+    runner, requests, draft, _ = make_case(False, 3, specs)
     transport = runner.transport
     transport.batched_target_replay = target_replay
     transport.batched_draft_repair = enabled
@@ -56,7 +56,6 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
         owner: (value.anchor, value.position, [tensor.rows for tensor in value.hidden])
         for owner, value in transport.states.items()
     }
-    assert core.device == "caller" and not core.pending
     return output, repairs, draft.cache, draft.input_hidden, transport.target.cache, state
 
 

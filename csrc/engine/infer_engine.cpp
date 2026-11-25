@@ -535,6 +535,20 @@ InferEngine::Input::to_model_input(
             ? target_hidden_states
             : to_device(target_hidden_states),
         sample_all_positions};
+    if (!target_hidden_segments.empty()) {
+        // The producer fence completed before this RUN. Keep the source views
+        // and enqueue all copies on this Draft worker's stream before forward.
+        const auto &first = target_hidden_segments.front();
+        auto packed = infinilm::runtime::Tensor::empty(runtime,
+            {input.input_ids.value()->numel(), first->size(1), first->size(2)}, first->dtype());
+        size_t offset = 0;
+        for (const auto &view : target_hidden_segments) {
+            const auto rows = view->size(0);
+            packed->narrow({{0, offset, rows}})->copy_from(runtime, view);
+            offset += rows;
+        }
+        input.target_hidden_states = std::move(packed);
+    }
     input.logical_kv_upper_bound = logical_kv_upper_bound;
     input.return_draft_hidden_states = return_draft_hidden_states;
     input.rollback_v4_cache = rollback_v4_cache;
@@ -592,7 +606,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         const auto type = model_config_->get<std::string>("model_type");
         const bool classic = (type == "deepseek_v4" &&
                               (original.return_draft_hidden_states || original.rollback_v4_cache))
-            || (type == "deepseek_v4_mtp" && original.target_hidden_states_by_rank);
+            || (type == "deepseek_v4_mtp" &&
+                (original.target_hidden_states_by_rank || original.target_hidden_segments_by_rank));
         if (classic && paged && paged->block_size() == models::deepseek_v4::kV4PageSize
             && original.position_ids && original.input_offsets &&
             original.block_tables && original.slot_mapping) {
@@ -641,6 +656,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
     }
     const auto &rank_hidden = input.target_hidden_states_by_rank;
+    const auto &rank_segments = input.target_hidden_segments_by_rank;
     if (input.mtp_graph_direct_commit) {
         const auto &dist = communication_group_.get_dist_config();
         const auto owners = paged ? paged->max_batch_size() : 0;
@@ -665,6 +681,47 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         return value && *value && (*value)->device().type() == Device::Type::kCpu
             && (*value)->dtype() == type && (*value)->is_contiguous() && (*value)->ndim() == 1;
     };
+    if (rank_segments) {
+        const auto &ids = input.input_ids;
+        const auto &offsets = input.input_offsets;
+        if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp"
+            || communication_group_.get_dist_config().pp_size != 1 || nsa_pool_epoch_
+            || rank_hidden || input.target_hidden_states || rank_segments->size() != workers_.size()
+            || !ids || !*ids || (*ids)->ndim() != 2 || (*ids)->size(0) != 1
+            || !cpu_vector(offsets, DataType::kInt32) || (*offsets)->numel() < 3
+            || input.sample_all_positions || input.top_k != 1 || input.sampling_rows || input.random_values
+            || input.rollback_v4_cache || input.mtp_draft_cache_only || input.mtp_scratch_step || input.mtp_last_logits
+            || input.mtp_graph_direct_commit || input.mtp_graph_fresh_prefill || input.mtp_graph_draft_seed) {
+            throw std::invalid_argument("Segmented rank-local HC requires packed greedy Classic V4 Draft");
+        }
+        const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
+        const auto segments = (*offsets)->numel() - 1;
+        if (bounds[0] != 0 || bounds[segments] <= 0 || size_t(bounds[segments]) != (*ids)->numel()) {
+            throw std::invalid_argument("Packed Draft offsets must cover all input tokens");
+        }
+        for (size_t segment = 0; segment < segments; ++segment) {
+            if (bounds[segment + 1] <= bounds[segment]) {
+                throw std::invalid_argument("Packed Draft offsets must strictly increase");
+            }
+        }
+        const auto hidden_size = model_config_->get<size_t>("hidden_size");
+        for (size_t rank = 0; rank < workers_.size(); ++rank) {
+            const auto &views = (*rank_segments)[rank];
+            const auto device = communication_group_.get_rank_info(rank).device;
+            if (views.size() != segments) {
+                throw std::invalid_argument("Each Draft rank requires one HC view per request");
+            }
+            for (size_t segment = 0; segment < segments; ++segment) {
+                const auto &view = views[segment];
+                const auto count = size_t(bounds[segment + 1] - bounds[segment]);
+                if (!view || view->device() != device || view->dtype() != DataType::kBFloat16
+                    || view->ndim() != 3 || view->size(0) != count
+                    || view->size(1) != 4 || view->size(2) != hidden_size) {
+                    throw std::invalid_argument("Packed Draft rank-local HC view does not match its input rows");
+                }
+            }
+        }
+    }
     if (input.mtp_graph_fresh_prefill) {
         // Graph-enabled engines still run this prefill eagerly. Permit only the
         // initial Target head selection or the initial output-free Draft write.
@@ -894,11 +951,16 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
     }
     // All rank-local tensors are prepared before any worker can enter a collective.
-    if (rank_hidden) {
+    if (rank_hidden || rank_segments) {
         auto rank_input = input;
         rank_input.target_hidden_states_by_rank.reset();
+        rank_input.target_hidden_segments_by_rank.reset();
         for (size_t i = 0; i < workers_.size(); ++i) {
-            rank_input.target_hidden_states = (*rank_hidden)[i];
+            if (rank_hidden) {
+                rank_input.target_hidden_states = (*rank_hidden)[i];
+            } else {
+                rank_input.target_hidden_segments = (*rank_segments)[i];
+            }
             workers_[i]->run(rank_input, v4_host_batch);
         }
     } else {

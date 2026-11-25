@@ -250,6 +250,7 @@ inline void bind_infer_engine(py::module &m) {
                     "return_draft_hidden_states",
                     "rollback_v4_cache",
                     "target_hidden_states_by_rank",
+                    "target_hidden_segments_by_rank",
                     "mtp_draft_cache_only",
                     "mtp_cpu_metadata_shadow",
                     "mtp_shared_compression_plan",
@@ -328,6 +329,9 @@ inline void bind_infer_engine(py::module &m) {
                     } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
+                    } else if (key == "target_hidden_segments_by_rank" && !item.second.is_none()) {
+                        input.target_hidden_segments_by_rank =
+                            py::cast<std::vector<std::vector<infinilm::runtime::Tensor>>>(item.second);
                     }
                 }
 
