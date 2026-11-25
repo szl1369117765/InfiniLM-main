@@ -370,6 +370,7 @@ class InferEngine(_infinilm.InferEngine):
         mtp_shared_compression_plan=False,
         mtp_scratch_step=False,
         mtp_last_logits=False,
+        mtp_graph_direct_commit=False,
     ):
         def unwrap_tensor(tensor):
             return (
@@ -422,6 +423,12 @@ class InferEngine(_infinilm.InferEngine):
             if getattr(self, "mtp_draft_cache_only_version", 0) != 1:
                 raise RuntimeError("Classic NextN Draft cache-only requires the native output policy")
             mtp_arguments["mtp_draft_cache_only"] = True
+        if type(mtp_graph_direct_commit) is not bool:
+            raise ValueError("mtp_graph_direct_commit must be a bool")
+        if mtp_graph_direct_commit:
+            if getattr(self, "mtp_graph_packed_direct_commit_version", 0) != 1:
+                raise RuntimeError("Classic NextN packed direct commit requires native Graph support")
+            mtp_arguments["mtp_graph_direct_commit"] = True
         for key, enabled in (
             ("mtp_cpu_metadata_shadow", mtp_cpu_metadata_shadow),
             ("mtp_shared_compression_plan", mtp_shared_compression_plan),
@@ -612,6 +619,7 @@ class InferEngine(_infinilm.InferEngine):
         mtp_shared_compression_plan=False,
         mtp_scratch_step=False,
         mtp_last_logits=False,
+        mtp_graph_direct_commit=False,
     ):
         try:
             output = super().forward(
@@ -643,6 +651,7 @@ class InferEngine(_infinilm.InferEngine):
                     mtp_shared_compression_plan=mtp_shared_compression_plan,
                     mtp_scratch_step=mtp_scratch_step,
                     mtp_last_logits=mtp_last_logits,
+                    mtp_graph_direct_commit=mtp_graph_direct_commit,
                 )
             )
             metadata_evidence = {}

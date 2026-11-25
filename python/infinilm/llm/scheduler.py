@@ -40,6 +40,22 @@ class _SpeculativeCacheReservation:
             raise RuntimeError("verification reservation cannot be submitted twice")
         self.submitted = True
 
+    def permits_packed_direct_target(self, tables):
+        self._assert_active()
+        scheduler = self.ops._scheduler
+        if (not self.submitted or self.completed or self.scratch_pages or len(self.rows) != 3
+                or scheduler.enable_prefix_caching or not all(tables)
+                or tables != tuple(provisional for _, _, _, provisional, _ in self.rows)):
+            return False
+        for req, base, original, _, _ in self.rows:
+            if (scheduler._active_requests.get(req.request_id) is not req
+                    or req._paged_completion_state != "active" or req.is_aborted()
+                    or req.num_local_cached_tokens != base - 1 or req.get_total_length() != base
+                    or tuple(req.block_table) != original):
+                return False
+        pages = tuple(page for table in tables for page in table)
+        return self.ops._cache_manager.has_private_unpublished_pages(pages)
+
     def reserve_branch_tables(self, ends):
         """Give candidates private page tables within this single-owner verify."""
         self._assert_active()

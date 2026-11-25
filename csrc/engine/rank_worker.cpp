@@ -824,12 +824,14 @@ void RankWorker::thread_loop() {
                             throw std::invalid_argument("V4 MTP requires a single pipeline stage");
                         }
                         const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states ||
-                            local_args.rollback_v4_cache || local_args.mtp_scratch_step;
+                            local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
+                            local_args.mtp_graph_direct_commit;
                         const bool graph_enabled = enable_graph_compiling_ && rank_info_.pp_size == 1;
                         // For a one-row Draft proposal, the last token is all
                         // positions. Draft prefill/repair still request all rows.
                         const bool mtp_graph_candidate = graph_enabled && !local_args.mtp_draft_cache_only &&
                             (local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
+                            local_args.mtp_graph_direct_commit ||
                             (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions &&
                              !local_args.return_draft_hidden_states));
                         std::shared_ptr<const nsa::Proof> nsa_proof;
@@ -1050,6 +1052,15 @@ void RankWorker::thread_loop() {
                                 last_logits_used = model_output.mtp_last_logits_used;
                             }
 
+                            if (local_args.mtp_graph_direct_commit
+                                && (!graph_execution || graph_execution->device_graph_segments != 1
+                                    || graph_execution->host_segments != 0 || !hidden_states
+                                    || hidden_states->ndim() != 3
+                                    || hidden_states->size(0) != (*local_args.input_ids)->numel())) {
+                                runtime_->syncStream();
+                                throw std::runtime_error(
+                                    "Packed direct MTP requires one device Graph and full HC on every TP rank");
+                            }
                             if (local_args.mtp_draft_cache_only) {
                                 if (!draft_cache_only_used || logits || hidden_states || model_sampled_ids ||
                                     graph_execution) {
@@ -1196,7 +1207,11 @@ void RankWorker::thread_loop() {
                             }
                             if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
                                 runtime_->syncStream();
-                                output_ = Output{{}, {}, std::move(hidden_states), {}, eager_reason};
+                                if (!local_args.mtp_graph_direct_commit) {
+                                    graph_execution.reset();
+                                }
+                                output_ = Output{{}, {}, std::move(hidden_states),
+                                                 std::move(graph_execution), eager_reason};
                                 output_.mtp_last_logits_used = last_logits_used;
                             } else if (local_args.mtp_scratch_step && rank_info_.tp_rank != 0) {
                                 // Scratch is reused or released after this packed step.

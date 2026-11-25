@@ -1,4 +1,4 @@
-"""Exercise eager K1 Target commit without loading the native engines."""
+"""Exercise eager and packed Graph Target commit with native call substitutes."""
 
 import os
 import sys
@@ -13,6 +13,7 @@ package = types.ModuleType("direct_commit_test_runner")
 package.__path__ = [str(Path(__file__).resolve().parents[2] / "python/infinilm/llm/model_runner")]
 sys.modules[package.__name__] = package
 from direct_commit_test_runner.deepseek_v4_mtp_transport import (
+    _DraftState,
     _V4Transport,
     _direct_k1_commit_enabled,
     _direct_k23_commit_enabled,
@@ -31,6 +32,10 @@ class Tensor:
 
     def tolist(self):
         return self.values
+
+    @property
+    def shape(self):
+        return (len(self.values), 1, 1)
 
     def narrow(self, dim, start, count):
         assert dim == 0
@@ -61,6 +66,81 @@ def cache_write_receipt():
 
 
 class DirectCommitTest(unittest.TestCase):
+    def packed_direct_step(self, *, enabled, hidden=True, graph=True):
+        requests = (
+            GreedyVerifyRequest("a", 253, 4, 1, (2, 3, 4)),
+            GreedyVerifyRequest("b", 253, 5, 11, (12, 13), frozenset({13})),
+            GreedyVerifyRequest("c", 255, 5, 21, (22,)),
+        )
+        # B's full three-token reservation crosses p256, but Draft stops at
+        # EOS. The last reserved page must stay leased and out of native input.
+        tables = ((3, 4), (5, 8), (6, 7))
+        batch = GreedyVerifyBatch.pack(requests, 512)
+        predictions = [2, 3, 4, 5, 15, 16, 17, 22, 23]
+        verify = output(predictions, "verify" if enabled and hidden else None, rows=9)
+        verify["execution_report"] = {
+            "mode": "device_graph" if graph else "mixed",
+            "device_graph_segments": 1,
+            "host_segments": 0 if graph else 1,
+        }
+        target = Engine(
+            verify,
+            *(() if enabled else (
+                output(predictions[:4], "a", rows=4),
+                output(predictions[4:5], "b", rows=1),
+                output(predictions[7:], "c", rows=2),
+            )),
+        )
+        draft = Engine(output([29]))
+        core = types.SimpleNamespace(from_list=lambda data, dtype: Tensor(data), int64=64, int32=32)
+        port = _V4Transport(target, draft, core, 256, graph_packed_direct_available=True)
+        for req, table in zip(requests, tables, strict=True):
+            port.states[req.owner] = _DraftState((), req.anchor, req.start, req.draft_tokens, table)
+        return port, target, draft, batch, tables
+
+    def test_packed_graph_direct_slices_owner_hc_and_trims_only_native_pages(self):
+        port, target, draft, batch, tables = self.packed_direct_step(enabled=True)
+        with patch.dict(os.environ, {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": "1"}):
+            with port.target_transaction(batch, tables, graph_packed_direct_commit=True) as tx:
+                self.assertEqual(tx.tables, tables)
+                self.assertEqual(port.states["b"].proposal_table, (5, 8))
+                decisions = batch.resolve(tx.rows)
+                self.assertEqual([(d.retain_length, d.terminal) for d in decisions],
+                                 [(257, True), (254, False), (257, False)])
+                tx.commit(decisions)
+        self.assertEqual(len(target.calls), 1)
+        self.assertTrue(target.calls[0]["mtp_graph_direct_commit"])
+        self.assertFalse(target.calls[0]["rollback_v4_cache"])
+        self.assertEqual(target.calls[0]["input_offsets"].values, [0, 4, 7, 9])
+        self.assertEqual(target.calls[0]["block_tables"].values, [[3, 4], [5, -1], [6, 7]])
+        self.assertEqual(len(draft.calls), 1)
+        self.assert_hidden_row(draft.calls[0]["target_hidden_states_by_rank"], "verify", 7)
+        for owner, row in (("a", 3), ("b", 4), ("c", 8)):
+            self.assert_hidden_row(port.states[owner].hidden, "verify", row)
+
+    def test_packed_graph_direct_defaults_to_protection(self):
+        port, target, _, batch, tables = self.packed_direct_step(enabled=False)
+        with patch.dict(os.environ, {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": "0"}):
+            with port.target_transaction(batch, tables, graph_packed_direct_commit=True) as tx:
+                tx.commit(batch.resolve(tx.rows))
+        self.assertEqual([call["rollback_v4_cache"] for call in target.calls], [True, False, False, False])
+        self.assertEqual(target.calls[0]["block_tables"].values, [list(table) for table in tables])
+        self.assertNotIn("mtp_graph_direct_commit", target.calls[0])
+
+    def test_packed_graph_direct_bad_receipt_does_not_retry_after_native_write(self):
+        for options, message in (
+            ({"hidden": False}, "complete Target HC"),
+            ({"graph": False}, "single Target device Graph"),
+        ):
+            with self.subTest(options=options):
+                port, target, draft, batch, tables = self.packed_direct_step(enabled=True, **options)
+                with patch.dict(os.environ, {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": "1"}):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        with port.target_transaction(batch, tables, graph_packed_direct_commit=True):
+                            self.fail("invalid native receipt reached commit")
+                self.assertEqual(len(target.calls), 1)
+                self.assertEqual(draft.calls, [])
+
     def make_step(self, accept, *, direct=True, remaining=4, missing_hidden=False,
                   draft_cache_only=False, reuse_seed=False):
         verify = [9, 10] if accept else [8, 10]

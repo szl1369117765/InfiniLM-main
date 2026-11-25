@@ -70,6 +70,7 @@ inline void bind_infer_engine(py::module &m) {
     py::class_<InferEngine, std::shared_ptr<InferEngine>> infer_engine(
         m, "InferEngine", py::release_gil_before_calling_cpp_dtor());
     infer_engine.def_property_readonly("deepseek_v4_raw_ring_rows", &InferEngine::deepseek_v4_raw_ring_rows);
+    infer_engine.def_property_readonly("mtp_graph_packed_direct_commit_version", [](const InferEngine &) { return 1; });
     infer_engine.attr("mtp_draft_cache_only_version") = 1;
     infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
     infer_engine.attr("mtp_shared_compression_plan_version") = 1;
@@ -252,6 +253,7 @@ inline void bind_infer_engine(py::module &m) {
                     "mtp_shared_compression_plan",
                     "mtp_scratch_step",
                     "mtp_last_logits",
+                    "mtp_graph_direct_commit",
                 };
 
                 for (auto &item : kwargs) {
@@ -304,6 +306,11 @@ inline void bind_infer_engine(py::module &m) {
                             throw py::value_error("mtp_last_logits must be a bool");
                         }
                         input.mtp_last_logits = py::cast<bool>(item.second);
+                    } else if (key == "mtp_graph_direct_commit") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_graph_direct_commit must be a bool");
+                        }
+                        input.mtp_graph_direct_commit = py::cast<bool>(item.second);
                     } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
@@ -376,6 +383,19 @@ inline void bind_infer_engine(py::module &m) {
             result["host_segments"] = host_segments;
             result["operator_count"] = graph ? graph->operator_count : 0;
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
+            if (!output.mtp_graph_direct_rank_reports.empty()) {
+                py::list rank_reports;
+                for (size_t rank = 0; rank < output.mtp_graph_direct_rank_reports.size(); ++rank) {
+                    const auto &report = output.mtp_graph_direct_rank_reports[rank];
+                    py::dict entry;
+                    entry["rank"] = rank;
+                    entry["device_graph_segments"] = report.device_graph_segments;
+                    entry["host_segments"] = report.host_segments;
+                    entry["operator_count"] = report.operator_count;
+                    rank_reports.append(std::move(entry));
+                }
+                result["mtp_graph_direct_rank_reports"] = std::move(rank_reports);
+            }
             return result;
         });
 }

@@ -258,13 +258,16 @@ class BlockManager:
             raise
         return pages
 
-    def release_private_blocks(self, pages: Sequence[int]) -> None:
-        if len(pages) != len(set(pages)) or any(
-            page not in self.used_block_ids
-            or self.blocks[page].ref_count != 1
-            or self.blocks[page].hash != EMPTY_BLOCK_HASH
+    def has_private_unpublished_pages(self, pages: Sequence[int]) -> bool:
+        return len(pages) == len(set(pages)) and all(
+            page in self.used_block_ids
+            and self.blocks[page].ref_count == 1
+            and self.blocks[page].hash == EMPTY_BLOCK_HASH
             for page in pages
-        ):
+        )
+
+    def release_private_blocks(self, pages: Sequence[int]) -> None:
+        if not self.has_private_unpublished_pages(pages):
             raise RuntimeError("packed NextN scratch pages must be privately owned")
         for page in pages:
             self.blocks[page].ref_count = 0

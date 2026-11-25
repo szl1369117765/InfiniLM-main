@@ -79,6 +79,7 @@ public:
         std::shared_ptr<const engine::DeepSeekV4HostBatch> deepseek_v4_host_batch;
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
+        bool mtp_graph_direct_commit{false};
     };
 
     struct Output {

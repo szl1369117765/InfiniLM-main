@@ -232,9 +232,16 @@ class DeepSeekV4MTPRunner:
                     transaction.commit(winner)
             else:
                 batch = GreedyVerifyBatch.pack(requests, self.max_context)
+                packed_direct = (
+                    self.num_draft_tokens == 3 and len(candidates) == 3
+                    and getattr(self.transport, "graph_packed_direct_enabled", lambda: False)()
+                    and all(not item["req"].sampling_params.do_sample for item in candidates)
+                    and reservation.permits_packed_direct_target(tables)
+                )
                 with self.transport.target_transaction(
                     batch, tables[0] if len(candidates) == 1 else tables,
                     **({"batch_draft_seed": True} if batched and self.num_draft_tokens == 1 else {}),
+                    **({"graph_packed_direct_commit": True} if packed_direct else {}),
                 ) as transaction:
                     intents = (
                         transaction.resolve_stochastic()
