@@ -191,8 +191,11 @@ class DeepSeekV4MTPRunner:
             # reserved until the transport has resolved the full transaction.
             reservation.mark_submitted()
             tables = tuple(tuple(candidate["block_table"]) for candidate in candidates)
+            keep_final_graph = self.num_draft_tokens == 3 and getattr(
+                self.transport, "graph_batched_draft_proposal", False
+            )
             batched = (
-                getattr(self.transport, "batched_draft", False)
+                (getattr(self.transport, "batched_draft", False) or keep_final_graph)
                 and not self.branch_draft_lengths
                 and (self.num_draft_tokens == 1 or len(candidates) > 1)
                 and all(not candidate["req"].sampling_params.do_sample for candidate in candidates)
@@ -200,7 +203,9 @@ class DeepSeekV4MTPRunner:
             if batched:
                 proposals = [self._proposal_request(candidate) for candidate in candidates]
                 counts = tuple(candidate["draft_count"] for candidate in candidates)
-                chains = self.transport.propose_batched(proposals, tables, counts)
+                chains = self.transport.propose_batched(
+                    proposals, tables, counts, **({"keep_final_graph": True} if keep_final_graph else {}),
+                )
                 requests = [replace(request, draft_tokens=chain)
                             for request, chain in zip(proposals, chains, strict=True)]
             else:

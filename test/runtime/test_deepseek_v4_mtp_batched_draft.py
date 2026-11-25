@@ -134,6 +134,11 @@ class Engine:
         self.calls.append((tuple(spans), all_positions))
         self.return_hidden.append(options["return_draft_hidden_states"])
         result = {"output_ids": Tensor(predictions)}
+        if options.get("mtp_graph_direct_commit"):
+            assert not self.draft and not options["rollback_v4_cache"]
+            result["execution_report"] = {
+                "mode": "device_graph", "device_graph_segments": 1, "host_segments": 0,
+            }
         if options["return_draft_hidden_states"]:
             result["hidden_states_by_rank"] = tuple(Tensor(rows, rank) for rank, rows in enumerate(hidden))
         return result
@@ -162,6 +167,9 @@ class Request:
 
 
 class CacheOps:
+    def __init__(self, *, permit_direct=False):
+        self.permit_direct = permit_direct
+
     @contextmanager
     def verify_batch(self, candidates):
         for row in candidates:
@@ -175,12 +183,16 @@ class CacheOps:
             for row, length in zip(candidates, lengths, strict=True):
                 row["req"].block_table = row["block_table"][:(length + PAGE_SIZE - 1) // PAGE_SIZE]
 
-        yield SimpleNamespace(mark_submitted=lambda: None, mark_completed=lambda: None, commit=commit)
+        yield SimpleNamespace(mark_submitted=lambda: None, mark_completed=lambda: None, commit=commit,
+                              permits_packed_direct_target=lambda tables: self.permit_direct)
 
 
-def make_case(enabled, depth, specs):
+def make_case(enabled, depth, specs, *, transport_options=None, modes=None):
     target, draft, core = Engine(), Engine(draft=True), Core()
-    transport = _V4Transport(target, draft, core, PAGE_SIZE, batched_draft=enabled)
+    transport = _V4Transport(target, draft, core, PAGE_SIZE, batched_draft=enabled, **(transport_options or {}))
+    if modes is not None:
+        proposal, repair = modes
+        transport.set_c3_draft_modes(proposal=proposal, repair=repair)
     runner = DeepSeekV4MTPRunner(target, transport, 2048, num_draft_tokens=depth)
     requests = [Request(name, page, budget, stop=stop) for name, page, budget, stop in specs]
     pages = [request.block_table[0] for request in requests]
@@ -205,9 +217,10 @@ def make_case(enabled, depth, specs):
     return runner, requests, draft, core
 
 
-def decode(runner, requests):
+def decode(runner, requests, *, cache_ops=None):
     output = runner.forward(SimpleNamespace(
-        is_prefill=False, scheduled_requests=requests, speculative_cache_ops=CacheOps(),
+        is_prefill=False, scheduled_requests=requests,
+        speculative_cache_ops=CacheOps() if cache_ops is None else cache_ops,
     ), {})
     for request, tokens in zip(requests, output, strict=True):
         request.generated_token_ids.extend(tokens)
