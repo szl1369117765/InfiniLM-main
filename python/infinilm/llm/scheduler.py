@@ -43,7 +43,7 @@ class _SpeculativeCacheReservation:
     def permits_packed_direct_target(self, tables):
         self._assert_active()
         scheduler = self.ops._scheduler
-        if (not self.submitted or self.completed or self.scratch_pages or len(self.rows) != 3
+        if (not self.submitted or self.completed or self.scratch_pages or len(self.rows) not in (1, 3)
                 or scheduler.enable_prefix_caching or not all(tables)
                 or tables != tuple(provisional for _, _, _, provisional, _ in self.rows)):
             return False

@@ -127,6 +127,25 @@ class DirectCommitTest(unittest.TestCase):
         self.assertEqual(target.calls[0]["block_tables"].values, [list(table) for table in tables])
         self.assertNotIn("mtp_graph_direct_commit", target.calls[0])
 
+    def test_single_owner_graph_direct_reuses_target_hidden(self):
+        port, target, _, _, tables = self.packed_direct_step(enabled=True)
+        req = GreedyVerifyRequest("a", 253, 4, 1, (2, 3, 4))
+        batch = GreedyVerifyBatch.pack((req,), 512)
+        verify = output([2, 3, 4, 5], "verify", rows=4)
+        verify["execution_report"] = {
+            "mode": "device_graph", "device_graph_segments": 1, "host_segments": 0,
+        }
+        target = port.target = Engine(verify)
+        port.states = {"a": port.states["a"]}
+        port.graph_single_direct_available = True
+        with patch.dict(os.environ, {"INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT": "1"}):
+            with port.target_transaction(batch, tables[0], graph_packed_direct_commit=True) as tx:
+                tx.commit(batch.resolve(tx.rows)[0])
+        self.assertEqual(len(target.calls), 1)
+        self.assertTrue(target.calls[0]["mtp_graph_direct_commit"])
+        self.assertEqual(target.calls[0]["input_offsets"].values, [0, 4])
+        self.assertEqual(target.calls[0]["block_tables"].values, [[3, 4]])
+
     def test_packed_graph_direct_bad_receipt_does_not_retry_after_native_write(self):
         for options, message in (
             ({"hidden": False}, "complete Target HC"),

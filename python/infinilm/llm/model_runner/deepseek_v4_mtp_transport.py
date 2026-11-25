@@ -320,7 +320,7 @@ class _V4Transport:
                  shared_compression_plan=False, stepwise_direct_commit=False,
                  batched_draft=False, last_logits=False, k1_graph_seed=False,
                  batched_target_replay=False, batched_draft_repair=False,
-                 graph_packed_direct_available=False):
+                 graph_packed_direct_available=False, graph_single_direct_available=False):
         self.target = target
         self.draft = draft
         self.core = core
@@ -339,11 +339,15 @@ class _V4Transport:
         self.last_logits = last_logits
         self.k1_graph_seed = k1_graph_seed
         self.graph_packed_direct_available = graph_packed_direct_available
+        self.graph_single_direct_available = graph_single_direct_available
         self.states = {}
         self.transaction = None
 
     def graph_packed_direct_enabled(self):
         return self.graph_packed_direct_available and os.getenv("INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT") == "1"
+
+    def graph_single_direct_enabled(self):
+        return self.graph_single_direct_available and os.getenv("INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT") == "1"
 
     @property
     def owner(self):
@@ -676,7 +680,7 @@ class _V4Transport:
 
     def _packed_direct_tables(self, batch, tables):
         spans = tuple(zip(batch.past_kv_lengths, batch.total_kv_lengths, strict=True))
-        if len(tables) != 3 or any(start <= 0 or not 2 <= end - start <= 4 for start, end in spans):
+        if len(tables) not in (1, 3) or any(start <= 0 or not 2 <= end - start <= 4 for start, end in spans):
             return None
         counts = tuple((end + self.page_size - 1) // self.page_size for _, end in spans)
         actual = tuple(table[:count] for table, count in zip(tables, counts, strict=True))
@@ -706,9 +710,19 @@ class _V4Transport:
             and batch.ends_in_known_stop
         )
         direct_tables = None
-        if graph_packed_direct_commit and not (stochastic or batch_draft_seed) and self.graph_packed_direct_enabled():
+        direct_graph_enabled = (self.graph_single_direct_enabled if len(tables) == 1
+                                else self.graph_packed_direct_enabled)
+        if graph_packed_direct_commit and not (stochastic or batch_draft_seed) and direct_graph_enabled():
             direct_tables = self._packed_direct_tables(batch, tables)
-        if len(tables) == 1:
+        if direct_tables is not None:
+            result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, graph_direct_commit=True)
+            verify_hidden = result[1]
+            if not verify_hidden or len(verify_hidden) != 8 or any(
+                tensor is None or len(tensor.shape) != 3 or tensor.shape[0] != len(batch.rows)
+                for tensor in verify_hidden
+            ):
+                raise RuntimeError("Direct MTP requires complete Target HC from eight ranks")
+        elif len(tables) == 1:
             # A K1 rejection advances to the first discarded position. Deeper
             # verifies need an expanded ring to keep the history for that input
             # live after the whole speculative suffix has written.
@@ -727,14 +741,6 @@ class _V4Transport:
                 if not hidden:
                     raise RuntimeError("Direct MTP verification requires Target hidden states")
                 verify_hidden = hidden
-        elif direct_tables is not None:
-            result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, graph_direct_commit=True)
-            verify_hidden = result[1]
-            if not verify_hidden or len(verify_hidden) != 8 or any(
-                tensor is None or len(tensor.shape) != 3 or tensor.shape[0] != len(batch.rows)
-                for tensor in verify_hidden
-            ):
-                raise RuntimeError("Packed direct MTP requires complete Target HC from eight ranks")
         else:
             result = self._forward_packed(self.target, batch, tables, rollback=True, return_logits=stochastic)
         transaction = _TargetTransaction(
@@ -1014,8 +1020,8 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
     if stepwise_direct_commit and getattr(target_engine, "mtp_scratch_hc_version", 0) != 1:
         raise RuntimeError("Stepwise direct commit requires native owned scratch q1 hidden states")
     direct_k23_commit = _direct_k23_commit_enabled(config, target_engine)
-    graph_packed_direct_available = (
-        config.enable_graph and config.max_batch_size == 3 and config.num_draft_tokens == 3
+    graph_direct_available = (
+        config.enable_graph and config.num_draft_tokens == 3
         and config.pipeline_parallel_size == 1 and config.tensor_parallel_size == 8 and config.moe_ep_size == 1
         and config.block_size == 256 and config.nextn_branch_draft_lengths is None
         and getattr(target_engine, "mtp_graph_packed_direct_commit_version", 0) == 1
@@ -1029,7 +1035,6 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         replay_requested = (
             os.getenv("INFINILM_MTP_GRAPH_BATCHED_TARGET_REPLAY") == "1"
             and config.num_draft_tokens == 3
-            and not graph_direct_k3_commit
         )
     else:
         replay_requested = os.getenv("INFINILM_MTP_BATCHED_TARGET_REPLAY") == "1"
@@ -1041,7 +1046,6 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         os.getenv("INFINILM_MTP_GRAPH_BATCHED_DRAFT_REPAIR") == "1"
         and config.enable_graph and config.num_draft_tokens == 3
         and config.max_batch_size in (2, 3) and config.nextn_branch_draft_lengths is None
-        and not graph_direct_k3_commit
     )
     k1_graph_seed = _k1_graph_seed_enabled(config, InferEngine)
     last_logits = os.getenv("INFINILM_MTP_LAST_LOGITS") == "1" and not config.enable_graph
@@ -1093,5 +1097,6 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         stepwise_direct_commit=stepwise_direct_commit, batched_draft=batched_draft, last_logits=last_logits,
         k1_graph_seed=k1_graph_seed, batched_target_replay=batched_target_replay,
         batched_draft_repair=batched_draft_repair,
-        graph_packed_direct_available=graph_packed_direct_available,
+        graph_packed_direct_available=graph_direct_available and config.max_batch_size == 3,
+        graph_single_direct_available=graph_direct_available and config.max_batch_size == 1,
     )

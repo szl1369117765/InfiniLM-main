@@ -21,7 +21,8 @@ namespace infinilm::engine {
 namespace {
 
 void validate_packed_direct_metadata(const RankWorker::Input &input,
-                                     const cache::PagedKVCacheConfig &cache, size_t vocab_size) {
+                                     const cache::PagedKVCacheConfig &cache, size_t vocab_size,
+                                     size_t owners) {
     using namespace infinilm::runtime;
     const auto cpu_tensor = [](const std::optional<Tensor> &value, DataType type, size_t dimensions) {
         return value && *value && (*value)->device().type() == Device::Type::kCpu
@@ -36,14 +37,14 @@ void validate_packed_direct_metadata(const RankWorker::Input &input,
     const auto &tables = input.block_tables;
     const auto &slots = input.slot_mapping;
     if (!cpu_tensor(ids, DataType::kInt64, 2) || (*ids)->size(0) != 1
-        || !cpu_tensor(offsets, DataType::kInt32, 1) || (*offsets)->numel() != 4
+        || !cpu_tensor(offsets, DataType::kInt32, 1) || (*offsets)->numel() != owners + 1
         || !cpu_tensor(positions, DataType::kInt64, 1)
-        || !cpu_tensor(past, DataType::kInt32, 1) || (*past)->numel() != 3
-        || !cpu_tensor(total, DataType::kInt32, 1) || (*total)->numel() != 3
-        || !cpu_tensor(cu, DataType::kInt32, 1) || (*cu)->numel() != 4
-        || !cpu_tensor(tables, DataType::kInt32, 2) || (*tables)->size(0) != 3
+        || !cpu_tensor(past, DataType::kInt32, 1) || (*past)->numel() != owners
+        || !cpu_tensor(total, DataType::kInt32, 1) || (*total)->numel() != owners
+        || !cpu_tensor(cu, DataType::kInt32, 1) || (*cu)->numel() != owners + 1
+        || !cpu_tensor(tables, DataType::kInt32, 2) || (*tables)->size(0) != owners
         || !cpu_tensor(slots, DataType::kInt64, 1)) {
-        throw std::invalid_argument("Packed direct MTP requires contiguous CPU metadata for three owners");
+        throw std::invalid_argument("Direct MTP requires contiguous CPU metadata for each owner");
     }
     const auto rows = (*ids)->numel();
     const auto *token = reinterpret_cast<const int64_t *>((*ids)->data());
@@ -56,15 +57,15 @@ void validate_packed_direct_metadata(const RankWorker::Input &input,
     const auto *slot = reinterpret_cast<const int64_t *>((*slots)->data());
     const auto width = (*tables)->size(1);
     const auto page_size = static_cast<int64_t>(cache.block_size());
-    if (rows < 6 || rows > 12 || (*positions)->numel() != rows || (*slots)->numel() != rows
-        || bounds[0] != 0 || bounds[3] != static_cast<int32_t>(rows) || lengths[0] != 0) {
+    if (rows < 2 * owners || rows > 4 * owners || (*positions)->numel() != rows || (*slots)->numel() != rows
+        || bounds[0] != 0 || bounds[owners] != static_cast<int32_t>(rows) || lengths[0] != 0) {
         throw std::invalid_argument("Packed direct MTP offsets must cover all query rows");
     }
 
     // The scheduler proves lease ownership. Validate the effective physical page layout
     // here before submitting the irreversible write to any rank.
     std::unordered_set<int32_t> owner_pages;
-    for (size_t owner = 0; owner < 3; ++owner) {
+    for (size_t owner = 0; owner < owners; ++owner) {
         const int64_t begin = bounds[owner], end = bounds[owner + 1], start = starts[owner];
         if (begin < 0 || end > static_cast<int64_t>(rows) || end - begin < 2 || end - begin > 4
             || start <= 0 || ends[owner] != start + end - begin
@@ -637,12 +638,14 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     if (input.mtp_graph_direct_commit) {
         const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
         const auto &dist = communication_group_.get_dist_config();
-        const auto *enabled = std::getenv("INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT");
+        const auto owners = paged ? paged->max_batch_size() : 0;
+        const auto *enabled = std::getenv(owners == 1
+            ? "INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT" : "INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT");
         const auto [c4_ring, c128_ring] = deepseek_v4_raw_ring_rows();
         if (!enabled || std::string_view(enabled) != "1" || !enable_graph_compiling_
             || !classic_mtp_target_ || nsa_pool_epoch_ || dist.pp_size != 1
             || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1 || !paged
-            || paged->max_batch_size() != 3 || paged->block_size() != models::deepseek_v4::kV4PageSize
+            || (owners != 1 && owners != 3) || paged->block_size() != models::deepseek_v4::kV4PageSize
             || c4_ring != 16 || c128_ring != 256
             || rank_hidden || input.target_hidden_states || !input.return_draft_hidden_states
             || !input.sample_all_positions || input.top_k != 1 || input.sampling_rows || input.random_values
@@ -650,7 +653,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             || input.mtp_draft_cache_only || input.mtp_cpu_metadata_shadow || input.mtp_shared_compression_plan) {
             throw std::invalid_argument("Packed direct MTP requires plain TP8 greedy Target Graph verification");
         }
-        validate_packed_direct_metadata(input, *paged, model_config_->get<size_t>("vocab_size"));
+        validate_packed_direct_metadata(input, *paged, model_config_->get<size_t>("vocab_size"), owners);
     }
     bool last_logits_expected = false;
     if (input.mtp_last_logits) {

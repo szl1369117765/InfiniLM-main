@@ -580,7 +580,7 @@ public:
         auto *mtp_graph_barrier = ctx.mtp_graph_barrier;
         const bool short_verify = short_verify_layout(batch.query_offsets, ids->numel());
         const bool packed_target = cfg_.classic_mtp_target && !cfg_.is_mtp && !hc &&
-            batch.query_offsets.size() == 4 && short_verify;
+            (batch.query_offsets.size() == 2 || batch.query_offsets.size() == 4) && short_verify;
         const bool direct_hc = input.mtp_graph_direct_commit && packed_target &&
             input.return_draft_hidden_states && !input.rollback_v4_cache;
         const bool short_target = !cfg_.is_mtp && !hc &&
@@ -602,7 +602,7 @@ public:
             (input.rollback_v4_cache || direct_hc) &&
             packed_shared_constants_prepared_ && packed_shared_constants_enabled();
         if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
-            throw std::runtime_error("Packed direct MTP requires the prepared C3 Target Graph path");
+            throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
         }
         if (input.rollback_v4_cache) {
             if (!ctx.mtp_snapshot_barrier)

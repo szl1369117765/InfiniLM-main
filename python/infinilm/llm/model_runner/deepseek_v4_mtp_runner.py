@@ -232,9 +232,12 @@ class DeepSeekV4MTPRunner:
                     transaction.commit(winner)
             else:
                 batch = GreedyVerifyBatch.pack(requests, self.max_context)
+                graph_direct_selector = {
+                    1: "graph_single_direct_enabled", 3: "graph_packed_direct_enabled",
+                }.get(len(candidates), "")
                 packed_direct = (
-                    self.num_draft_tokens == 3 and len(candidates) == 3
-                    and getattr(self.transport, "graph_packed_direct_enabled", lambda: False)()
+                    self.num_draft_tokens == 3
+                    and getattr(self.transport, graph_direct_selector, lambda: False)()
                     and all(not item["req"].sampling_params.do_sample for item in candidates)
                     and reservation.permits_packed_direct_target(tables)
                 )
