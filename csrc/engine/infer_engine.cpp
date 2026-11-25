@@ -964,10 +964,13 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     };
     output.output_ids = completed_view(output.output_ids);
     output.logits = completed_view(output.logits);
-    const bool owns_hc = (input.mtp_scratch_step || input.mtp_graph_direct_commit
-                          || input.mtp_graph_draft_seed || eager_direct)
+    // Direct eager creates fresh HC and all workers have already synchronized it.
+    // Export its storage-owning view like other eager outputs so the serving
+    // thread can join Draft inputs without running on a Target worker runtime.
+    const bool keep_hc_worker_runtime = (input.mtp_scratch_step || input.mtp_graph_direct_commit
+                                         || input.mtp_graph_draft_seed)
         && input.return_draft_hidden_states;
-    if (!owns_hc) {
+    if (!keep_hc_worker_runtime) {
         output.hidden_states = completed_view(output.hidden_states);
     }
     if (input.return_draft_hidden_states) {
@@ -1007,7 +1010,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
                 output.mtp_graph_direct_rank_reports.push_back(std::move(rank_output.graph_execution).value());
             }
             output.hidden_states_by_rank.push_back(
-                owns_hc ? std::move(hidden) : completed_view(std::move(hidden)));
+                keep_hc_worker_runtime ? std::move(hidden) : completed_view(std::move(hidden)));
         }
     }
     return output;
