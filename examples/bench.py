@@ -961,6 +961,7 @@ if __name__ == "__main__":
         model_path,
         draft_model_path=cfg.draft_model,
         num_draft_tokens=cfg.num_draft_tokens,
+        enable_deepseek_v4_mtp=cfg.enable_deepseek_v4_mtp,
         infini_device=infini_device,
         tp=tp,
         skip_load=skip_load,

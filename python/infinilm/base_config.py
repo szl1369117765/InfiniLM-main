@@ -61,6 +61,7 @@ class BaseConfig:
         self.model = self.args.model
         self.draft_model = self.args.draft_model
         self.num_draft_tokens = self.args.num_draft_tokens
+        self.enable_deepseek_v4_mtp = self.args.enable_deepseek_v4_mtp
         self.device = self.args.device
         self.tp = self.args.tp
         self.pp = self.args.pp
@@ -170,7 +171,12 @@ class BaseConfig:
             "--num-draft-tokens",
             type=int,
             default=1,
-            help="number of Eagle draft tokens to verify per target step",
+            help="number of draft tokens to verify per target step (1-3 for classic V4 MTP)",
+        )
+        self.parser.add_argument(
+            "--enable-deepseek-v4-mtp",
+            action="store_true",
+            help="enable classic DeepSeek V4 NextN with up to 3 paged requests",
         )
         self.parser.add_argument(
             "--device",

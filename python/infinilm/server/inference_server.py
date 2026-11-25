@@ -148,6 +148,9 @@ class InferenceServer:
         pre_transpose: bool = False,
         tool_call_parser: str = "none",
         chunked_prefill_size: int = 0,
+        draft_model_path: Optional[str] = None,
+        num_draft_tokens: int = 4,
+        enable_deepseek_v4_mtp: bool = False,
     ):
         """Initialize inference server.
 
@@ -213,6 +216,9 @@ class InferenceServer:
             raise ValueError("Unsupported tool call parser")
         self.tool_call_parser = tool_call_parser
         self.chunked_prefill_size = chunked_prefill_size
+        self.draft_model_path = draft_model_path
+        self.num_draft_tokens = num_draft_tokens
+        self.enable_deepseek_v4_mtp = enable_deepseek_v4_mtp
 
         self.engine: AsyncLLMEngine = None
 
@@ -230,6 +236,9 @@ class InferenceServer:
         async def lifespan(app: FastAPI):
             self.engine = AsyncLLMEngine(
                 model_path=self.model_path,
+                draft_model_path=self.draft_model_path,
+                num_draft_tokens=self.num_draft_tokens,
+                enable_deepseek_v4_mtp=self.enable_deepseek_v4_mtp,
                 device=self.device,
                 dtype=self.dtype,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -726,6 +735,8 @@ def parse_kv_transfer_config(kv_transfer_config_str: str) -> KVTransferConfig:
 def main():
     cfg = BaseConfig()
     setup_logging(cfg.log_level)
+    if cfg.enable_deepseek_v4_mtp and cfg.pp != 1:
+        raise ValueError("classic DeepSeek V4 MTP does not support pipeline parallelism")
     if cfg.pp > 1 and cfg.node_rank > 0:
         from infinilm.server.pipeline_worker import run_worker
 
@@ -751,6 +762,9 @@ def main():
 
     server = InferenceServer(
         model_path=cfg.model,
+        draft_model_path=cfg.draft_model if cfg.enable_deepseek_v4_mtp else None,
+        num_draft_tokens=cfg.num_draft_tokens if cfg.enable_deepseek_v4_mtp else 4,
+        enable_deepseek_v4_mtp=cfg.enable_deepseek_v4_mtp,
         device=device,
         dtype=cfg.dtype,
         tensor_parallel_size=cfg.tp,

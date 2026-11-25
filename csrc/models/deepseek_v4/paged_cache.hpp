@@ -2,6 +2,8 @@
 
 #include "runtime/tensor.hpp"
 
+#include <vector>
+
 namespace infinilm::models::deepseek_v4 {
 
 constexpr size_t kV4PageSize = 256;
@@ -28,5 +30,48 @@ struct LayerPagedCache {
 LayerPagedCache allocate_layer_paged_cache(
     runtime::Runtime &runtime, size_t full_blocks, size_t swa_blocks,
     size_t compression_ratio, size_t index_head_dim = 128);
+
+// Writable locations from the host attention metadata and compression plans.
+// All tensors are contiguous int32 row vectors. A value of -1 skips that write.
+struct PagedCacheWriteSet {
+    runtime::Tensor swa_slots;
+    runtime::Tensor c4_slots;
+    runtime::Tensor c128_slots;
+    runtime::Tensor c4_state_slots;
+    runtime::Tensor c128_state_slots;
+};
+
+// An eager verification submission on one rank and its owner stream.
+// The caller must keep the Runtime and live cache layout in place until this
+// finishes. Other submissions and cache reconfiguration must wait.
+class PagedCacheSnapshot {
+public:
+    PagedCacheSnapshot(runtime::Runtime &runtime,
+                       const std::vector<LayerPagedCache> &layers,
+                       const PagedCacheWriteSet &writes);
+    ~PagedCacheSnapshot() noexcept;
+
+    PagedCacheSnapshot(const PagedCacheSnapshot &) = delete;
+    PagedCacheSnapshot &operator=(const PagedCacheSnapshot &) = delete;
+
+    void commit();
+    void rollback();
+
+private:
+    struct Slice {
+        runtime::Tensor live;
+        size_t live_offset;
+        size_t backup_offset;
+        size_t bytes;
+    };
+
+    void require_active() const;
+    void release();
+
+    runtime::Runtime &runtime_;
+    runtime::Tensor backup_;
+    std::vector<Slice> slices_;
+    bool active_{false};
+};
 
 } // namespace infinilm::models::deepseek_v4

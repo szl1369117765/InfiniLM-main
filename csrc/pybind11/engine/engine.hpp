@@ -233,6 +233,9 @@ inline void bind_infer_engine(py::module &m) {
                     "random_values",
                     "sampling_rows",
                     "nsa_owner_snapshot",
+                    "return_draft_hidden_states",
+                    "rollback_v4_cache",
+                    "target_hidden_states_by_rank",
                 };
 
                 for (auto &item : kwargs) {
@@ -262,6 +265,13 @@ inline void bind_infer_engine(py::module &m) {
                         if (!item.second.is_none()) {
                             input.sampling_rows = py::cast<std::vector<std::tuple<float, float, int>>>(item.second);
                         }
+                    } else if (key == "return_draft_hidden_states") {
+                        input.return_draft_hidden_states = py::cast<bool>(item.second);
+                    } else if (key == "rollback_v4_cache") {
+                        input.rollback_v4_cache = py::cast<bool>(item.second);
+                    } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
+                        input.target_hidden_states_by_rank =
+                            py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
                     }
                 }
 
@@ -313,6 +323,7 @@ inline void bind_infer_engine(py::module &m) {
         .def_readwrite("output_ids", &InferEngine::Output::output_ids, "Sampled token IDs")
         .def_readwrite("logits", &InferEngine::Output::logits, "Raw logits tensor")
         .def_readwrite("hidden_states", &InferEngine::Output::hidden_states, "Raw hidden states tensor")
+        .def_readonly("hidden_states_by_rank", &InferEngine::Output::hidden_states_by_rank)
         .def_property_readonly("execution_report", [](const InferEngine::Output &output) {
             py::dict result;
             const auto *graph = output.graph_execution ? &*output.graph_execution : nullptr;

@@ -328,6 +328,7 @@ def load_model_state_dict_by_file(
                 stream.write(json.dumps(record) + "\n")
 
     model_type = model.hf_config.get("model_type", "")
+    is_v4_mtp = model_type == "deepseek_v4_mtp"
     read_mode = os.environ.get(
         "INFINILM_WEIGHT_READ_MODE",
         "auto" if model_type in ("deepseek_v4", "qwen3_moe") and os.environ.get("HYGON_ARCH") else "mmap",
@@ -335,7 +336,7 @@ def load_model_state_dict_by_file(
     if read_mode not in ("mmap", "buffered", "auto"):
         raise ValueError(f"Unknown INFINILM_WEIGHT_READ_MODE: {read_mode!r}")
     is_ernie = model_type == "ernie4_5_moe_vl"
-    tie_word_embeddings = _declares_tied_embeddings(model.hf_config)
+    tie_word_embeddings = not is_v4_mtp and _declares_tied_embeddings(model.hf_config)
     model_keys = model.state_dict_keyname()
     model_key_set = set(model_keys)
     parameter_dtypes = {
@@ -439,6 +440,25 @@ def load_model_state_dict_by_file(
     batch_timing = {}
 
     def checkpoint_batches():
+        if is_v4_mtp:
+            for file_path, weight_names in _plan_deepseek_v4_mtp_weights(
+                file_list, model_key_set
+            ).items():
+                started = time.perf_counter()
+                # Buffered mode reads the entire shard, including unselected weights.
+                source = _load_checkpoint_shard(
+                    file_path, None, (), raw=True, keys=weight_names, read_mode="mmap"
+                )
+                batch_timing.clear()
+                batch_timing["read_s"] = time.perf_counter() - started
+                params = {
+                    target: source.pop(name) for name, target in weight_names.items()
+                }
+                try:
+                    yield os.path.basename(file_path), params, False
+                finally:
+                    params.clear()
+            return
         if is_ernie:
             if file_list:
                 catalog = _ernie_checkpoint_catalog(file_list, weight_map)
@@ -1419,6 +1439,64 @@ def _remap_deepseek_v4(state_dict, config=None):
             raise ValueError(f"DeepSeek V4 checkpoint alias collision: {target}")
         remapped[target] = tensor
     return remapped
+
+
+_V4_MTP_SHARED_WEIGHTS = {
+    "embed.weight": "model.embed_tokens.weight",
+    "head.weight": "lm_head.weight",
+}
+
+
+def _deepseek_v4_mtp_weight_name(name):
+    aliases = {
+        "emb.tok_emb.weight": "model.embed_tokens.weight",
+        "head.weight": "lm_head.weight",
+        "norm.weight": "model.norm.weight",
+    }
+    if name in aliases:
+        return aliases[name]
+    prefix = "model.layers.0."
+    if name.startswith(("enorm.", "hnorm.", "e_proj.", "h_proj.", "hc_head_")):
+        prefix = "model."
+    if name.endswith(".scale"):
+        name = name.removesuffix(".scale") + ".weight_scale"
+    return prefix + name
+
+
+def _plan_deepseek_v4_mtp_weights(file_list, model_keys):
+    """Select classic mtp.0 from actual shard headers before any weight copy."""
+    draft = {}
+    shared = {}
+    prefix = "mtp.0."
+    for file_path in file_list:
+        with SafeTensorsMmap(file_path) as shard:
+            for name in shard.tensors:
+                if name.startswith(prefix):
+                    target = _deepseek_v4_mtp_weight_name(name.removeprefix(prefix))
+                    weights = draft
+                elif name in _V4_MTP_SHARED_WEIGHTS:
+                    target = _V4_MTP_SHARED_WEIGHTS[name]
+                    weights = shared
+                else:
+                    continue
+                if target in weights:
+                    raise ValueError(
+                        f"Duplicate DeepSeek V4 MTP checkpoint weight: {target}"
+                    )
+                weights[target] = (file_path, name)
+    if not draft:
+        raise ValueError("DeepSeek V4 MTP requires safetensors with mtp.0 weights")
+
+    # Checkpoint-local embedding/head override the shared Target versions,
+    # including when the fallback name appears in an earlier shard.
+    selected = shared | draft
+    unexpected = sorted(selected.keys() - model_keys)
+    if unexpected:
+        raise ValueError(f"Unexpected DeepSeek V4 MTP checkpoint weights: {unexpected}")
+    by_file = {}
+    for target, (file_path, name) in selected.items():
+        by_file.setdefault(file_path, {})[name] = target
+    return by_file
 
 
 _WEIGHT_REMAPPER = {

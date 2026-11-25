@@ -229,8 +229,23 @@ class InferEngine(_infinilm.InferEngine):
         moe_ep_backend="disabled",
         moe_ep_size=1,
         pre_transpose=False,
+        classic_mtp_draft=False,
     ):
         self.hf_config = read_hf_config(model_path)
+        if classic_mtp_draft:
+            if (
+                self.hf_config.get("model_type") != "deepseek_v4"
+                or self.hf_config.get("num_nextn_predict_layers", 1) != 1
+                or any(key.startswith("dspark_") for key in self.hf_config)
+            ):
+                raise ValueError("classic MTP Draft requires a DeepSeek V4 mtp.0 checkpoint")
+            self.hf_config = {
+                **self.hf_config,
+                "model_type": "deepseek_v4_mtp",
+                "num_hidden_layers": 1,
+                "num_hash_layers": 0,
+                "compress_ratios": [0],
+            }
         self.hf_generation_config = read_hf_generation_config(model_path)
         self.position_id_axes = _infer_position_id_axes(self.hf_config)
         self.hf_config["position_id_axes"] = self.position_id_axes
@@ -344,6 +359,9 @@ class InferEngine(_infinilm.InferEngine):
         random_values=None,
         sampling_rows=None,
         nsa_owner_snapshot=None,
+        return_draft_hidden_states=False,
+        rollback_v4_cache=False,
+        target_hidden_states_by_rank=None,
     ):
         def unwrap_tensor(tensor):
             return (
@@ -379,6 +397,17 @@ class InferEngine(_infinilm.InferEngine):
         temperature = 1.0 if temperature is None else temperature
         top_k = 1 if top_k is None else top_k
         top_p = 1.0 if top_p is None else top_p
+        mtp_arguments = {}
+        if return_draft_hidden_states or rollback_v4_cache or target_hidden_states_by_rank is not None:
+            mtp_arguments = {
+                "return_draft_hidden_states": return_draft_hidden_states,
+                "rollback_v4_cache": rollback_v4_cache,
+                "target_hidden_states_by_rank": (
+                    [unwrap_tensor(tensor) for tensor in target_hidden_states_by_rank]
+                    if target_hidden_states_by_rank is not None
+                    else None
+                ),
+            }
 
         return super().Input(
             input_ids,
@@ -405,6 +434,7 @@ class InferEngine(_infinilm.InferEngine):
             random_values=random_values,
             sampling_rows=sampling_rows,
             nsa_owner_snapshot=nsa_owner_snapshot,
+            **mtp_arguments,
         )
 
     def forward(
@@ -538,6 +568,9 @@ class InferEngine(_infinilm.InferEngine):
         top_k=None,
         top_p=None,
         nsa_owner_snapshot=None,
+        return_draft_hidden_states=False,
+        rollback_v4_cache=False,
+        target_hidden_states_by_rank=None,
     ):
         try:
             output = super().forward(
@@ -561,14 +594,22 @@ class InferEngine(_infinilm.InferEngine):
                     top_k=top_k,
                     top_p=top_p,
                     nsa_owner_snapshot=nsa_owner_snapshot,
+                    return_draft_hidden_states=return_draft_hidden_states,
+                    rollback_v4_cache=rollback_v4_cache,
+                    target_hidden_states_by_rank=target_hidden_states_by_rank,
                 )
             )
-            return {
+            result = {
                 "output_ids": infinicore.Tensor(output.output_ids),
                 "logits": infinicore.Tensor(output.logits),
                 "hidden_states": infinicore.Tensor(output.hidden_states),
                 "execution_report": output.execution_report,
             }
+            if return_draft_hidden_states:
+                result["hidden_states_by_rank"] = tuple(
+                    infinicore.Tensor(tensor) for tensor in output.hidden_states_by_rank
+                )
+            return result
         except BaseException as e:
             handle_oom_and_exit(e)
             raise

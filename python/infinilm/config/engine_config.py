@@ -11,7 +11,8 @@ class EngineConfig:
     Attributes:
         model_path: Path to the model directory.
         draft_model_path: Optional Eagle/MTP draft model directory.
-        num_draft_tokens: Number of Eagle draft tokens to verify per step.
+        num_draft_tokens: Number of draft tokens to verify per step.
+        enable_deepseek_v4_mtp: Opt in to classic DeepSeek V4 NextN (C1-C3, K1-K3).
         device: Device type string ('cpu', 'cuda', 'mlu', etc.).
         dtype: Data type string ('float16', 'bfloat16', 'float32').
         tensor_parallel_size: Number of devices for tensor parallelism.
@@ -70,8 +71,31 @@ class EngineConfig:
     enable_prefix_caching: bool = True
     static_cache_capacity: int = 1
     chunked_prefill_size: int = 0
+    enable_deepseek_v4_mtp: bool = False
 
     def __post_init__(self) -> None:
+        if self.enable_deepseek_v4_mtp and (
+            not self.draft_model_path
+            or type(self.num_draft_tokens) is not int
+            or self.num_draft_tokens not in (1, 2, 3)
+            or type(self.max_batch_size) is not int
+            or self.max_batch_size not in (1, 2, 3)
+            or self.cache_type != "paged"
+            or self.attn_backend != "paged-attn"
+            or self.block_size != 256
+            or self.enable_prefix_caching
+            or self.chunked_prefill_size
+            or self.skip_load
+            or self.pipeline_parallel_size != 1
+            or self.moe_ep_backend != "disabled"
+            or self.moe_ep_size != 1
+            or (self.kv_transfer_config is not None and self.kv_transfer_config.kv_connector)
+        ):
+            raise ValueError(
+                "classic DeepSeek V4 MTP requires a Draft and paged-attn "
+                "with 256-token pages, 1-3 requests, 1-3 draft tokens, local KV, "
+                "and TP expert placement"
+            )
         if (
             type(self.static_cache_capacity) is not int
             or self.static_cache_capacity < 1

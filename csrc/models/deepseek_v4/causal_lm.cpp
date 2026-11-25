@@ -16,6 +16,7 @@
 #include <array>
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace infinilm::models::deepseek_v4 {
 namespace {
@@ -39,6 +40,7 @@ struct V4Config {
     double rms_eps, hc_eps, route_scale, swiglu_limit;
     std::vector<size_t> ratios;
     std::shared_ptr<Quant> quant;
+    bool is_mtp;
 
     V4Config(const ModelConfig &config, const Rank &rank)
         : hidden(config.get<size_t>("hidden_size")), vocab(config.get<size_t>("vocab_size")),
@@ -50,7 +52,8 @@ struct V4Config {
           iterations(config.get<size_t>("hc_sinkhorn_iters")), max_positions(config.get<size_t>("max_position_embeddings")),
           rms_eps(config.get<double>("rms_norm_eps")), hc_eps(config.get<double>("hc_eps")),
           route_scale(config.get<double>("routed_scaling_factor")), swiglu_limit(config.get<double>("swiglu_limit")),
-          ratios(config.get<std::vector<size_t>>("compress_ratios")) {
+          ratios(config.get<std::vector<size_t>>("compress_ratios")),
+          is_mtp(config.get<std::string>("model_type") == "deepseek_v4_mtp") {
         const auto layers = config.get<size_t>("num_hidden_layers");
         const auto &json = config.get_config_json();
         if (!json.contains("quantization_config") || !json.at("quantization_config").is_object() ||
@@ -68,6 +71,7 @@ struct V4Config {
             !heads || heads % 8 || output_groups != 8 || !intermediate || intermediate % 8 ||
             !hidden || !vocab || !q_rank || !o_rank || !experts || !topk || topk > experts ||
             !index_heads || streams != 4 || !iterations || !max_positions || !layers || ratios.size() < layers ||
+            (is_mtp && (layers != 1 || hash_layers != 0 || ratios != std::vector<size_t>{0})) ||
             hash_layers > layers || !std::isfinite(swiglu_limit) || swiglu_limit <= 0) {
             throw std::invalid_argument("Unsupported DeepSeek V4 Flash W8A8 configuration");
         }
@@ -141,7 +145,25 @@ struct BatchMetadata {
     }
 };
 
-BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input) {
+bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) {
+    if (offsets.size() < 2 || offsets.size() > 4 ||
+        offsets.front() != 0 || offsets.back() != total_rows) {
+        return false;
+    }
+    for (size_t i = 1; i < offsets.size(); ++i) {
+        if (offsets[i] <= offsets[i - 1]) {
+            return false;
+        }
+        const auto rows = offsets[i] - offsets[i - 1];
+        if (rows < 2 || rows > 4) {
+            return false;
+        }
+    }
+    return true;
+}
+
+BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
+                         PagedCacheWriteSet *writes = nullptr) {
     const runtime::Device cpu{runtime::Device::Type::kCpu};
     auto host = [&](const std::optional<Tensor> &value) {
         if (!value || !*value) throw std::invalid_argument("DeepSeek V4 requires paged input metadata");
@@ -158,6 +180,10 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input) {
         host(input.block_tables), host(input.slot_mapping), positions, offsets, std::nullopt, kV4PageSize);
     const auto c4 = engine::build_deepseek_v4_compression_plan(metadata, positions, offsets, 4);
     const auto c128 = engine::build_deepseek_v4_compression_plan(metadata, positions, offsets, 128);
+    if (writes) {
+        *writes = {metadata.raw_out_loc, metadata.c4_out_loc, metadata.c128_out_loc,
+                   c4.state_slots, c128.state_slots};
+    }
     const bool decode = positions->numel()==1 &&
         (positions->dtype()==DataType::kInt64
           ? *reinterpret_cast<const int64_t*>(positions->data())>0
@@ -399,10 +425,16 @@ private:
 class Backbone final : public weights::ModelWeights {
 public:
     Backbone(Runtime &rt,const V4Config &c,const Rank &rank)
-        : hidden_(c.hidden), streams_(c.streams), rms_eps_(c.rms_eps), hc_eps_(c.hc_eps) {
+        : hidden_(c.hidden), streams_(c.streams), rms_eps_(c.rms_eps), hc_eps_(c.hc_eps), is_mtp_(c.is_mtp) {
         embedding_ = bind_child("embed_tokens",std::make_shared<layers::Embedding>(
             rt,c.vocab,c.hidden,std::nullopt,DataType::kBFloat16));
         norm_ = bind_child("norm",std::make_shared<RMSNorm>(rt,c.hidden,c.rms_eps,DataType::kBFloat16));
+        if (is_mtp_) {
+            enorm_ = bind_child("enorm",std::make_shared<RMSNorm>(rt,c.hidden,c.rms_eps,DataType::kBFloat16));
+            hnorm_ = bind_child("hnorm",std::make_shared<RMSNorm>(rt,c.hidden,c.rms_eps,DataType::kBFloat16));
+            e_proj_ = bind_child("e_proj",std::make_shared<Linear>(rt,c.hidden,c.hidden,c.quant,false,DataType::kBFloat16));
+            h_proj_ = bind_child("h_proj",std::make_shared<Linear>(rt,c.hidden,c.hidden,c.quant,false,DataType::kBFloat16));
+        }
         const auto fp = DataType::kFloat32;
         head_ = {bind_weight("hc_head_fn",Weight(rt,{c.streams,c.streams*c.hidden},fp)),
                  bind_weight("hc_head_scale",Weight(rt,{1},fp)),
@@ -412,26 +444,55 @@ public:
         }
     }
 
-    Tensor forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
+    std::pair<Tensor,Tensor> forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
                    const std::vector<LayerPagedCache> &caches,
-                   const Tensor &swa_rope, const Tensor &compressed_rope) const {
-        auto embedded = embedding_->forward(rt,tokens)->view({tokens->numel(),hidden_});
-        auto expanded = embedded->as_strided({tokens->numel(),streams_,hidden_},
-                                             {static_cast<runtime::Stride>(hidden_),0,1});
-        auto residual = expanded->contiguous(rt);
+                   const Tensor &swa_rope, const Tensor &compressed_rope,
+                   const Tensor &target_hc, bool return_hc) const {
+        const auto rows = tokens->numel();
+        const Shape hc_shape{rows,streams_,hidden_};
+        if (is_mtp_ && (!target_hc || target_hc->shape() != hc_shape ||
+                        target_hc->dtype() != DataType::kBFloat16 || target_hc->device() != rt.device())) {
+            throw std::invalid_argument("Classic NextN requires rank-local BF16 Target HC [tokens,4,hidden]");
+        }
+        auto embedded = embedding_->forward(rt,tokens)->view({rows,hidden_});
+        const auto expand = [&](const Tensor &value) {
+            return value->as_strided(hc_shape, {static_cast<runtime::Stride>(hidden_),0,1})->contiguous(rt);
+        };
+        Tensor residual;
+        if (is_mtp_) {
+            auto normalized_embedding = enorm_->forward(rt,embedded);
+            auto e = e_proj_->forward(rt,normalized_embedding);
+            // The caller completes the Target producer stream before dispatch.
+            auto hc = Tensor::empty(rt,hc_shape,DataType::kBFloat16);
+            hc->copy_from(rt,target_hc);
+            auto normalized_hc = hnorm_->forward(rt,hc->view({rows*streams_,hidden_}));
+            auto h = h_proj_->forward(rt,normalized_hc);
+            residual = add(rt,h->view(hc_shape),expand(e));
+        } else {
+            residual = expand(embedded);
+        }
         for (size_t i=0;i<layers_.size();++i) {
             residual = layers_[i]->forward(rt,residual,tokens,batch,caches[i],
                                            caches[i].compression_ratio ? compressed_rope : swa_rope);
         }
-        return norm_->forward(rt,run_mhc(rt,residual,head_,rms_eps_,hc_eps_,0,batch.query_offsets).activation);
+        Tensor hc_output;
+        if (return_hc) {
+            hc_output = Tensor::empty(rt,hc_shape,DataType::kBFloat16);
+            hc_output->copy_from(rt,residual);
+        }
+        auto normalized = norm_->forward(rt,run_mhc(
+            rt,residual,head_,rms_eps_,hc_eps_,0,batch.query_offsets).activation);
+        return {std::move(normalized),std::move(hc_output)};
     }
 
 private:
     size_t hidden_, streams_;
     double rms_eps_, hc_eps_;
+    bool is_mtp_;
     MixWeights head_;
     std::shared_ptr<layers::Embedding> embedding_;
-    std::shared_ptr<RMSNorm> norm_;
+    std::shared_ptr<RMSNorm> norm_, enorm_, hnorm_;
+    std::shared_ptr<Linear> e_proj_, h_proj_;
     std::vector<std::shared_ptr<Decoder>> layers_;
 };
 
@@ -454,16 +515,42 @@ public:
         if (caches_.empty() || !input.input_ids || !*input.input_ids || rt.isGraphRecording())
             throw std::invalid_argument("DeepSeek V4 requires initialized paged cache and eager input preparation");
         auto ids = (*input.input_ids)->view({(*input.input_ids)->numel()});
-        auto batch = make_batch(rt,input);
+        PagedCacheWriteSet writes;
+        auto batch = make_batch(rt,input,input.rollback_v4_cache ? &writes : nullptr);
         if (ctx.model_decode_barrier && batch.single_decode) {
             return decode(rt, std::move(ids), std::move(batch), *ctx.model_decode_barrier,
                           ctx.model_decode_greedy);
         }
-        return {logits(rt,ids,batch)};
+        const auto hc = input.target_hidden_states.value_or(Tensor{});
+        auto *mtp_graph_barrier = ctx.mtp_graph_barrier;
+        const bool short_target = !cfg_.is_mtp && !hc && input.rollback_v4_cache &&
+            short_verify_layout(batch.query_offsets, ids->numel());
+        const bool short_draft = cfg_.is_mtp && hc && !input.rollback_v4_cache &&
+            ids->numel() == 1 && batch.query_offsets.size() == 2;
+        // Eligibility must agree across ranks before any capture or collective.
+        const bool capture_mtp = mtp_graph_barrier && mtp_graph_barrier->all(
+            !input.return_draft_hidden_states && (short_target || short_draft));
+        if (input.rollback_v4_cache) {
+            if (!ctx.mtp_snapshot_barrier)
+                throw std::invalid_argument("Classic NextN verify requires a snapshot rendezvous");
+            PagedCacheSnapshot snapshot(rt,caches_,writes);
+            // A rank that cannot allocate its snapshot must fail before its peers
+            // enter the verify collectives.
+            ctx.mtp_snapshot_barrier->wait();
+            auto output = capture_mtp
+                ? decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier, false, hc, true)
+                : forward_logits(rt, ids, batch, hc, input.return_draft_hidden_states);
+            snapshot.rollback();
+            return output;
+        }
+        if (capture_mtp) {
+            return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier, false, hc, true);
+        }
+        return forward_logits(rt,ids,batch,hc,input.return_draft_hidden_states);
     }
 
     bool owns_paged_decode_graph() const override {
-        return true;
+        return !cfg_.is_mtp;
     }
 
     void reset_cache(const cache::CacheConfig *requested,global_state::ForwardContext &ctx,
@@ -472,6 +559,7 @@ public:
         cache::validate_cache_runtime(rt,rank);
         cache::validate_backend_cache_config(requested,backend);
         decode_plans_ = {};
+        mtp_decode_plans_ = {};
         if (!requested) {
             caches_.clear();
             cache_config_.reset();
@@ -502,14 +590,25 @@ private:
     struct DecodePlan {
         Tensor ids;
         BatchMetadata batch;
+        Tensor target_hc;
         Tensor logits;
         Tensor sampled_ids;
         bool greedy;
         std::shared_ptr<execution::graph::Graph> graph;
     };
 
-    Tensor logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch) const {
-        auto hidden=backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_);
+    static Tensor copy_graph_input(Runtime &rt, const Tensor &source) {
+        if (!source) {
+            return {};
+        }
+        auto stable = Tensor::empty(rt, source->shape(), source->dtype());
+        stable->copy_from(rt, source);
+        return stable;
+    }
+
+    Output forward_logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch,
+                          const Tensor &target_hc = {},bool return_hc = false) const {
+        auto [hidden,hc] = backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc);
         // A per-token projection retains the reference's M=1 accumulation boundary
         // while preserving the all-position logits requested by existing callers.
         auto output = Tensor::empty(rt,{ids->numel(),cfg_.vocab},hidden->dtype());
@@ -518,18 +617,31 @@ private:
             auto local = head_->forward(rt,input);
             engine::distributed::allgather_(rt,output->narrow({{0,row,1}}),local,comm_);
         }
-        return output->view({1,ids->numel(),cfg_.vocab});
+        return {output->view({1,ids->numel(),cfg_.vocab}),std::move(hc),std::nullopt,{}};
     }
 
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
-                  bool greedy) const {
-        auto &recent = decode_plans_.front();
-        auto &previous = decode_plans_.back();
+                  bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false) const {
+        auto &plans = classic_mtp ? mtp_decode_plans_ : decode_plans_;
+        auto &recent = plans.front();
+        auto &previous = plans.back();
         const auto incoming = batch.tensors();
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
                 return false;
+            }
+            if (classic_mtp) {
+                // The C++ model slices rows using these offsets while recording;
+                // equal total rows (e.g. [2,4] and [3,3]) do not share a graph.
+                if (plan->batch.query_offsets != batch.query_offsets ||
+                    static_cast<bool>(plan->target_hc) != static_cast<bool>(target_hc)) {
+                    return false;
+                }
+                if (target_hc && (plan->target_hc->shape() != target_hc->shape() ||
+                    plan->target_hc->dtype() != target_hc->dtype())) {
+                    return false;
+                }
             }
             const auto held = plan->batch.tensors();
             for (size_t i = 0; i < held.size(); ++i) {
@@ -555,13 +667,32 @@ private:
                 Tensor dest = *held[i];
                 dest->copy_from(rt, *incoming[i]);
             }
+            if (target_hc) {
+                recent->target_hc->copy_from(rt, target_hc);
+            }
+            if (classic_mtp) {
+                barrier.wait();
+            }
         } else {
             // Drop the least recently used graph before pinning new allocations.
             previous.reset();
-            DecodePlan candidate{std::move(ids), std::move(batch), {}, {}, greedy, {}};
+            if (classic_mtp) {
+                // The original id/position inputs and rank HC may be borrowed
+                // from the current call. Only the stable plan buffers go into
+                // the recorder; all other batch tensors were already allocated
+                // by make_batch on this worker.
+                ids = copy_graph_input(rt, ids);
+                batch.position = copy_graph_input(rt, batch.position);
+            }
+            DecodePlan candidate{std::move(ids), std::move(batch),
+                                 copy_graph_input(rt, target_hc), {}, {}, greedy, {}};
+            if (classic_mtp) {
+                barrier.wait();
+            }
             rt.startGraphRecording(true);
             try {
-                candidate.logits = logits(rt, candidate.ids, candidate.batch);
+                candidate.logits = forward_logits(
+                    rt, candidate.ids, candidate.batch, candidate.target_hc).logits;
                 if (greedy && sampling_rank_) {
                     candidate.sampled_ids = Tensor::empty(rt, {1}, DataType::kInt64);
                     execution::submit<infini::ops::Argmax>(
@@ -596,10 +727,13 @@ private:
     // These graphs hold pointers to this model instance's current KV cache.
     // The two most recent shapes cover both sides of adjacent page boundaries.
     mutable std::array<std::optional<DecodePlan>, 2> decode_plans_;
+    mutable std::array<std::optional<DecodePlan>, 2> mtp_decode_plans_;
 };
 
 } // namespace
 
 INFINILM_REGISTER_EXPLICIT_CAUSAL_LM_MODEL(deepseek_v4, DeepseekV4ForCausalLM,
                                            create_deepseek_v4_model_config);
+INFINILM_REGISTER_EXPLICIT_CAUSAL_LM_MODEL(deepseek_v4_mtp, DeepseekV4ForCausalLM,
+                                           create_deepseek_v4_mtp_model_config);
 } // namespace infinilm::models::deepseek_v4

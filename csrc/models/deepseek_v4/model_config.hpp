@@ -9,4 +9,7 @@ namespace infinilm::models::deepseek_v4 {
 std::shared_ptr<config::ModelConfig> create_deepseek_v4_model_config(
     std::shared_ptr<config::ModelConfig> source);
 
+std::shared_ptr<config::ModelConfig> create_deepseek_v4_mtp_model_config(
+    std::shared_ptr<config::ModelConfig> source);
+
 } // namespace infinilm::models::deepseek_v4

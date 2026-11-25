@@ -141,7 +141,7 @@ class LLMEngine:
                 max_cache_len=config.max_cache_len,
                 enable_prefix_caching=config.enable_prefix_caching,
                 cache_capacity=config.static_cache_capacity,
-                on_aborted_request=self._on_static_scheduler_abort,
+                on_aborted_request=self._on_scheduler_abort,
             )
             logger.info(
                 f"Using Static KV Cache with max_cache_len={config.max_cache_len}"
@@ -188,6 +188,12 @@ class LLMEngine:
                     else None
                 ),
                 chunked_prefill_size=config.chunked_prefill_size,
+                serial_requests=(
+                    config.enable_deepseek_v4_mtp and config.max_batch_size == 1
+                ),
+                on_aborted_request=(
+                    self._on_scheduler_abort if config.enable_deepseek_v4_mtp else None
+                ),
             )
             if model_engine.model_type == "videonsa":
                 self.model_runner.bind_nsa_scheduler(self.scheduler)
@@ -215,12 +221,19 @@ class LLMEngine:
 
     def add_request(self, request: InferenceRequest):
         """Add a request to the scheduler."""
+        mtp_runner = getattr(self.model_runner, "deepseek_v4_mtp_runner", None)
+        if mtp_runner is not None:
+            if mtp_runner.failed:
+                raise RuntimeError(
+                    "classic DeepSeek V4 MTP must be closed after a failed step"
+                )
+            mtp_runner.validate_request(request)
         self.scheduler.add_request(request)
 
     def close(self):
         self.model_runner.close()
 
-    def _on_static_scheduler_abort(self, req: InferenceRequest) -> None:
+    def _on_scheduler_abort(self, req: InferenceRequest) -> None:
         # The async queue owns both the terminal reason and final output.
         # A standalone synchronous engine has no such queue.
         if not self._async_abort_owner:
@@ -233,6 +246,37 @@ class LLMEngine:
             Whether work was scheduled or a KV transfer completed. Token
             outputs are published to request queues before step() returns.
         """
+        mtp_runner = getattr(self.model_runner, "deepseek_v4_mtp_runner", None)
+        if mtp_runner is None:
+            return self._step()
+        if mtp_runner.failed:
+            raise RuntimeError(
+                "classic DeepSeek V4 MTP must be closed after a failed step"
+            )
+        try:
+            mtp_runner.retire()
+            did_work = self._step(mtp_runner)
+            # Scheduling can consume a canceled running owner without producing
+            # a model batch. Retire that owner before any new prefill.
+            mtp_runner.retire()
+            return did_work
+        except BaseException:
+            mtp_runner.failed = True
+            if not self._async_abort_owner:
+                # Notification and resource retirement are distinct. Preserve
+                # the first error and keep unresolved cache ownership in place.
+                try:
+                    self.scheduler.notify_failed_requests(self._notify_mtp_failure)
+                except Exception:
+                    logger.exception("Failed to notify classic MTP requests")
+            raise
+
+    @staticmethod
+    def _notify_mtp_failure(req: InferenceRequest) -> None:
+        reason = FinishReason.CANCELED if req.is_aborted() else FinishReason.ERROR
+        _finalize_aborted_request(req, reason)
+
+    def _step(self, mtp_runner=None) -> bool:
         # Schedule the next unit of work, which may be model execution,
         # connector control metadata, or both.
         scheduler_output = self.scheduler.schedule()
@@ -240,6 +284,18 @@ class LLMEngine:
             return False
 
         requests = tuple(scheduler_output.scheduled_requests)
+        if mtp_runner is not None and not self._async_abort_owner:
+            aborted = [req for req in requests if req.is_aborted()]
+            if aborted:
+                for req in aborted:
+                    self._on_scheduler_abort(req)
+                self.scheduler.complete_requests(aborted)
+                requests = tuple(req for req in requests if req not in aborted)
+                if not requests:
+                    return True
+                mtp_runner.retire()
+                scheduler_output.scheduled_requests = list(requests)
+                scheduler_output.num_requests = len(requests)
         request_ids = tuple(req.request_id for req in requests)
         computed_lengths = tuple(req.get_total_length() for req in requests)
         generations = tuple(req._static_cache_lease_generation for req in requests)
@@ -285,7 +341,9 @@ class LLMEngine:
         )
         self.scheduler.accept_model_output(requests, generations, physical_rows)
         self.scheduler.update_from_output(runner_output)
-        self._update_requests(requests, sampled_token_ids)
+        self._update_requests(
+            requests, sampled_token_ids, finalize_abort=mtp_runner is not None
+        )
 
         # Return False (no immediate work) only when no requests were scheduled
         # and no KV transfers completed in this step.
@@ -332,6 +390,8 @@ class LLMEngine:
         self,
         requests: List[InferenceRequest],
         sampled_token_ids: list[int | list[int]],
+        *,
+        finalize_abort: bool = False,
     ) -> None:
         """Apply sampled tokens and publish their target-model KV boundary."""
         sampled_token_ids = self._validate_sampled_token_ids(
@@ -439,6 +499,8 @@ class LLMEngine:
             )
             if post_output_computed_tokens > pre_output_computed_tokens:
                 self.scheduler.commit_computed_tokens(req, post_output_computed_tokens)
+            if finalize_abort and req.is_aborted():
+                self._on_scheduler_abort(req)
 
         self.scheduler.complete_requests(requests)
 
@@ -556,6 +618,7 @@ class LLM:
         enable_prefix_caching: bool = True,
         static_cache_capacity: int = 1,
         chunked_prefill_size: int = 0,
+        enable_deepseek_v4_mtp: bool = False,
     ):
         """Initialize LLM.
 
@@ -596,6 +659,7 @@ class LLM:
             max_batch_size=max_batch_size,
             static_cache_capacity=static_cache_capacity,
             chunked_prefill_size=chunked_prefill_size,
+            enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,
@@ -786,6 +850,7 @@ class AsyncLLMEngine:
         enable_prefix_caching: bool = True,
         static_cache_capacity: int = 1,
         chunked_prefill_size: int = 0,
+        enable_deepseek_v4_mtp: bool = False,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -830,6 +895,7 @@ class AsyncLLMEngine:
             max_batch_size=max_batch_size,
             static_cache_capacity=static_cache_capacity,
             chunked_prefill_size=chunked_prefill_size,
+            enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,

@@ -585,6 +585,7 @@ RankWorker::Output RankWorker::get_output() {
 //------------------------------------------------------
 void RankWorker::thread_loop() {
     try {
+        const bool classic_draft = model_config_->get<std::string>("model_type") == "deepseek_v4_mtp";
         {
             std::lock_guard<std::mutex> lk(mutex_);
 
@@ -791,6 +792,18 @@ void RankWorker::thread_loop() {
                             return local_args.top_p == 0.0f || local_args.top_k == 1 || local_args.temperature == 0.0f;
                         };
                         auto effective_args = local_args;
+                        if ((local_args.return_draft_hidden_states || local_args.rollback_v4_cache)
+                            && rank_info_.pp_size != 1) {
+                            throw std::invalid_argument("V4 MTP requires a single pipeline stage");
+                        }
+                        const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states ||
+                            local_args.rollback_v4_cache;
+                        const bool graph_enabled = enable_graph_compiling_ && rank_info_.pp_size == 1;
+                        // For a one-row Draft proposal, the last token is all
+                        // positions. Draft prefill/repair still request all rows.
+                        const bool mtp_graph_candidate = graph_enabled && (local_args.rollback_v4_cache ||
+                            (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions &&
+                             !local_args.return_draft_hidden_states));
                         std::shared_ptr<const nsa::Proof> nsa_proof;
                         // These retained RUN locals are OUTSIDE the inner try.
                         // Its catch sees the real exception before these locals unwind.
@@ -886,11 +899,13 @@ void RankWorker::thread_loop() {
                             }
                             const char *eager_reason = !enable_graph_compiling_        ? "graphs_disabled"
                                                      : rank_info_.pp_size != 1         ? "pipeline_graph_not_supported"
+                                                     : mtp_graph_candidate            ? "mtp_graph_shape_not_supported"
+                                                     : classic_mtp                    ? "mtp_eager_stage"
                                                      : local_args.sample_all_positions ? "all_positions_not_compiled"
                                                                                        : "no_matching_plan";
                             // Packed all-position runs do not match the one-token-per-request
                             // output shape captured by the compiled decode graphs.
-                            if (!local_args.sample_all_positions && enable_graph_compiling_ && rank_info_.pp_size == 1) {
+                            if (!classic_mtp && !local_args.sample_all_positions && graph_enabled) {
                                 GraphCompiler::Compiled compiled{nullptr, nullptr};
                                 {
                                     const auto lookup_input = effective_args.to_model_input(
@@ -981,14 +996,17 @@ void RankWorker::thread_loop() {
                                         effective_args.block_tables, local_args.slot_mapping);
                                 }
                                 forward_context_.model_decode_barrier =
-                                    enable_graph_compiling_ && !local_args.sample_all_positions &&
-                                            rank_info_.pp_size == 1 && model_->owns_paged_decode_graph()
+                                    graph_enabled && !classic_mtp && !local_args.sample_all_positions &&
+                                            model_->owns_paged_decode_graph()
                                         ? barrier_
                                         : nullptr;
                                 forward_context_.model_decode_greedy =
                                     forward_context_.model_decode_barrier && effective_args.input_offsets &&
                                     effective_args.input_offsets.value() &&
                                     effective_args.input_offsets.value()->size(0) == 2 && parameter_greedy();
+                                forward_context_.mtp_snapshot_barrier =
+                                    effective_args.rollback_v4_cache ? barrier_ : nullptr;
+                                forward_context_.mtp_graph_barrier = mtp_graph_candidate ? barrier_ : nullptr;
                                 auto model_output = model_->forward(model_args, forward_context_);
                                 if (model_output.model_graph_execution) {
                                     graph_execution = std::move(model_output.model_graph_execution);
@@ -1116,6 +1134,10 @@ void RankWorker::thread_loop() {
                                                 std::move(graph_execution), eager_reason}};
 
                                 output_ = std::move(out);
+                            }
+                            if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
+                                runtime_->syncStream();
+                                output_ = Output{{}, {}, std::move(hidden_states), {}, eager_reason};
                             }
 
                             if (nsa_pool_epoch_ && rank_info_.tp_rank != 0) {

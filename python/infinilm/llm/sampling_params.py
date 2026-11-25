@@ -35,7 +35,7 @@ class SamplingParams:
             top_k=self.top_k,
             seed=self.seed,
             max_tokens=self.max_tokens,
-            stop=self.stop.copy() if self.stop else None,
-            stop_token_ids=self.stop_token_ids.copy() if self.stop_token_ids else None,
+            stop=list(self.stop) if self.stop else None,
+            stop_token_ids=list(self.stop_token_ids) if self.stop_token_ids else None,
             ignore_eos=self.ignore_eos,
         )

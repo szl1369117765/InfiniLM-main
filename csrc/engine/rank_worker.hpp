@@ -98,6 +98,9 @@ public:
         std::optional<std::vector<std::tuple<float, float, int>>> sampling_rows;
 
         std::optional<nsa::Snapshot> nsa_owner_snapshot;
+        bool return_draft_hidden_states{false};
+        bool rollback_v4_cache{false};
+        std::optional<std::vector<infinilm::runtime::Tensor>> target_hidden_states_by_rank;
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,
@@ -115,6 +118,7 @@ public:
         // Present only after this forward actually submitted the selected plan.
         std::optional<infinilm::execution::graph::Graph::ExecutionReport> graph_execution;
         const char *eager_reason = "graphs_disabled";
+        std::vector<infinilm::runtime::Tensor> hidden_states_by_rank;
     };
 
     RankWorker(std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,

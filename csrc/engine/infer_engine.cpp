@@ -448,6 +448,8 @@ InferEngine::Input::to_model_input(
             : to_device(target_hidden_states),
         sample_all_positions};
     input.logical_kv_upper_bound = logical_kv_upper_bound;
+    input.return_draft_hidden_states = return_draft_hidden_states;
+    input.rollback_v4_cache = rollback_v4_cache;
 
     auto &attn_metadata = forward_context.attn_metadata;
     attn_metadata = {
@@ -512,9 +514,47 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
             }
         }
     }
-    // Trigger each worker to run inference
-    for (auto &worker : workers_) {
-        worker->run(input);
+    const auto &rank_hidden = input.target_hidden_states_by_rank;
+    if (rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
+        const auto type = model_config_->get<std::string>("model_type");
+        if ((type != "deepseek_v4" && type != "deepseek_v4_mtp")
+            || communication_group_.get_dist_config().pp_size != 1
+            || (rank_hidden && type != "deepseek_v4_mtp")) {
+            throw std::invalid_argument("Classic V4 MTP input requires a single-stage V4 model");
+        }
+    }
+    if (rank_hidden && (rank_hidden->size() != workers_.size() || input.target_hidden_states
+                        || std::any_of(rank_hidden->begin(), rank_hidden->end(),
+                                       [](const auto &tensor) { return !tensor; }))) {
+        throw std::invalid_argument("MTP requires one non-null hidden-state tensor per rank");
+    }
+    if (rank_hidden) {
+        if (!input.input_ids || !*input.input_ids) {
+            throw std::invalid_argument("Classic V4 MTP requires input IDs");
+        }
+        const auto hidden_size = model_config_->get<size_t>("hidden_size");
+        for (size_t i = 0; i < rank_hidden->size(); ++i) {
+            const auto &tensor = (*rank_hidden)[i];
+            if (tensor->device() != communication_group_.get_rank_info(i).device
+                || tensor->dtype() != infinilm::runtime::DataType::kBFloat16
+                || tensor->ndim() != 3 || tensor->size(0) != (*input.input_ids)->numel()
+                || tensor->size(1) != 4 || tensor->size(2) != hidden_size) {
+                throw std::invalid_argument("Invalid rank-local BF16 hidden states for Classic V4 MTP");
+            }
+        }
+    }
+    // All rank-local tensors are prepared before any worker can enter a collective.
+    if (rank_hidden) {
+        auto rank_input = input;
+        rank_input.target_hidden_states_by_rank.reset();
+        for (size_t i = 0; i < workers_.size(); ++i) {
+            rank_input.target_hidden_states = (*rank_hidden)[i];
+            workers_[i]->run(rank_input);
+        }
+    } else {
+        for (auto &worker : workers_) {
+            worker->run(input);
+        }
     }
     // Wait for all workers
     for (auto &worker : workers_) {
@@ -534,6 +574,16 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
     output.output_ids = completed_view(output.output_ids);
     output.logits = completed_view(output.logits);
     output.hidden_states = completed_view(output.hidden_states);
+    if (input.return_draft_hidden_states) {
+        output.hidden_states_by_rank.reserve(workers_.size());
+        for (const auto &worker : workers_) {
+            auto hidden = worker->get_output().hidden_states;
+            if (!hidden) {
+                throw std::runtime_error("V4 MTP did not return hidden states on every rank");
+            }
+            output.hidden_states_by_rank.push_back(completed_view(std::move(hidden)));
+        }
+    }
     return output;
 }
 

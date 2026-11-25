@@ -68,6 +68,8 @@ public:
         /// Preserve logits for every packed position for speculative/MTP callers.
         bool sample_all_positions{false};
         size_t logical_kv_upper_bound{0};
+        bool return_draft_hidden_states{false};
+        bool rollback_v4_cache{false};
     };
 
     struct Output {

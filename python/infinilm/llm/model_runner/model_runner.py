@@ -49,13 +49,26 @@ class ModelRunner:
         self.config = config
         self._closed = False
         self._nsa_scheduler = None
+        self.deepseek_v4_mtp_runner = None
         self.kv_transfer_config = config.kv_transfer_config
         logger.info(f"kv_transfer_config: {self.kv_transfer_config}")
 
-        self._nsa_paged_owner = (
-            config.cache_type == "paged"
-            and read_hf_config(config.model_path).get("model_type") == "videonsa"
+        model_type = (
+            read_hf_config(config.model_path).get("model_type")
+            if config.cache_type == "paged"
+            else None
         )
+        self._nsa_paged_owner = model_type == "videonsa"
+        if config.enable_deepseek_v4_mtp:
+            if model_type != "deepseek_v4":
+                raise ValueError("classic NextN requires a DeepSeek V4 Target")
+            from .deepseek_v4_mtp_runner import DeepSeekV4MTPRunner
+            from .deepseek_v4_mtp_transport import (
+                create_deepseek_v4_mtp_transport,
+                require_classic_v4_mtp_abi,
+            )
+
+            require_classic_v4_mtp_abi()
         if self._nsa_paged_owner and (
             config.draft_model_path is not None
             or (
@@ -124,7 +137,14 @@ class ModelRunner:
             )
 
         self.speculative_runner = None
-        if config.draft_model_path is not None:
+        if config.enable_deepseek_v4_mtp:
+            self.deepseek_v4_mtp_runner = DeepSeekV4MTPRunner(
+                self.model_engine,
+                create_deepseek_v4_mtp_transport(config, self.model_engine, self.device),
+                config.num_blocks * config.block_size,
+                num_draft_tokens=config.num_draft_tokens,
+            )
+        elif config.draft_model_path is not None:
             self.speculative_runner = SpeculativeRunner(
                 config, self.model_engine, self.device
             )
@@ -279,6 +299,10 @@ class ModelRunner:
         if self._nsa_paged_owner:
             freeze_model_input(self.model_engine, nsa_owner, model_input, infinicore)
 
+        mtp_runner = getattr(self, "deepseek_v4_mtp_runner", None)
+        if mtp_runner is not None:
+            return mtp_runner.forward(scheduler_output, model_input)
+
         if (
             self.speculative_runner is not None
             and not any(request.chunked_prefill_pending for request in requests)
@@ -394,6 +418,14 @@ class ModelRunner:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        mtp_runner = getattr(self, "deepseek_v4_mtp_runner", None)
+        if mtp_runner is not None:
+            try:
+                mtp_runner.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            self.deepseek_v4_mtp_runner = None
 
         # SpeculativeRunner retains the target engine as well as its draft
         # engine, so release it first.  Do not defer native teardown to Python
