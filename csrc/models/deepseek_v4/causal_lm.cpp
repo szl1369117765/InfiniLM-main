@@ -653,7 +653,7 @@ public:
         if (capture_mtp) {
             const auto table_width = batch.page_table->size(1);
             batch.short_c4_index = direct_hc && batch.query_offsets.size() == 2 &&
-                rt.device().type() == Device::Type::kHygon && table_width > 0 &&
+                rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 &&
                 table_width <= kC4IndexMaxUnscoredPages &&
                 env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
