@@ -907,6 +907,9 @@ private:
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
+        if (classic_mtp && env_enabled("INFINILM_MTP_GRAPH_PLAN_RECEIPT")) {
+            report.mtp_graph_plan = common_slots ? "hit" : "capture";
+        }
         Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
         output.mtp_last_logits_used = draft_seed_graph;
         return output;

@@ -401,6 +401,9 @@ inline void bind_infer_engine(py::module &m) {
             result["host_segments"] = host_segments;
             result["operator_count"] = graph ? graph->operator_count : 0;
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
+            if (graph && graph->mtp_graph_plan) {
+                result["mtp_graph_plan"] = graph->mtp_graph_plan;
+            }
             if (!output.mtp_graph_direct_rank_reports.empty()) {
                 py::list rank_reports;
                 for (size_t rank = 0; rank < output.mtp_graph_direct_rank_reports.size(); ++rank) {
@@ -410,6 +413,9 @@ inline void bind_infer_engine(py::module &m) {
                     entry["device_graph_segments"] = report.device_graph_segments;
                     entry["host_segments"] = report.host_segments;
                     entry["operator_count"] = report.operator_count;
+                    if (report.mtp_graph_plan) {
+                        entry["mtp_graph_plan"] = report.mtp_graph_plan;
+                    }
                     rank_reports.append(std::move(entry));
                 }
                 result["mtp_graph_direct_rank_reports"] = std::move(rank_reports);
