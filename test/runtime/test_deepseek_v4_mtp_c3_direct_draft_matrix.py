@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 from test_deepseek_v4_mtp_batched_draft import CacheOps, decode, make_case
@@ -20,7 +20,7 @@ DIRECT = {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": "1"}
 
 
 def run_arm(proposal, repair, *, specs=SPECS, rounds=2, permit_direct=True):
-    runner, requests, draft, _ = make_case(
+    runner, requests, draft, core = make_case(
         False, 3, specs, transport_options=OPTIONS, modes=(proposal, repair),
     )
     transport = runner.transport
@@ -40,8 +40,23 @@ def run_arm(proposal, repair, *, specs=SPECS, rounds=2, permit_direct=True):
             with original(*args, **kwargs) as transaction:
                 yield transaction
 
-        with patch.dict(os.environ, DIRECT), patch.object(transport, "target_transaction", observe):
+        no_frontend_join = (
+            patch.object(core, "cat", side_effect=AssertionError("New Draft modes require worker-local HC"))
+            if permit_direct else nullcontext()
+        )
+        with (
+            patch.dict(os.environ, DIRECT),
+            patch.object(transport, "target_transaction", observe),
+            patch.object(draft, "forward_raw", wraps=draft.forward_raw) as native,
+            no_frontend_join,
+        ):
             outputs.append(decode(runner, requests, cache_ops=cache_ops))
+        for index, call in enumerate(native.call_args_list, begin_draft):
+            payload = call.kwargs
+            if len(payload["input_offsets"].rows) > 2:
+                worker_join = proposal if index < proposal_end else permit_direct and repair
+                assert ("target_hidden_segments_by_rank" in payload) is worker_join
+                assert ("target_hidden_states_by_rank" in payload) is not worker_join
         tables.append([tuple(req.block_table) for req in requests])
         proposal_shapes = [
             (len(spans), return_hc) for (spans, _), return_hc in

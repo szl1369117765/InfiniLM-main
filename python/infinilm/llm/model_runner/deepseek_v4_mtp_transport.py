@@ -131,7 +131,7 @@ class _TargetTransaction:
                 self._retained_target(decision, table, self.batch.input_offsets[index])
                 for index, (decision, table) in enumerate(zip(decisions, self.tables, strict=True))
             )
-            self._commit_draft_repair_batch(decisions, direct_hc)
+            self._commit_draft_repair_batch(decisions, direct_hc, worker_join=True)
         else:
             retained = (None,) * len(decisions)
             if (self.transport.batched_target_replay and len(decisions) in (2, 3)
@@ -144,7 +144,7 @@ class _TargetTransaction:
                     self._commit_owner(decision, table, self.batch.input_offsets[index], replay)
         self.committed = True
 
-    def _commit_draft_repair_batch(self, decisions, retained):
+    def _commit_draft_repair_batch(self, decisions, retained, *, worker_join=False):
         updates, by_depth = {}, []
         for intent, table, (tokens, start, hidden) in zip(decisions, self.tables, retained, strict=True):
             updates[intent.owner] = _DraftState(
@@ -166,7 +166,9 @@ class _TargetTransaction:
                 (segment,) = segments
                 self.transport._write_draft_cache(segment.tokens, segment.start, segment.table, segment.hidden)
             else:
-                self.transport._forward_draft_segments(segments, return_hidden=False)
+                self.transport._forward_draft_segments(
+                    segments, return_hidden=False, worker_join=worker_join,
+                )
         self.transport.states.update(updates)
 
     def _batch_retained_target(self, decisions):
@@ -488,7 +490,24 @@ class _V4Transport:
             **({"graph_fresh_prefill": True} if graph_fresh_prefill else {}),
         )
 
-    def _forward_draft_segments(self, segments, *, return_hidden):
+    def _join_draft_hidden(self, segments):
+        core = self.core
+        # Native returns completed rank-local views. Cat submits on the frontend
+        # runtime for each device. Finish those writes before the Draft workers
+        # consume the joined tensors on their separate rank streams.
+        hidden = tuple(core.cat(rank_rows, dim=0) for rank_rows in zip(
+            *(segment.hidden for segment in segments), strict=True,
+        ))
+        previous = core.get_device()
+        try:
+            for tensor in hidden:
+                core.set_device(tensor.device)
+                core.sync_stream()
+        finally:
+            core.set_device(previous)
+        return hidden
+
+    def _forward_draft_segments(self, segments, *, return_hidden, worker_join=False):
         if len(segments) == 1:
             (segment,) = segments
             return self._forward(
@@ -512,8 +531,13 @@ class _V4Transport:
             tables.append(list(table) + [-1] * (width - len(table)))
         if len(set(slots)) != len(slots):
             raise ValueError("MTP packed Draft has overlapping physical slots")
-        # Each Draft worker joins its own rank's HC views in packed token order.
-        hidden_segments_by_rank = tuple(zip(*(segment.hidden for segment in segments), strict=True))
+        if worker_join:
+            # The C3 optimizations join rank-local HC on the Draft worker.
+            hidden_input = {"target_hidden_segments_by_rank": tuple(zip(
+                *(segment.hidden for segment in segments), strict=True,
+            ))}
+        else:
+            hidden_input = {"target_hidden_states_by_rank": self._join_draft_hidden(segments)}
         core = self.core
         result = self.draft.forward_raw(
             input_ids=core.from_list([tokens], dtype=core.int64),
@@ -527,7 +551,7 @@ class _V4Transport:
             sample_all_positions=False,
             top_k=1,
             return_draft_hidden_states=return_hidden,
-            target_hidden_segments_by_rank=hidden_segments_by_rank,
+            **hidden_input,
             **self._host_metadata_options(),
         )
         return self._decode(result, len(segments))
@@ -688,7 +712,9 @@ class _V4Transport:
             if not segments:
                 continue
             next_depth = any(depth + 1 < counts[index] for index in active)
-            ids, rows = self._forward_draft_segments(segments, return_hidden=next_depth)
+            ids, rows = self._forward_draft_segments(
+                segments, return_hidden=next_depth, worker_join=keep_final_graph,
+            )
             if next_depth and (
                 not rows or len(rows) != len(segments[0].hidden)
                 or any(tensor.shape[0] != len(active) for tensor in rows)

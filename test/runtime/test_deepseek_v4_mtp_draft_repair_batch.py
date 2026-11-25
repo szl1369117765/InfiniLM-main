@@ -8,7 +8,7 @@ from test_deepseek_v4_mtp_batched_draft import decode, make_case
 
 def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
     specs = (("long", 1, 12, first_stop), ("reject", 4, 9, ()), ("partial", 7, 12, ()))
-    runner, requests, draft, _ = make_case(False, 3, specs)
+    runner, requests, draft, core = make_case(False, 3, specs)
     transport = runner.transport
     transport.batched_target_replay = target_replay
     transport.batched_draft_repair = enabled
@@ -31,14 +31,22 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
         repairs.append(((table[0], start),))
         return original_single(tokens, start, table, hidden)
 
-    def packed(segments, *, return_hidden):
+    def packed(segments, *, return_hidden, worker_join=False):
         if return_hidden:
             return original_packed(segments, return_hidden=True)
         repairs.append(tuple((segment.table[0], segment.start) for segment in segments))
         if fail_packed:
             raise RuntimeError("simulated packed Draft repair failure")
         assert all(len(segment.tokens) == 1 for segment in segments)
-        return original_packed(segments, return_hidden=False)
+        sync_start = len(core.synced_devices)
+        with patch.object(draft, "forward_raw", wraps=draft.forward_raw) as native:
+            result = original_packed(segments, return_hidden=False, worker_join=worker_join)
+        native.assert_called_once()
+        assert "target_hidden_states_by_rank" in native.call_args.kwargs
+        assert "target_hidden_segments_by_rank" not in native.call_args.kwargs
+        assert core.synced_devices[sync_start:] == list(range(8))
+        assert core.get_device() == "cpu"
+        return result
 
     with (
         patch.object(transport.target, "forward_raw", target_forward),

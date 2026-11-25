@@ -47,14 +47,27 @@ class Core:
     int64 = 64
     int32 = 32
 
+    def __init__(self):
+        self.device = "cpu"
+        self.synced_devices = []
+
     def from_list(self, rows, *, dtype):
         return Tensor(rows)
 
     def cat(self, tensors, *, dim):
-        raise AssertionError("Frontend cannot concatenate Draft worker-owned hidden states")
+        assert dim == 0
+        device = tensors[0].device
+        assert all(tensor.device == device for tensor in tensors)
+        return Tensor([row for tensor in tensors for row in tensor.rows], device)
+
+    def get_device(self):
+        return self.device
+
+    def set_device(self, device):
+        self.device = device
 
     def sync_stream(self):
-        raise AssertionError("Frontend cannot synchronize a Draft worker stream")
+        self.synced_devices.append(self.device)
 
 
 class Engine:
@@ -82,7 +95,8 @@ class Engine:
         assert len(set(slots)) == len(tokens)
         assert options["top_k"] == 1
         if self.draft:
-            if len(offsets) > 2:
+            if "target_hidden_segments_by_rank" in options:
+                assert len(offsets) > 2
                 assert "target_hidden_states_by_rank" not in options
                 rank_segments = options["target_hidden_segments_by_rank"]
                 assert isinstance(rank_segments, tuple)
@@ -94,7 +108,6 @@ class Engine:
                     assert all(tensor.device == rank for tensor in segments)
                     rank_hidden.append(Tensor([row for tensor in segments for row in tensor.rows], rank))
             else:
-                assert "target_hidden_segments_by_rank" not in options
                 rank_hidden = options["target_hidden_states_by_rank"]
             assert len(rank_hidden) == RANKS
             assert all(tensor.device == rank and len(tensor.rows) == len(tokens)
