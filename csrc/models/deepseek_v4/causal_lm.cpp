@@ -149,6 +149,11 @@ bool packed_shared_constants_enabled() {
     return env_enabled("INFINILM_MTP_GRAPH_PACKED_SHARED_EXPERT_CONSTANTS");
 }
 
+bool k3_draft_seed_enabled() {
+    const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED");
+    return mode && std::string_view(mode) == "1";
+}
+
 struct BatchMetadata {
     Tensor position, swa_indices, swa_lengths, swa_slots, page_table;
     Tensor c4_slots, c4_positions, c4_lengths, c4_sparse_lengths, c4_sources, c4_state_slots;
@@ -351,7 +356,8 @@ public:
         const int64_t zero=0;
         rt.memcpyH2D(shared_one_->data(),&one,sizeof(one),false);
         rt.memcpyH2D(shared_zero_->data(),&zero,sizeof(zero),false);
-        if (c.classic_mtp_target && !c.is_mtp && packed_shared_constants_enabled()) {
+        if ((c.classic_mtp_target && !c.is_mtp && packed_shared_constants_enabled())
+            || (c.is_mtp && k3_draft_seed_enabled())) {
             const Shape shape{kPackedSharedExpertRows, 1};
             std::array<float, kPackedSharedExpertRows> ones;
             ones.fill(1.f);
@@ -562,6 +568,7 @@ public:
         k1_graph_seed_ = cfg_.is_mtp && k1_seed && std::string_view(k1_seed) == "1";
         packed_shared_constants_prepared_ =
             cfg_.classic_mtp_target && !cfg_.is_mtp && packed_shared_constants_enabled();
+        draft_seed_constants_prepared_ = cfg_.is_mtp && k3_draft_seed_enabled();
         backbone_ = bind_child("model",std::make_shared<Backbone>(rt,cfg_,rank));
         head_ = bind_child("lm_head",std::make_shared<ColumnLinear>(
             rt,cfg_.hidden,cfg_.vocab,false,DataType::kBFloat16,rank.tp_rank,rank.tp_size));
@@ -618,6 +625,11 @@ public:
         batch.packed_shared_constants = capture_mtp && packed_target &&
             (input.rollback_v4_cache || direct_hc) &&
             packed_shared_constants_prepared_ && packed_shared_constants_enabled();
+        if (capture_mtp && draft_seed_graph && draft_seed_constants_prepared_) {
+            const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED_CONSTANTS");
+            // The existing plan key compares this bit before replaying a graph.
+            batch.packed_shared_constants = mode && std::string_view(mode) == "1";
+        }
         if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
             throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
         }
@@ -872,6 +884,7 @@ private:
     std::vector<LayerPagedCache> caches_;
     bool reuse_snapshot_buffer_ = false;
     bool packed_shared_constants_prepared_ = false;
+    bool draft_seed_constants_prepared_ = false;
     bool k1_graph_seed_ = false;
     // The rank worker serializes verify calls; rollback synchronizes before
     // the next request can reuse or resize this device buffer.
