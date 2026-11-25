@@ -326,6 +326,7 @@ class _V4Transport:
                  batched_draft=False, last_logits=False, k1_graph_seed=False,
                  batched_target_replay=False, batched_draft_repair=False,
                  graph_packed_direct_available=False, graph_single_direct_available=False,
+                 eager_packed_direct_available=False,
                  graph_prefill_last_logits=False, graph_prefill_draft_cache_only=False,
                  graph_k3_draft_seed=False):
         self.target = target
@@ -350,6 +351,8 @@ class _V4Transport:
         self.k1_graph_seed = k1_graph_seed
         self.graph_packed_direct_available = graph_packed_direct_available
         self.graph_single_direct_available = graph_single_direct_available
+        self.eager_packed_direct_available = eager_packed_direct_available
+        self._eager_packed_direct_commit = False
         self.states = {}
         self.transaction = None
 
@@ -358,6 +361,18 @@ class _V4Transport:
 
     def graph_single_direct_enabled(self):
         return self.graph_single_direct_available and os.getenv("INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT") == "1"
+
+    def eager_packed_direct_enabled(self):
+        return self.eager_packed_direct_available and self._eager_packed_direct_commit
+
+    def set_eager_packed_direct_commit(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("Packed eager MTP direct commit requires a bool")
+        if self.states or self.transaction is not None:
+            raise RuntimeError("Packed eager MTP mode can only change with no active owners or transaction")
+        if enabled and not self.eager_packed_direct_available:
+            raise RuntimeError("Packed eager MTP direct commit was not prepared")
+        self._eager_packed_direct_commit = enabled
 
     @property
     def owner(self):
@@ -529,7 +544,8 @@ class _V4Transport:
         return self._decode(result, len(segments))
 
     def _forward_packed(self, engine, batch, tables, *, return_hidden=False, rollback=False,
-                        return_logits=False, scratch_step=False, graph_direct_commit=False):
+                        return_logits=False, scratch_step=False, graph_direct_commit=False,
+                        eager_direct_commit=False):
         width = max(map(len, tables))
         slots = []
         for table, start, end in zip(tables, batch.past_kv_lengths, batch.total_kv_lengths):
@@ -552,15 +568,21 @@ class _V4Transport:
             top_k=1,
             return_draft_hidden_states=return_hidden,
             rollback_v4_cache=rollback,
-            **self._host_metadata_options(),
+            **({} if eager_direct_commit else self._host_metadata_options()),
             **({"mtp_scratch_step": True} if scratch_step else {}),
             **({"mtp_graph_direct_commit": True} if graph_direct_commit else {}),
+            **({"mtp_eager_packed_direct_commit": True} if eager_direct_commit else {}),
         )
         if graph_direct_commit:
             report = result.get("execution_report") or {}
             if (report.get("mode") != "device_graph" or report.get("device_graph_segments") != 1
                     or report.get("host_segments") != 0):
                 raise RuntimeError("Packed direct MTP did not execute a single Target device Graph")
+        if eager_direct_commit:
+            report = result.get("execution_report") or {}
+            if (report.get("mtp_eager_packed_direct_commit") is not True or report.get("mode") != "eager"
+                    or report.get("device_graph_segments") != 0 or report.get("host_segments") != 0):
+                raise RuntimeError("Packed direct MTP did not execute a verified eager Target forward")
         decoded = self._decode(result, len(batch.rows))
         if not return_logits:
             return decoded
@@ -723,7 +745,10 @@ class _V4Transport:
         return actual if len(pages) == len(set(pages)) and all(page >= 0 for page in pages) else None
 
     @contextmanager
-    def target_transaction(self, batch, block_table, *, batch_draft_seed=False, graph_packed_direct_commit=False):
+    def target_transaction(self, batch, block_table, *, batch_draft_seed=False, graph_packed_direct_commit=False,
+                           eager_packed_direct_commit=False):
+        if graph_packed_direct_commit and eager_packed_direct_commit:
+            raise ValueError("Packed MTP verification must select a single direct execution mode")
         tables = (tuple(block_table),) if len(batch.requests) == 1 else tuple(block_table)
         if self.transaction is not None or len(tables) != len(batch.requests):
             raise ValueError("MTP verify must match the current owner and proposal")
@@ -745,10 +770,16 @@ class _V4Transport:
         direct_tables = None
         direct_graph_enabled = (self.graph_single_direct_enabled if len(tables) == 1
                                 else self.graph_packed_direct_enabled)
-        if graph_packed_direct_commit and not (stochastic or batch_draft_seed) and direct_graph_enabled():
-            direct_tables = self._packed_direct_tables(batch, tables)
+        direct_option = None
+        if not (stochastic or batch_draft_seed):
+            if graph_packed_direct_commit and direct_graph_enabled():
+                direct_option = "graph_direct_commit"
+            elif eager_packed_direct_commit and len(tables) == 3 and self.eager_packed_direct_enabled():
+                direct_option = "eager_direct_commit"
+            if direct_option is not None:
+                direct_tables = self._packed_direct_tables(batch, tables)
         if direct_tables is not None:
-            result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, graph_direct_commit=True)
+            result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, **{direct_option: True})
             verify_hidden = result[1]
             if not verify_hidden or len(verify_hidden) != 8 or any(
                 tensor is None or len(tensor.shape) != 3 or tensor.shape[0] != len(batch.rows)
@@ -1030,6 +1061,19 @@ def _direct_k23_commit_enabled(config, target_engine):
     return True
 
 
+def _eager_packed_direct_available(config, target_engine):
+    if (os.getenv("INFINILM_MTP_EAGER_C3_DIRECT_COMMIT") != "1"
+            or config.enable_graph or config.num_draft_tokens != 3 or config.max_batch_size != 3
+            or config.pipeline_parallel_size != 1 or config.tensor_parallel_size != 8 or config.moe_ep_size != 1
+            or config.block_size != 256 or config.nextn_branch_draft_lengths is not None
+            or config.enable_prefix_caching):
+        return False
+    if (getattr(target_engine, "mtp_eager_packed_direct_commit_version", 0) != 1
+            or getattr(target_engine, "deepseek_v4_raw_ring_rows", None) != (16, 256)):
+        raise RuntimeError("Packed eager MTP direct commit requires its native ABI and expanded compressor rings")
+    return True
+
+
 def _graph_k3_prefill_modes(config, engine_type):
     if (
         not config.enable_graph or config.max_batch_size != 1 or config.num_draft_tokens != 3
@@ -1077,6 +1121,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
     if stepwise_direct_commit and getattr(target_engine, "mtp_scratch_hc_version", 0) != 1:
         raise RuntimeError("Stepwise direct commit requires native owned scratch q1 hidden states")
     direct_k23_commit = _direct_k23_commit_enabled(config, target_engine)
+    eager_packed_direct_available = _eager_packed_direct_available(config, target_engine)
     graph_direct_available = (
         config.enable_graph and config.num_draft_tokens == 3
         and config.pipeline_parallel_size == 1 and config.tensor_parallel_size == 8 and config.moe_ep_size == 1
@@ -1142,13 +1187,14 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         "Classic NextN K=%s graph=%s branches=%s branch_execution=%s direct_k1=%s direct_k23=%s "
         "draft_seed=%s draft_cache_only=%s batched_draft=%s k1_graph_seed=%s last_logits=%s terminal_tail_trim=%s "
         "cpu_metadata_shadow=%s shared_compression_plan=%s stepwise_direct_commit=%s "
-        "batched_target_replay=%s batched_draft_repair=%s "
+        "batched_target_replay=%s batched_draft_repair=%s eager_packed_direct_available=%s "
         "graph_prefill_last_logits=%s graph_prefill_draft_cache_only=%s graph_k3_draft_seed=%s",
         config.num_draft_tokens, config.enable_graph, config.nextn_branch_draft_lengths,
         config.nextn_branch_execution, direct_k1_commit, direct_k23_commit, reuse_seed,
         draft_cache_only, batched_draft, k1_graph_seed, last_logits, terminal_tail_trim,
         cpu_metadata_shadow or shared_compression_plan,
         shared_compression_plan, stepwise_direct_commit, batched_target_replay, batched_draft_repair,
+        eager_packed_direct_available,
         graph_prefill_last_logits, graph_prefill_draft_cache_only,
         graph_k3_draft_seed,
     )
@@ -1163,6 +1209,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         batched_draft_repair=batched_draft_repair,
         graph_packed_direct_available=graph_direct_available and config.max_batch_size == 3,
         graph_single_direct_available=graph_direct_available and config.max_batch_size == 1,
+        eager_packed_direct_available=eager_packed_direct_available,
         graph_prefill_last_logits=graph_prefill_last_logits,
         graph_prefill_draft_cache_only=graph_prefill_draft_cache_only,
         graph_k3_draft_seed=graph_k3_draft_seed,

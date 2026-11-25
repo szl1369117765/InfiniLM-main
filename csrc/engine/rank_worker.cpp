@@ -808,6 +808,7 @@ void RankWorker::thread_loop() {
                         infinilm::runtime::Tensor model_sampled_ids;
                         bool draft_cache_only_used = false;
                         bool last_logits_used = false;
+                        std::optional<InfinilmModel::EagerPackedTargetModes> eager_target_receipt;
                         const auto parameter_greedy = [&] {
                             if (local_args.sampling_rows) {
                                 return std::all_of(local_args.sampling_rows->begin(), local_args.sampling_rows->end(),
@@ -825,7 +826,7 @@ void RankWorker::thread_loop() {
                         }
                         const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states ||
                             local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
-                            local_args.mtp_graph_direct_commit;
+                            local_args.mtp_graph_direct_commit || local_args.mtp_eager_packed_direct_commit;
                         const bool graph_enabled = enable_graph_compiling_ && rank_info_.pp_size == 1;
                         // For a one-row Draft proposal, the last token is all
                         // positions. Draft prefill/repair still request all rows.
@@ -860,6 +861,10 @@ void RankWorker::thread_loop() {
                                 }
                             }
                             size_t logical_kv_upper_bound = 0;
+                            if (local_args.mtp_eager_packed_direct_commit
+                                && (enable_graph_compiling_ || finite_paged_decode_profile_)) {
+                                throw std::logic_error("Packed eager direct MTP excludes Graph and worker-side page-table rewriting");
+                            }
                             if (local_v4_host_batch && (finite_paged_decode_profile_ || graph_enabled)) {
                                 throw std::logic_error("V4 host batch cannot use Graph or worker-side page-table rewriting");
                             }
@@ -1050,6 +1055,7 @@ void RankWorker::thread_loop() {
                                 model_sampled_ids = std::move(model_output.model_sampled_ids);
                                 draft_cache_only_used = model_output.mtp_draft_cache_only_used;
                                 last_logits_used = model_output.mtp_last_logits_used;
+                                eager_target_receipt = model_output.mtp_eager_target_receipt;
                             }
 
                             if (local_args.mtp_graph_direct_commit
@@ -1206,15 +1212,18 @@ void RankWorker::thread_loop() {
                                 auto out{Output{output_ids, logits, hidden_states,
                                                 std::move(graph_execution), eager_reason}};
                                 out.mtp_last_logits_used = last_logits_used;
+                                out.mtp_eager_target_receipt = eager_target_receipt;
 
                                 output_ = std::move(out);
                             }
                             if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
                                 runtime_->syncStream();
-                                const bool return_graph = local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed;
+                                const bool return_graph = local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed
+                                    || local_args.mtp_eager_packed_direct_commit;
                                 output_ = Output{{}, {}, std::move(hidden_states),
                                                  return_graph ? std::move(graph_execution) : std::nullopt, eager_reason};
                                 output_.mtp_last_logits_used = last_logits_used;
+                                output_.mtp_eager_target_receipt = eager_target_receipt;
                             } else if (local_args.mtp_scratch_step && rank_info_.tp_rank != 0) {
                                 // Scratch is reused or released after this packed step.
                                 runtime_->syncStream();

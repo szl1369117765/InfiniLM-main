@@ -111,6 +111,9 @@ public:
         bool mtp_graph_direct_commit{false};
         bool mtp_graph_fresh_prefill{false};
         bool mtp_graph_draft_seed{false};
+        bool mtp_eager_packed_direct_commit{false};
+        // Resolved once by InferEngine for the whole dispatch, not a public input.
+        InfinilmModel::EagerPackedTargetModes mtp_eager_target_modes{};
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,
@@ -134,6 +137,7 @@ public:
         bool mtp_shared_compression_plan_used{false};
         bool mtp_last_logits_used{false};
         std::vector<infinilm::execution::graph::Graph::ExecutionReport> mtp_graph_direct_rank_reports;
+        std::optional<InfinilmModel::EagerPackedTargetModes> mtp_eager_target_receipt{};
     };
 
     RankWorker(std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,

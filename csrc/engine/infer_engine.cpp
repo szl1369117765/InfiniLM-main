@@ -543,6 +543,8 @@ InferEngine::Input::to_model_input(
     input.mtp_last_logits = mtp_last_logits;
     input.mtp_graph_direct_commit = mtp_graph_direct_commit;
     input.mtp_graph_draft_seed = mtp_graph_draft_seed;
+    input.mtp_eager_packed_direct_commit = mtp_eager_packed_direct_commit;
+    input.mtp_eager_target_modes = mtp_eager_target_modes;
 
     auto &attn_metadata = forward_context.attn_metadata;
     attn_metadata = {
@@ -579,24 +581,59 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
     std::shared_ptr<const DeepSeekV4HostBatch> v4_host_batch;
     std::optional<Input> frozen_dispatch;
-    if ((original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan)
-        && !enable_graph_compiling_ && communication_group_.get_dist_config().pp_size == 1
+    const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+    const auto &dist = communication_group_.get_dist_config();
+    const auto env_enabled = [](const char *name) {
+        const auto *value = std::getenv(name);
+        return value && std::string_view(value) == "1";
+    };
+    const bool eager_direct = original.mtp_eager_packed_direct_commit;
+    const bool eager_direct_plan = eager_direct && env_enabled("INFINILM_MTP_EAGER_C3_SHARED_TARGET_PLAN");
+    if (eager_direct) {
+        const auto [c4_ring, c128_ring] = deepseek_v4_raw_ring_rows();
+        if (enable_graph_compiling_ || !classic_mtp_target_ || nsa_pool_epoch_ || dist.pp_size != 1
+            || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1 || workers_.size() != 8
+            || !paged || paged->max_batch_size() != 3
+            || paged->block_size() != models::deepseek_v4::kV4PageSize || c4_ring != 16 || c128_ring != 256
+            || original.target_hidden_states_by_rank || original.target_hidden_states
+            || !original.return_draft_hidden_states || !original.sample_all_positions
+            || original.top_k != 1 || original.sampling_rows || original.random_values
+            || original.rollback_v4_cache || original.mtp_scratch_step || original.mtp_last_logits
+            || original.mtp_draft_cache_only || original.mtp_graph_direct_commit
+            || original.mtp_graph_draft_seed || original.mtp_graph_fresh_prefill
+            || original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan) {
+            throw std::invalid_argument("Packed eager direct MTP requires three TP8 greedy Target owners and expanded rings");
+        }
+        frozen_dispatch.emplace(original);
+        // Latch the switches once, before any rank can enter a collective.
+        frozen_dispatch->mtp_eager_target_modes = {
+            env_enabled("INFINILM_MTP_EAGER_C3_PACKED_TARGET_COLLECTIVES"),
+            eager_direct_plan,
+            env_enabled("INFINILM_MTP_EAGER_C3_PACKED_MHC_PRE"),
+            env_enabled("INFINILM_MTP_EAGER_C3_SHORT_C4_INDEX"),
+        };
+    }
+    const bool eager_host_batch = (original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan)
+        && !enable_graph_compiling_ && dist.pp_size == 1
         && original.input_ids && *original.input_ids && (*original.input_ids)->ndim() == 2
-        && (*original.input_ids)->size(0) == 1) {
+        && (*original.input_ids)->size(0) == 1;
+    if (eager_direct_plan || eager_host_batch) {
         const auto type = model_config_->get<std::string>("model_type");
         const bool classic = (type == "deepseek_v4" &&
                               (original.return_draft_hidden_states || original.rollback_v4_cache))
             || (type == "deepseek_v4_mtp" && original.target_hidden_states_by_rank);
-        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
         if (classic && paged && paged->block_size() == models::deepseek_v4::kV4PageSize
+            && original.input_ids && *original.input_ids
             && original.position_ids && original.input_offsets &&
             original.block_tables && original.slot_mapping) {
             v4_host_batch = DeepSeekV4HostBatch::prepare_short(
                 *original.position_ids, *original.input_offsets, *original.block_tables,
                 *original.slot_mapping, (*original.input_ids)->numel(), paged->num_blocks(),
-                original.mtp_shared_compression_plan, classic_mtp_target_);
+                eager_direct_plan || original.mtp_shared_compression_plan, classic_mtp_target_);
             if (v4_host_batch) {
-                frozen_dispatch.emplace(original);
+                if (!frozen_dispatch) {
+                    frozen_dispatch.emplace(original);
+                }
                 frozen_dispatch->position_ids = v4_host_batch->positions();
                 frozen_dispatch->input_offsets = v4_host_batch->offsets();
                 frozen_dispatch->block_tables = v4_host_batch->tables();
@@ -605,6 +642,14 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
     }
     const auto &input = frozen_dispatch ? *frozen_dispatch : original;
+    if (eager_direct) {
+        // Validate the effective tensors the workers will actually use, including
+        // the frozen table, positions, offsets and slots when a plan is shared.
+        validate_packed_direct_metadata(input, *paged, model_config_->get<size_t>("vocab_size"), 3);
+        if (eager_direct_plan && (!v4_host_batch || !v4_host_batch->plans())) {
+            throw std::invalid_argument("Packed eager direct MTP requires the requested shared Target plan");
+        }
+    }
     if (input.random_values.has_value()) {
         if (input.sample_all_positions || !input.input_offsets.has_value()
             || input.input_offsets.value()->ndim() != 1
@@ -637,8 +682,6 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
     const auto &rank_hidden = input.target_hidden_states_by_rank;
     if (input.mtp_graph_direct_commit) {
-        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
-        const auto &dist = communication_group_.get_dist_config();
         const auto owners = paged ? paged->max_batch_size() : 0;
         const auto *enabled = std::getenv(owners == 1
             ? "INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT" : "INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT");
@@ -921,10 +964,10 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     };
     output.output_ids = completed_view(output.output_ids);
     output.logits = completed_view(output.logits);
-    const bool explicit_graph_hc = input.mtp_graph_direct_commit || input.mtp_graph_draft_seed;
-    const bool owns_graph_hc = (input.mtp_scratch_step || explicit_graph_hc)
+    const bool owns_hc = (input.mtp_scratch_step || input.mtp_graph_direct_commit
+                          || input.mtp_graph_draft_seed || eager_direct)
         && input.return_draft_hidden_states;
-    if (!owns_graph_hc) {
+    if (!owns_hc) {
         output.hidden_states = completed_view(output.hidden_states);
     }
     if (input.return_draft_hidden_states) {
@@ -932,8 +975,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         if (input.mtp_graph_direct_commit) {
             output.mtp_graph_direct_rank_reports.reserve(workers_.size());
         }
-        for (const auto &worker : workers_) {
-            auto rank_output = worker->get_output();
+        for (size_t rank = 0; rank < workers_.size(); ++rank) {
+            auto rank_output = workers_[rank]->get_output();
             if (input.mtp_graph_draft_seed &&
                 (!rank_output.graph_execution || rank_output.graph_execution->device_graph_segments == 0)) {
                 throw std::runtime_error("Classic NextN Draft seed did not run a device Graph on every rank");
@@ -941,6 +984,19 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             auto hidden = std::move(rank_output.hidden_states);
             if (!hidden) {
                 throw std::runtime_error("V4 MTP did not return hidden states on every rank");
+            }
+            if (eager_direct &&
+                (rank_output.graph_execution || !rank_output.mtp_eager_target_receipt
+                 || !(rank_output.mtp_eager_target_receipt == output.mtp_eager_target_receipt)
+                 || rank_output.mtp_eager_target_receipt->packed_collectives != input.mtp_eager_target_modes.packed_collectives
+                 || rank_output.mtp_eager_target_receipt->shared_plan != eager_direct_plan
+                 || (rank_output.mtp_eager_target_receipt->packed_mhc_pre && !input.mtp_eager_target_modes.packed_mhc_pre)
+                 || (rank_output.mtp_eager_target_receipt->short_c4_index && !input.mtp_eager_target_modes.short_c4_index)
+                 || hidden->device() != communication_group_.get_rank_info(rank).device
+                 || hidden->dtype() != infinilm::runtime::DataType::kBFloat16
+                 || hidden->ndim() != 3 || hidden->size(0) != (*input.input_ids)->numel()
+                 || hidden->size(1) != 4 || hidden->size(2) != model_config_->get<size_t>("hidden_size"))) {
+                throw std::runtime_error("Packed eager direct MTP did not complete the selected path with full HC on every rank");
             }
             if ((input.mtp_last_logits || input.mtp_graph_draft_seed)
                 && (rank_output.mtp_last_logits_used != last_logits_expected
@@ -951,7 +1007,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
                 output.mtp_graph_direct_rank_reports.push_back(std::move(rank_output.graph_execution).value());
             }
             output.hidden_states_by_rank.push_back(
-                owns_graph_hc ? std::move(hidden) : completed_view(std::move(hidden)));
+                owns_hc ? std::move(hidden) : completed_view(std::move(hidden)));
         }
     }
     return output;

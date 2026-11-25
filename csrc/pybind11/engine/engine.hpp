@@ -71,6 +71,7 @@ inline void bind_infer_engine(py::module &m) {
         m, "InferEngine", py::release_gil_before_calling_cpp_dtor());
     infer_engine.def_property_readonly("deepseek_v4_raw_ring_rows", &InferEngine::deepseek_v4_raw_ring_rows);
     infer_engine.def_property_readonly("mtp_graph_packed_direct_commit_version", [](const InferEngine &) { return 1; });
+    infer_engine.def_property_readonly("mtp_eager_packed_direct_commit_version", [](const InferEngine &) { return 1; });
     infer_engine.attr("mtp_draft_cache_only_version") = 1;
     infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
     infer_engine.attr("mtp_shared_compression_plan_version") = 1;
@@ -256,6 +257,7 @@ inline void bind_infer_engine(py::module &m) {
                     "mtp_scratch_step",
                     "mtp_last_logits",
                     "mtp_graph_direct_commit",
+                    "mtp_eager_packed_direct_commit",
                     "mtp_graph_fresh_prefill",
                     "mtp_graph_draft_seed",
                 };
@@ -315,6 +317,11 @@ inline void bind_infer_engine(py::module &m) {
                             throw py::value_error("mtp_graph_direct_commit must be a bool");
                         }
                         input.mtp_graph_direct_commit = py::cast<bool>(item.second);
+                    } else if (key == "mtp_eager_packed_direct_commit") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_eager_packed_direct_commit must be a bool");
+                        }
+                        input.mtp_eager_packed_direct_commit = py::cast<bool>(item.second);
                     } else if (key == "mtp_graph_fresh_prefill") {
                         if (!py::isinstance<py::bool_>(item.second)) {
                             throw py::value_error("mtp_graph_fresh_prefill must be a bool");
@@ -397,6 +404,13 @@ inline void bind_infer_engine(py::module &m) {
             result["host_segments"] = host_segments;
             result["operator_count"] = graph ? graph->operator_count : 0;
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
+            if (const auto &receipt = output.mtp_eager_target_receipt) {
+                result["mtp_eager_packed_direct_commit"] = true;
+                result["mtp_eager_packed_target_collectives_used"] = receipt->packed_collectives;
+                result["mtp_eager_shared_target_plan_used"] = receipt->shared_plan;
+                result["mtp_eager_packed_mhc_pre_used"] = receipt->packed_mhc_pre;
+                result["mtp_eager_short_c4_index_used"] = receipt->short_c4_index;
+            }
             if (!output.mtp_graph_direct_rank_reports.empty()) {
                 py::list rank_reports;
                 for (size_t rank = 0; rank < output.mtp_graph_direct_rank_reports.size(); ++rank) {
