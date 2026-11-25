@@ -143,6 +143,8 @@ class ModelRunner:
                 create_deepseek_v4_mtp_transport(config, self.model_engine, self.device),
                 config.num_blocks * config.block_size,
                 num_draft_tokens=config.num_draft_tokens,
+                branch_draft_lengths=config.nextn_branch_draft_lengths,
+                allow_stochastic=not config.enable_graph,
             )
         elif config.draft_model_path is not None:
             self.speculative_runner = SpeculativeRunner(

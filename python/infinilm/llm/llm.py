@@ -26,6 +26,7 @@ from infinilm.llm.request import (
     FinishReason,
     InferenceRequest,
     RequestOutput,
+    RequestStatus,
     TokenOutput,
 )
 from infinilm.llm.sampling_params import SamplingParams
@@ -60,6 +61,17 @@ def _resolve_sampling_params(sampling_params, config):
         sampling_params = sampling_params.clone()
         sampling_params.max_tokens = config.max_tokens
     return sampling_params
+
+
+def _stable_text_end(text: str, stop_strings) -> int:
+    """Exclude a suffix that can still become a stop marker."""
+    held = 0
+    for marker in stop_strings:
+        for size in range(min(len(text), len(marker) - 1), held, -1):
+            if text.endswith(marker[:size]):
+                held = size
+                break
+    return len(text) - held
 
 
 def _finalize_aborted_request(
@@ -228,7 +240,38 @@ class LLMEngine:
                     "classic DeepSeek V4 MTP must be closed after a failed step"
                 )
             mtp_runner.validate_request(request)
+            if request.sampling_params.max_tokens == 0:
+                self._finish_empty_mtp_request(request)
+                return
+        elif request.sampling_params.do_sample or (
+            request.sampling_params.presence_penalty,
+            request.sampling_params.frequency_penalty,
+            request.sampling_params.repetition_penalty,
+        ) != (0, 0, 1):
+            raise ValueError("explicit do_sample and sampling penalties require classic MTP")
         self.scheduler.add_request(request)
+
+    @staticmethod
+    def _finish_empty_mtp_request(request: InferenceRequest) -> None:
+        # This request never owns a scheduler slot, block table or native state.
+        with request._terminal_lock:
+            if (
+                request._paged_submitted
+                or request.status != RequestStatus.WAITING
+                or request.is_aborted()
+            ):
+                raise ValueError("classic MTP requires a new waiting request")
+            if request._output_queue is not None:
+                request.output_queue.sync_q.put_nowait(
+                    TokenOutput(
+                        request_id=request.request_id,
+                        token_id=-1,
+                        token_text="",
+                        finished=True,
+                        finish_reason=FinishReason.LENGTH,
+                    )
+                )
+            request.mark_finished(FinishReason.LENGTH)
 
     def close(self):
         self.model_runner.close()
@@ -434,6 +477,9 @@ class LLMEngine:
                 num_computed_output_tokens = 0
                 token_ids = [token_ids]
 
+            text_stops = (
+                req.sampling_params.stop if self.config.enable_deepseek_v4_mtp else ()
+            )
             num_appended_tokens = 0
             for token_id in token_ids:
                 # Decode a prospective token without changing request state.
@@ -462,7 +508,12 @@ class LLMEngine:
                     if not holds_back:
                         req.generated_text = last_committed_text + delta
                         req._token_decode_offset = len(req.generated_token_ids)
-                    is_finished = self._check_request_finished(req, token_id)
+                    pending_text = (
+                        delta.rstrip("\ufffd") if holds_back and text_stops else ""
+                    )
+                    is_finished = self._check_request_finished(
+                        req, token_id, pending_text=pending_text
+                    )
                     if is_finished and req.finish_reason == FinishReason.EOS_TOKEN:
                         req.generated_text = last_committed_text
                     # vLLM-style replacement character handling is primarily
@@ -471,12 +522,17 @@ class LLMEngine:
                         if is_finished:
                             req.mark_finished(req.finish_reason)
                     else:
+                        text_end = len(req.generated_text)
+                        if text_stops and not is_finished:
+                            text_end = _stable_text_end(req.generated_text, text_stops)
                         if holds_back and not is_finished:
                             token_text = ""
                         else:
-                            token_text = req.generated_text[req._text_output_offset :]
+                            token_text = req.generated_text[
+                                req._text_output_offset : text_end
+                            ]
                             if token_text:
-                                req._text_output_offset = len(req.generated_text)
+                                req._text_output_offset = text_end
 
                         output = TokenOutput(
                             request_id=req.request_id,
@@ -484,7 +540,7 @@ class LLMEngine:
                             token_text=token_text,
                             finished=is_finished,
                             finish_reason=req.finish_reason if is_finished else None,
-                            generated_text=req.generated_text,
+                            generated_text=req.generated_text[:text_end],
                         )
                         # Queue delivery and terminal state share one commit
                         # boundary. A failed put must stop this step, not leave
@@ -502,10 +558,22 @@ class LLMEngine:
             if finalize_abort and req.is_aborted():
                 self._on_scheduler_abort(req)
 
+        # A textual stop is discovered after verification. The finished MTP
+        # owner retires all of its private KV, including any unissued suffix
+        # verified by that step. Prefix caching is disabled for classic MTP.
         self.scheduler.complete_requests(requests)
 
-    def _check_request_finished(self, req: InferenceRequest, token_id: int) -> bool:
+    def _check_request_finished(
+        self, req: InferenceRequest, token_id: int, *, pending_text: str = ""
+    ) -> bool:
         """Check if request generation is finished."""
+        if (
+            req.sampling_params.stop_token_ids
+            and self.config.enable_deepseek_v4_mtp
+            and token_id in req.sampling_params.stop_token_ids
+        ):
+            req.finish_reason = FinishReason.EOS_TOKEN
+            return True
         if not req.sampling_params.ignore_eos:
             # Check EOS token - only stop if ignore_eos is False
             eos_ids = req.eos_token_ids or self.eos_token_ids
@@ -513,10 +581,18 @@ class LLMEngine:
                 req.finish_reason = FinishReason.EOS_TOKEN
                 return True
 
-            # While ignoring EOS, stop strings are also ignored to avoid requiring additional arguments for benchmarking.
-            # Check stop strings
-            # Remove stop string from generated_text if STOP_STRING is the finishing reason
-            stop_strings = req.sampling_params.stop or []
+        stop_strings = req.sampling_params.stop or []
+        if self.config.enable_deepseek_v4_mtp:
+            if stop_strings:
+                text = req.generated_text + pending_text
+                positions = [text.find(marker) for marker in stop_strings]
+                first = min((pos for pos in positions if pos >= 0), default=None)
+                if first is not None:
+                    req.generated_text = text[:first]
+                    req.finish_reason = FinishReason.STOP_STRING
+                    return True
+        elif not req.sampling_params.ignore_eos:
+            # Preserve the ordinary engine's legacy suffix and ignore_eos rules.
             for stop_str in stop_strings:
                 if req.generated_text.endswith(stop_str):
                     req.generated_text = req.generated_text[: -len(stop_str)]
@@ -619,6 +695,7 @@ class LLM:
         static_cache_capacity: int = 1,
         chunked_prefill_size: int = 0,
         enable_deepseek_v4_mtp: bool = False,
+        nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None,
     ):
         """Initialize LLM.
 
@@ -660,6 +737,7 @@ class LLM:
             static_cache_capacity=static_cache_capacity,
             chunked_prefill_size=chunked_prefill_size,
             enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
+            nextn_branch_draft_lengths=nextn_branch_draft_lengths,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,
@@ -851,6 +929,7 @@ class AsyncLLMEngine:
         static_cache_capacity: int = 1,
         chunked_prefill_size: int = 0,
         enable_deepseek_v4_mtp: bool = False,
+        nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None,
     ):
         """Initialize AsyncLLMEngine.
 
@@ -896,6 +975,7 @@ class AsyncLLMEngine:
             static_cache_capacity=static_cache_capacity,
             chunked_prefill_size=chunked_prefill_size,
             enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
+            nextn_branch_draft_lengths=nextn_branch_draft_lengths,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,
@@ -926,6 +1006,7 @@ class AsyncLLMEngine:
         self._stop_requested = False
         self._stop_drain_complete = False
         self._stop_drain_error: Optional[str] = None
+        self._fatal_error_handler = None
 
     def is_healthy(self) -> bool:
         return bool(self._healthy)
@@ -1130,6 +1211,8 @@ class AsyncLLMEngine:
                 except Exception:
                     # Logging cannot undo the fault latch or request notifications.
                     pass
+                if self._fatal_error_handler is not None:
+                    self._fatal_error_handler(e)
                 break
 
     def add_request(

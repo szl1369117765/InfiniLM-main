@@ -15,6 +15,8 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <string_view>
 #include <stdexcept>
 #include <utility>
 
@@ -505,6 +507,8 @@ public:
         if (backend != backends::AttentionBackend::PAGED_ATTN || ep.backend != layers::moe::EPBackend::Disabled)
             throw std::invalid_argument("DeepSeek V4 requires paged attention and TP expert placement");
         model_config_ = std::move(config);
+        const auto *reuse = std::getenv("INFINILM_MTP_REUSE_SNAPSHOT_BUFFER");
+        reuse_snapshot_buffer_ = reuse && std::string_view(reuse) == "1";
         backbone_ = bind_child("model",std::make_shared<Backbone>(rt,cfg_,rank));
         head_ = bind_child("lm_head",std::make_shared<ColumnLinear>(
             rt,cfg_.hidden,cfg_.vocab,false,DataType::kBFloat16,rank.tp_rank,rank.tp_size));
@@ -533,7 +537,8 @@ public:
         if (input.rollback_v4_cache) {
             if (!ctx.mtp_snapshot_barrier)
                 throw std::invalid_argument("Classic NextN verify requires a snapshot rendezvous");
-            PagedCacheSnapshot snapshot(rt,caches_,writes);
+            PagedCacheSnapshot snapshot(rt,caches_,writes,
+                reuse_snapshot_buffer_ ? &snapshot_backup_ : nullptr);
             // A rank that cannot allocate its snapshot must fail before its peers
             // enter the verify collectives.
             ctx.mtp_snapshot_barrier->wait();
@@ -560,6 +565,7 @@ public:
         cache::validate_backend_cache_config(requested,backend);
         decode_plans_ = {};
         mtp_decode_plans_ = {};
+        snapshot_backup_.reset();
         if (!requested) {
             caches_.clear();
             cache_config_.reset();
@@ -723,6 +729,10 @@ private:
     infinicclComm_t comm_;
     const bool sampling_rank_;
     std::vector<LayerPagedCache> caches_;
+    bool reuse_snapshot_buffer_ = false;
+    // The rank worker serializes verify calls; rollback synchronizes before
+    // the next request can reuse or resize this device buffer.
+    mutable Tensor snapshot_backup_;
     Tensor swa_rope_, compressed_rope_;
     // These graphs hold pointers to this model instance's current KV cache.
     // The two most recent shapes cover both sides of adjacent page boundaries.

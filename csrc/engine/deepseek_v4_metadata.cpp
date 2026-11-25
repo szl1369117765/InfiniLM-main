@@ -1,5 +1,7 @@
 #include "deepseek_v4_metadata.hpp"
 
+#include "models/deepseek_v4/cache_geometry.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -90,7 +92,7 @@ int64_t state_loc(int64_t raw_slot, size_t ratio, size_t block_size) {
     if (raw_slot < 0) {
         return -1;
     }
-    const size_t ring_size = ratio == 4 ? 8 : 128;
+    const size_t ring_size = models::deepseek_v4::compressor_ring_rows(ratio);
     const auto slot = static_cast<size_t>(raw_slot);
     return static_cast<int64_t>(((slot / block_size) * ring_size + (slot % ring_size)) / ratio);
 }
@@ -557,7 +559,7 @@ DeepSeekV4CompressionPlan build_deepseek_v4_compression_plan(
         throw std::invalid_argument("DeepSeek V4 compression offsets must cover all input rows");
     }
     const auto group_width = static_cast<int64_t>(ratio);
-    const size_t window = ratio == 4 ? 8 : 128;
+    const size_t window = models::deepseek_v4::compression_window(ratio);
     DeepSeekV4CompressionPlan plan{make_i32_tensor({rows, window}), make_i32_tensor(row_shape)};
     auto *sources = i32_data(plan.sources);
     auto *slots = i32_data(plan.state_slots);

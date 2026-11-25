@@ -1,13 +1,24 @@
 """Eager classic DeepSeek V4 NextN execution."""
 
+from dataclasses import replace
+
+from ..sampling_params import validate_stop_strings, validate_stop_token_ids
+from .deepseek_v4_mtp_sampling import RequestSampling, validate_request_sampling
 from .deepseek_v4_mtp_verify import GreedyVerifyBatch, GreedyVerifyRequest
 
 
 class DeepSeekV4MTPRunner:
-    def __init__(self, target, transport, cache_token_capacity, *, num_draft_tokens=1):
+    def __init__(
+        self, target, transport, cache_token_capacity, *, num_draft_tokens=1,
+        branch_draft_lengths=None, allow_stochastic=False,
+    ):
         self.target = target
         self.transport = transport
         self.num_draft_tokens = num_draft_tokens
+        self.branch_draft_lengths = tuple(
+            k for k in (branch_draft_lengths or ()) if k <= num_draft_tokens
+        )
+        self.allow_stochastic = allow_stochastic
         self.max_context = min(
             target.hf_config["max_position_embeddings"], cache_token_capacity
         )
@@ -20,18 +31,22 @@ class DeepSeekV4MTPRunner:
 
     def validate_request(self, request):
         params = request.sampling_params
+        validate_request_sampling(params)
+        if params.do_sample and not self.allow_stochastic:
+            raise ValueError("classic stochastic MTP requires eager execution")
+        if params.do_sample and self.branch_draft_lengths:
+            raise ValueError("classic stochastic MTP requires a single draft chain")
+        validate_stop_strings(params.stop)
+        validate_stop_token_ids(params.stop_token_ids)
         if (
-            params.top_k != 1
-            or params.stop
-            or params.stop_token_ids
-            or request.has_multimodal_inputs
+            request.has_multimodal_inputs
             or type(params.max_tokens) is not int
-            or params.max_tokens < 1
+            or params.max_tokens < 0
             or request.get_prompt_length() < 1
         ):
             raise ValueError(
                 "classic DeepSeek V4 MTP requires a nonempty text prompt, "
-                "a positive output limit, top_k=1 and no custom stop rules"
+                "and a non-negative output limit"
             )
         if request.get_prompt_length() + params.max_tokens > self.max_context:
             raise ValueError("classic DeepSeek V4 MTP request exceeds available context")
@@ -55,11 +70,14 @@ class DeepSeekV4MTPRunner:
         requests = scheduler_output.scheduled_requests
         if not requests:
             raise RuntimeError("classic DeepSeek V4 MTP requires a scheduled request")
-        # Classic greedy sampling never consumes RNG state.
+        # Native output IDs remain greedy. Stochastic choices use the raw logits
+        # and consume only their requesting owner's Python RNG.
         model_input = {**model_input, "temperature": 1.0, "top_p": 1.0, "top_k": 1}
         try:
             for request in requests:
                 self.validate_request(request)
+            if self.branch_draft_lengths and len(requests) != 1:
+                raise RuntimeError("classic NextN serial branches require one scheduled owner")
             if scheduler_output.is_prefill:
                 return self._prefill(requests, model_input)
             for request in requests:
@@ -70,14 +88,15 @@ class DeepSeekV4MTPRunner:
                 request.sampling_params.max_tokens - request.get_num_generated_tokens()
                 for request in requests
             ]
-            if remaining == [1]:
+            if remaining == [1] and not requests[0].sampling_params.do_sample:
                 # There is no room to publish both a proposal and its bonus.
                 return self.target.forward(
                     **model_input, sampling_rows=[(1.0, 1.0, 1)], random_values=[0.0]
                 ).to_numpy().tolist()
+            depth = max(self.branch_draft_lengths, default=self.num_draft_tokens)
             candidates = [
                 {"req": req, "base_len": req.get_total_length(),
-                 "draft_count": min(self.num_draft_tokens, limit - 1), "remaining": limit}
+                 "draft_count": min(depth, limit - 1), "remaining": limit}
                 for req, limit in zip(requests, remaining) if limit > 1
             ]
             outputs = self._verify(scheduler_output.speculative_cache_ops, candidates) if candidates else {}
@@ -86,6 +105,7 @@ class DeepSeekV4MTPRunner:
                     outputs[request.request_id] = self.transport.target_tail(
                         request.request_id, request.generated_token_ids[-1],
                         request.get_total_length() - 1, request.block_table,
+                        **({"sampling": RequestSampling(request)} if request.sampling_params.do_sample else {}),
                     )
             return [outputs[request.request_id] for request in requests]
         except BaseException:
@@ -100,10 +120,17 @@ class DeepSeekV4MTPRunner:
             for request in requests
         ):
             raise RuntimeError("classic DeepSeek V4 MTP requires a fresh full prefill")
-        if len(owners) == 1:
+        if len(owners) == 1 and requests[0].sampling_params.do_sample:
+            anchors = [self.transport.prefill(owners[0], model_input, sampling=RequestSampling(requests[0]))]
+        elif len(owners) == 1:
             anchors = [self.transport.prefill(owners[0], model_input)]
         else:
-            anchors = list(self.transport.prefill_many(owners, model_input))
+            sampling = tuple(RequestSampling(req) if req.sampling_params.do_sample else None
+                             for req in requests)
+            if any(state is not None for state in sampling):
+                anchors = list(self.transport.prefill_many(owners, model_input, sampling=sampling))
+            else:
+                anchors = list(self.transport.prefill_many(owners, model_input))
         if len(anchors) != len(owners) or any(type(token) is not int or token < 0 for token in anchors):
             raise RuntimeError("classic DeepSeek V4 MTP prefill returned invalid tokens")
         self.requests.update(zip(owners, requests))
@@ -117,12 +144,22 @@ class DeepSeekV4MTPRunner:
         eos = request.eos_token_ids or self.target.eos_token_id or ()
         if isinstance(eos, int):
             eos = (eos,)
-        eos = frozenset() if request.sampling_params.ignore_eos else frozenset(eos)
-        if count == 1:
+        stop_ids = frozenset(request.sampling_params.stop_token_ids)
+        if not request.sampling_params.ignore_eos:
+            stop_ids = stop_ids.union(eos)
+        if request.sampling_params.do_sample:
+            proposals = self.transport.propose_many(
+                owner, anchor, start, table, count, stop_ids, sampling=RequestSampling(request)
+            )
+        elif count == 1:
             proposals = (self.transport.propose(owner, anchor, start, table),)
         else:
-            proposals = self.transport.propose_many(owner, anchor, start, table, count, eos)
-        return GreedyVerifyRequest(owner, start, candidate["remaining"] + 1, anchor, proposals, eos)
+            proposals = self.transport.propose_many(
+                owner, anchor, start, table, count, stop_ids
+            )
+        return GreedyVerifyRequest(
+            owner, start, candidate["remaining"] + 1, anchor, proposals, stop_ids
+        )
 
     def _verify(self, cache_ops, candidates):
         with cache_ops.verify_batch(candidates) as reservation:
@@ -130,15 +167,37 @@ class DeepSeekV4MTPRunner:
             # reserved until the transport has resolved the full transaction.
             reservation.mark_submitted()
             tables = tuple(tuple(candidate["block_table"]) for candidate in candidates)
-            batch = GreedyVerifyBatch.pack(
-                [self._propose(candidate, table) for candidate, table in zip(candidates, tables)],
-                self.max_context,
-            )
-            with self.transport.target_transaction(
-                batch, tables[0] if len(candidates) == 1 else tables,
-            ) as transaction:
-                intents = batch.resolve(transaction.rows)
-                transaction.commit(intents[0] if len(candidates) == 1 else intents)
+            requests = [
+                self._propose(candidate, table) for candidate, table in zip(candidates, tables)
+            ]
+            if self.branch_draft_lengths:
+                (request,) = requests
+                depths = dict.fromkeys(
+                    min(k, len(request.draft_tokens)) for k in self.branch_draft_lengths
+                )
+                branches = tuple(
+                    GreedyVerifyBatch.pack(
+                        (replace(request, draft_tokens=request.draft_tokens[:k]),),
+                        self.max_context,
+                    )
+                    for k in depths
+                )
+                with self.transport.serial_branch_transaction(branches, tables[0]) as (
+                    transaction, winner,
+                ):
+                    intents = (winner,)
+                    transaction.commit(winner)
+            else:
+                batch = GreedyVerifyBatch.pack(requests, self.max_context)
+                with self.transport.target_transaction(
+                    batch, tables[0] if len(candidates) == 1 else tables,
+                ) as transaction:
+                    intents = (
+                        transaction.resolve_stochastic()
+                        if any(row["req"].sampling_params.do_sample for row in candidates)
+                        else batch.resolve(transaction.rows)
+                    )
+                    transaction.commit(intents[0] if len(candidates) == 1 else intents)
             reservation.mark_completed()
             reservation.commit([intent.retain_length for intent in intents])
 

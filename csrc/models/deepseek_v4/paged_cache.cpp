@@ -110,7 +110,7 @@ LayerPagedCache allocate_layer_paged_cache(runtime::Runtime &rt, size_t full_blo
     const auto page_tokens = kV4PageSize / ratio;
     cache.compressed = zeros(rt, full_blocks, align(page_tokens * kV4FlashMlaWidth, kFlashMlaAlignment),
                              DataType::kUInt8);
-    const size_t ring = ratio == 4 ? 8 : 128;
+    const size_t ring = compressor_ring_rows(ratio);
     const size_t coeff = ratio == 4 ? 2 : 1;
     if (swa_blocks > std::numeric_limits<size_t>::max() / ring - 2) {
         throw std::overflow_error("DeepSeek V4 compressor ring size overflows");
@@ -128,7 +128,8 @@ LayerPagedCache allocate_layer_paged_cache(runtime::Runtime &rt, size_t full_blo
 
 PagedCacheSnapshot::PagedCacheSnapshot(runtime::Runtime &rt,
                                        const std::vector<LayerPagedCache> &layers,
-                                       const PagedCacheWriteSet &writes)
+                                       const PagedCacheWriteSet &writes,
+                                       runtime::Tensor *reusable_backup)
     : runtime_(rt) {
     rt.assertOwnerThread();
     if (rt.isGraphRecording()) {
@@ -190,7 +191,14 @@ PagedCacheSnapshot::PagedCacheSnapshot(runtime::Runtime &rt,
     }
 
     if (backup_bytes) {
-        backup_ = runtime::Tensor::empty(rt, {backup_bytes}, DataType::kUInt8);
+        if (reusable_backup && *reusable_backup && (*reusable_backup)->numel() >= backup_bytes) {
+            backup_ = *reusable_backup;
+        } else {
+            backup_ = runtime::Tensor::empty(rt, {backup_bytes}, DataType::kUInt8);
+            if (reusable_backup) {
+                *reusable_backup = backup_;
+            }
+        }
         try {
             for (auto &slice : slices_) {
                 rt.memcpyD2D(backup_->data() + slice.backup_offset,

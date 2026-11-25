@@ -62,6 +62,7 @@ class BaseConfig:
         self.draft_model = self.args.draft_model
         self.num_draft_tokens = self.args.num_draft_tokens
         self.enable_deepseek_v4_mtp = self.args.enable_deepseek_v4_mtp
+        self.nextn_branch_draft_lengths = self.args.nextn_branch_draft_lengths
         self.device = self.args.device
         self.tp = self.args.tp
         self.pp = self.args.pp
@@ -177,6 +178,12 @@ class BaseConfig:
             "--enable-deepseek-v4-mtp",
             action="store_true",
             help="enable classic DeepSeek V4 NextN with up to 3 paged requests",
+        )
+        self.parser.add_argument(
+            "--nextn-branch-draft-lengths",
+            type=int,
+            nargs="+",
+            help="ordered draft depths for serial eager classic NextN branches (C1 only)",
         )
         self.parser.add_argument(
             "--device",

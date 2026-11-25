@@ -13,6 +13,7 @@ class EngineConfig:
         draft_model_path: Optional Eagle/MTP draft model directory.
         num_draft_tokens: Number of draft tokens to verify per step.
         enable_deepseek_v4_mtp: Opt in to classic DeepSeek V4 NextN (C1-C3, K1-K3).
+        nextn_branch_draft_lengths: Ordered extra candidate depths for single-owner eager NextN.
         device: Device type string ('cpu', 'cuda', 'mlu', etc.).
         dtype: Data type string ('float16', 'bfloat16', 'float32').
         tensor_parallel_size: Number of devices for tensor parallelism.
@@ -72,6 +73,7 @@ class EngineConfig:
     static_cache_capacity: int = 1
     chunked_prefill_size: int = 0
     enable_deepseek_v4_mtp: bool = False
+    nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None
 
     def __post_init__(self) -> None:
         if self.enable_deepseek_v4_mtp and (
@@ -96,6 +98,23 @@ class EngineConfig:
                 "with 256-token pages, 1-3 requests, 1-3 draft tokens, local KV, "
                 "and TP expert placement"
             )
+        lengths = self.nextn_branch_draft_lengths
+        if lengths is not None:
+            if (
+                not self.enable_deepseek_v4_mtp
+                or self.enable_graph
+                or self.max_batch_size != 1
+                or not isinstance(lengths, (list, tuple))
+                or not lengths
+                or any(type(k) is not int or k not in (1, 2, 3) for k in lengths)
+                or len(set(lengths)) != len(lengths)
+                or min(lengths) > self.num_draft_tokens
+            ):
+                raise ValueError(
+                    "classic NextN serial branches require eager C1 and distinct "
+                    "K1/K2/K3 candidate depths with at least one within the draft limit"
+                )
+            self.nextn_branch_draft_lengths = tuple(lengths)
         if (
             type(self.static_cache_capacity) is not int
             or self.static_cache_capacity < 1

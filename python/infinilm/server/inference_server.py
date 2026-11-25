@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from infinilm.base_config import BaseConfig
 from infinilm.config import KVTransferConfig
 from infinilm.llm import AsyncLLMEngine, FinishReason, SamplingParams
+from infinilm.llm.sampling_params import validate_stop_strings, validate_stop_token_ids
 from infinilm.moe_config import configure_moe_ep_backend
 from infinilm.server.agent_protocol import (
     AgentProtocolError,
@@ -151,6 +153,7 @@ class InferenceServer:
         draft_model_path: Optional[str] = None,
         num_draft_tokens: int = 4,
         enable_deepseek_v4_mtp: bool = False,
+        nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None,
     ):
         """Initialize inference server.
 
@@ -219,15 +222,32 @@ class InferenceServer:
         self.draft_model_path = draft_model_path
         self.num_draft_tokens = num_draft_tokens
         self.enable_deepseek_v4_mtp = enable_deepseek_v4_mtp
+        self.nextn_branch_draft_lengths = nextn_branch_draft_lengths
 
         self.engine: AsyncLLMEngine = None
+        self._standalone_mtp = False
 
-    def start(self):
+    def start(self, *, standalone=False):
         """Start the HTTP server."""
-        app = self._create_app()
-        logger.info(f"Starting API Server at {self.host}:{self.port}...")
-        uvicorn.run(app, host=self.host, port=self.port)
+        self._standalone_mtp = standalone and self.enable_deepseek_v4_mtp
+        try:
+            app = self._create_app()
+            logger.info(f"Starting API Server at {self.host}:{self.port}...")
+            uvicorn.run(app, host=self.host, port=self.port)
+        finally:
+            self._standalone_mtp = False
         logger.info("Inference Server stopped")
+
+    def _exit_failed_standalone_mtp(self, error):
+        # This hook runs once, after the engine latches failure and queues ERROR.
+        # Leave a short window for HTTP/SSE errors before exiting the failed process.
+        timer = threading.Timer(1.0, os._exit, args=(70,))
+        timer.daemon = True
+        try:
+            timer.start()
+        except Exception:
+            os._exit(70)
+        logger.critical("Fatal classic MTP failure, standalone server exiting with code 70: %s", error)
 
     def _create_app(self):
         """Create FastAPI application."""
@@ -239,6 +259,7 @@ class InferenceServer:
                 draft_model_path=self.draft_model_path,
                 num_draft_tokens=self.num_draft_tokens,
                 enable_deepseek_v4_mtp=self.enable_deepseek_v4_mtp,
+                nextn_branch_draft_lengths=self.nextn_branch_draft_lengths,
                 device=self.device,
                 dtype=self.dtype,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -267,6 +288,8 @@ class InferenceServer:
                 pre_transpose=self.pre_transpose,
                 chunked_prefill_size=self.chunked_prefill_size,
             )
+            if self._standalone_mtp:
+                self.engine._fatal_error_handler = self._exit_failed_standalone_mtp
             self.engine.start()
             logger.info(f"Engine initialized with model at {self.model_path}")
             logger.info(f"  enable_graph: {self.enable_graph}")
@@ -430,9 +453,13 @@ class InferenceServer:
             self.max_tokens,
         )
         if max_tokens is not None:
-            max_tokens = int(max_tokens)
-            if max_tokens <= 0:
-                raise ValueError("max_tokens must be greater than 0")
+            if self.enable_deepseek_v4_mtp:
+                if type(max_tokens) is not int or max_tokens < 0:
+                    raise ValueError("classic MTP max_tokens must be a non-negative integer")
+            else:
+                max_tokens = int(max_tokens)
+                if max_tokens <= 0:
+                    raise ValueError("max_tokens must be greater than 0")
 
         ignore_eos = pick("ignore_eos", self.ignore_eos)
         if not isinstance(ignore_eos, bool):
@@ -441,15 +468,53 @@ class InferenceServer:
         stop = pick("stop", None)
         if isinstance(stop, str):
             stop = [stop]
-
-        return SamplingParams(
-            temperature=float(pick("temperature", self.temperature)),
-            top_p=float(pick("top_p", self.top_p)),
-            top_k=int(pick("top_k", self.top_k)),
+        stop_token_ids = None
+        nextn_options = {}
+        temperature, top_p, top_k = (
+            pick("temperature", self.temperature), pick("top_p", self.top_p), pick("top_k", self.top_k)
+        )
+        if self.enable_deepseek_v4_mtp:
+            n = pick("n", 1)
+            if type(n) is not int or n != 1:
+                raise ValueError("classic NextN supports integer n=1 only")
+            if stop is not None:
+                validate_stop_strings(stop)
+            stop_token_ids = pick("stop_token_ids", [])
+            validate_stop_token_ids(stop_token_ids)
+            nextn_options = {
+                "do_sample": pick("do_sample", False),
+                "seed": pick("seed", None),
+                "presence_penalty": pick("presence_penalty", 0.0),
+                "frequency_penalty": pick("frequency_penalty", 0.0),
+                "repetition_penalty": pick("repetition_penalty", 1.0),
+            }
+            if nextn_options["do_sample"] is True:
+                if self.enable_graph:
+                    raise ValueError("classic stochastic MTP requires eager execution")
+                if getattr(self, "nextn_branch_draft_lengths", None):
+                    raise ValueError("classic stochastic MTP requires a single draft chain")
+                for key, default in (("min_p", 0), ("typical_p", 1), ("min_tokens", 0), ("min_new_tokens", 0)):
+                    if pick(key, default) != default:
+                        raise ValueError(f"classic stochastic MTP does not support nondefault {key}")
+                if pick("logit_bias", {}):
+                    raise ValueError("classic stochastic MTP does not support logit_bias")
+        if nextn_options.get("do_sample") is not True:
+            temperature, top_p, top_k = float(temperature), float(top_p), int(top_k)
+        params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             max_tokens=max_tokens,
             stop=stop,
+            stop_token_ids=stop_token_ids,
             ignore_eos=ignore_eos,
+            **nextn_options,
         )
+        if self.enable_deepseek_v4_mtp:
+            from infinilm.llm.model_runner.deepseek_v4_mtp_sampling import validate_request_sampling
+
+            validate_request_sampling(params)
+        return params
 
     async def _stream_chat(self, request_id: str, data: dict, http_request: Request):
         """Handle streaming chat request."""
@@ -765,6 +830,7 @@ def main():
         draft_model_path=cfg.draft_model if cfg.enable_deepseek_v4_mtp else None,
         num_draft_tokens=cfg.num_draft_tokens if cfg.enable_deepseek_v4_mtp else 4,
         enable_deepseek_v4_mtp=cfg.enable_deepseek_v4_mtp,
+        nextn_branch_draft_lengths=cfg.nextn_branch_draft_lengths,
         device=device,
         dtype=cfg.dtype,
         tensor_parallel_size=cfg.tp,
@@ -797,7 +863,7 @@ def main():
         tool_call_parser=cfg.tool_call_parser,
         chunked_prefill_size=cfg.chunked_prefill_size,
     )
-    server.start()
+    server.start(standalone=True)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 """Exercise classic MTP request retirement through the real paged LLM engine."""
 
+import ast
+from contextlib import contextmanager
 import importlib
 import queue
 import sys
@@ -82,15 +84,26 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
         cls.runner = importlib.import_module(
             "infinilm.llm.model_runner.deepseek_v4_mtp_runner"
         ).DeepSeekV4MTPRunner
-        cls.target = SimpleNamespace(hf_config=config, model_type="deepseek_v4")
+        cls.verify_row = importlib.import_module(
+            "infinilm.llm.model_runner.deepseek_v4_mtp_verify"
+        ).TargetVerifyRow
+        cls.native_transport = importlib.import_module(
+            "infinilm.llm.model_runner.deepseek_v4_mtp_transport"
+        )
+        cls.target = SimpleNamespace(
+            hf_config=config, model_type="deepseek_v4", eos_token_id=None
+        )
 
     def setUp(self):
         self.transport = NativeTransport()
         self.tokenizer = SimpleNamespace(decode=lambda tokens: str(tokens[-1]))
         self.engine = self.make_engine()
 
-    def make_engine(self, max_batch_size=1):
-        runner = self.runner(self.target, self.transport, 1024)
+    def make_engine(self, max_batch_size=1, num_draft_tokens=1, branch_lengths=None):
+        runner = self.runner(
+            self.target, self.transport, 1024, num_draft_tokens=num_draft_tokens,
+            branch_draft_lengths=branch_lengths,
+        )
 
         def execute_model(batch):
             rows = runner.forward(batch, {})
@@ -116,7 +129,8 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
                     draft_model_path="draft",
                     tensor_parallel_size=8,
                     max_batch_size=max_batch_size,
-                    num_draft_tokens=1,
+                    num_draft_tokens=num_draft_tokens,
+                    nextn_branch_draft_lengths=branch_lengths,
                     num_blocks=4,
                     attn_backend="paged-attn",
                     enable_prefix_caching=False,
@@ -124,11 +138,13 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
                 )
             )
 
-    def enqueue(self, owner, budget=2):
+    def enqueue(self, owner, budget=2, **sampling):
         request = self.llm.InferenceRequest(
             owner,
             prompt_token_ids=[7],
-            sampling_params=self.llm.SamplingParams(top_k=1, max_tokens=budget),
+            sampling_params=self.llm.SamplingParams(
+                top_k=1, max_tokens=budget, **sampling
+            ),
         )
         request.output_queue
         self.engine.add_request(request)
@@ -141,6 +157,272 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
             result = stream.get_nowait()
             outputs.append((result.token_id, result.finished, result.finish_reason))
         return outputs
+
+    def test_zero_budget_finishes_without_scheduler_or_native_ownership(self):
+        with patch.object(self.engine.scheduler, "add_request") as submit:
+            zero = self.enqueue("empty", budget=0)
+            submit.assert_not_called()
+        self.assertTrue(zero.is_finished())
+        self.assertEqual(list(zero.generated_token_ids), [])
+        self.assertEqual(self.outputs(zero), [(-1, True, self.reason.LENGTH)])
+        self.assertEqual(zero.block_table, [])
+        self.assertFalse(self.engine.step())
+        self.assertEqual(self.transport.calls, [])
+        with self.assertRaisesRegex(ValueError, "new waiting request"):
+            self.engine.add_request(zero)
+        self.assert_usable_pages(4)
+
+    def test_prefill_stop_id_wins_over_ignore_eos_and_hides_text(self):
+        request = self.enqueue("stop", stop_token_ids=[71], ignore_eos=True)
+        self.assertTrue(self.engine.step())
+        self.assertEqual(self.outputs(request), [(71, True, self.reason.EOS_TOKEN)])
+        self.assertEqual(list(request.generated_token_ids), [71])
+        self.assertEqual(request.generated_text, "")
+        self.assertEqual(
+            self.transport.calls, [("prefill", "stop"), ("release", "stop")]
+        )
+        self.assert_usable_pages(4)
+
+    def test_packed_stop_id_only_shortens_its_own_verify(self):
+        self.engine = self.make_engine(max_batch_size=2, num_draft_tokens=3)
+        stopped = self.enqueue(
+            "stop", budget=5, stop_token_ids=[72], ignore_eos=True
+        )
+        survivor = self.enqueue("survivor", budget=5, ignore_eos=True)
+        queries = []
+        commits = []
+
+        def propose_many(owner, anchor, position, table, count, stop_ids):
+            proposals = []
+            for token in range(anchor + 1, anchor + count + 1):
+                proposals.append(token)
+                if token in stop_ids:
+                    break
+            return tuple(proposals)
+
+        @contextmanager
+        def target_transaction(batch, tables):
+            queries.append(batch.input_offsets)
+            rows = tuple(
+                self.verify_row(row, row.input_token + 1) for row in batch.rows
+            )
+            yield SimpleNamespace(rows=rows, commit=commits.append)
+
+        self.assertTrue(self.engine.step())
+        with (
+            patch.object(self.transport, "propose_many", propose_many, create=True),
+            patch.object(
+                self.transport, "target_transaction", target_transaction, create=True
+            ),
+        ):
+            self.assertTrue(self.engine.step())
+        self.assertEqual(queries, [(0, 2, 6)])
+        self.assertEqual(
+            [(row.owner, row.terminal) for row in commits[0]],
+            [("stop", True), ("survivor", False)],
+        )
+        self.assertEqual(
+            self.outputs(stopped), [(71, False, None), (72, True, self.reason.EOS_TOKEN)]
+        )
+        self.assertEqual(list(survivor.generated_token_ids), [71, 72, 73, 74, 75])
+        self.assertTrue(survivor.is_finished())
+        self.assert_usable_pages(4)
+
+    def test_text_stop_masks_a_cross_token_marker_and_retires_cross_page_suffix(self):
+        self.engine = self.make_engine(max_batch_size=2, num_draft_tokens=3)
+        stopped = self.llm.InferenceRequest(
+            "stop",
+            prompt_token_ids=[7] * 254,
+            sampling_params=self.llm.SamplingParams(
+                max_tokens=5, stop=["END"], ignore_eos=True
+            ),
+        )
+        stopped.output_queue
+        self.engine.add_request(stopped)
+        survivor = self.enqueue("survivor", budget=5)
+        chunks = {71: "left E", 72: "ND suffix", 73: " next", 74: " last", 75: "!"}
+        self.tokenizer.decode = lambda tokens: chunks[tokens[-1]]
+        self.assertTrue(self.engine.step())
+        first = stopped.output_queue.sync_q.get_nowait()
+        self.assertEqual((first.token_text, first.generated_text), ("left ", "left "))
+        self.assertFalse(first.finished)
+        self.assertEqual(len(stopped.block_table), 1)
+        commits = []
+
+        def propose_many(owner, anchor, position, table, count, stop_ids):
+            return tuple(range(anchor + 1, anchor + count + 1))
+
+        @contextmanager
+        def target_transaction(batch, tables):
+            self.assertEqual(batch.input_offsets, (0, 4, 8))
+            self.assertEqual([len(table) for table in tables], [2, 1])
+            rows = tuple(
+                self.verify_row(row, row.input_token + 1) for row in batch.rows
+            )
+            yield SimpleNamespace(rows=rows, commit=commits.append)
+
+        with (
+            patch.object(self.transport, "propose_many", propose_many, create=True),
+            patch.object(
+                self.transport, "target_transaction", target_transaction, create=True
+            ),
+        ):
+            self.assertTrue(self.engine.step())
+        end = stopped.output_queue.sync_q.get_nowait()
+        self.assertEqual(
+            (end.token_id, end.token_text, end.generated_text, end.finish_reason),
+            (72, "", "left ", self.reason.STOP_STRING),
+        )
+        self.assertTrue(end.finished)
+        self.assertTrue(stopped.output_queue.sync_q.empty())
+        self.assertEqual(list(stopped.generated_token_ids), [71, 72])
+        self.assertEqual(stopped.to_request_output().outputs[0].text, "left ")
+        self.assertEqual(len(commits[0][0].materialized_rows), 4)
+        self.assertEqual(list(survivor.generated_token_ids), [71, 72, 73, 74, 75])
+        self.assertEqual(survivor.finish_reason, self.reason.LENGTH)
+        self.assertEqual(
+            self.transport.calls[-2:], [("release", "stop"), ("release", "survivor")]
+        )
+        self.assert_usable_pages(4)
+        followup = self.enqueue("stop", budget=1)
+        self.assertTrue(self.engine.step())
+        self.assertEqual(list(followup.generated_token_ids), [71])
+        self.assert_usable_pages(4)
+
+    def test_text_stop_flushes_a_partial_marker_at_length_limit(self):
+        self.tokenizer.decode = lambda _: "left E"
+        request = self.enqueue("length", budget=1, stop=["END"])
+        self.assertTrue(self.engine.step())
+        end = request.output_queue.sync_q.get_nowait()
+        self.assertEqual((end.token_text, end.generated_text), ("left E", "left E"))
+        self.assertEqual(end.finish_reason, self.reason.LENGTH)
+
+    def test_text_stop_detects_the_marker_before_an_incomplete_utf8_suffix(self):
+        self.tokenizer.decode = lambda _: "left END\ufffd"
+        request = self.enqueue("stop", budget=2, stop=["END"])
+        self.assertTrue(self.engine.step())
+        end = request.output_queue.sync_q.get_nowait()
+        self.assertEqual((end.token_text, end.generated_text), ("left ", "left "))
+        self.assertEqual(end.finish_reason, self.reason.STOP_STRING)
+        self.assertEqual(list(request.generated_token_ids), [71])
+        self.assert_usable_pages(4)
+
+    def test_serial_greedy_branches_publish_only_the_ordered_winner(self):
+        class Hidden:
+            def narrow(self, axis, start, length):
+                return self
+
+        for tie in (False, True):
+            with self.subTest(tie=tie):
+                draft = object()
+                hidden = (Hidden(),)
+                self.transport = self.native_transport._V4Transport(
+                    self.target, draft, None, 256
+                )
+                self.engine = self.make_engine(num_draft_tokens=3, branch_lengths=(1, 3))
+                calls = []
+
+                def prefill(owner, model_input):
+                    self.transport.states[owner] = self.native_transport._DraftState(
+                        hidden, 71, 254
+                    )
+                    return 71
+
+                def forward(engine, tokens, start, table, *, rollback=False, **options):
+                    calls.append((engine is self.target, tuple(tokens), rollback))
+                    predicted = [token + 1 for token in tokens]
+                    if engine is self.target and rollback and len(tokens) == 4 and tie:
+                        predicted[1] = 90
+                    return tuple(predicted), hidden
+
+                request = self.llm.InferenceRequest(
+                    "branch",
+                    prompt_token_ids=[7] * 254,
+                    sampling_params=self.llm.SamplingParams(max_tokens=5),
+                )
+                self.engine.add_request(request)
+                with (
+                    patch.object(self.transport, "prefill", prefill),
+                    patch.object(self.transport, "_forward", forward),
+                ):
+                    self.assertTrue(self.engine.step())
+                    self.assertTrue(self.engine.step())
+                winner = (71, 72) if tie else (71, 72, 73, 74)
+                self.assertEqual(
+                    [row[1:] for row in calls if row[0]],
+                    [((71, 72), True), ((71, 72, 73, 74), True), (winner, False)],
+                )
+                self.assertEqual(
+                    [row[1] for row in calls[:3]], [(71,), (72,), (73,)]
+                )
+                self.assertEqual(
+                    list(request.generated_token_ids),
+                    [71, 72, 73] if tie else [71, 72, 73, 74, 75],
+                )
+                if tie:
+                    self.assertEqual(self.transport.states["branch"].anchor, 73)
+                    request.abort()
+                    self.engine.step()
+                self.assertFalse(self.transport.states)
+                self.assert_usable_pages(4)
+
+    def test_classic_serial_branch_configuration_rejects_unsupported_modes(self):
+        configure = self.llm.EngineConfig
+        required = {
+            "model_path": "target", "draft_model_path": "draft",
+            "num_draft_tokens": 3, "max_batch_size": 1,
+            "attn_backend": "paged-attn", "enable_prefix_caching": False,
+            "enable_deepseek_v4_mtp": True, "nextn_branch_draft_lengths": [3, 1],
+        }
+        self.assertEqual(configure(**required).nextn_branch_draft_lengths, (3, 1))
+        for change in (
+            {"enable_graph": True}, {"max_batch_size": 2},
+            {"nextn_branch_draft_lengths": [1, 1]},
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(
+                ValueError, "serial branches require eager C1"
+            ):
+                configure(**{**required, **change})
+
+    def test_real_http_sampling_parser_accepts_mtp_stop_ids_and_zero_alias(self):
+        path = SOURCE / "server" / "inference_server.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        server_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "InferenceServer"
+        )
+        method = next(
+            node for node in server_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_build_sampling_params"
+        )
+        sampling = importlib.import_module("infinilm.llm.sampling_params")
+        scope = {
+            "SamplingParams": sampling.SamplingParams,
+            "validate_stop_strings": sampling.validate_stop_strings,
+            "validate_stop_token_ids": sampling.validate_stop_token_ids,
+        }
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), scope
+        )
+        parse = scope[method.name]
+        server = SimpleNamespace(
+            enable_deepseek_v4_mtp=True, ignore_eos=False,
+            max_tokens=6, temperature=1.0, top_p=1.0, top_k=1,
+        )
+        params = parse(
+            server, {"max_completion_tokens": 0, "sampling_params": {"stop_token_ids": [72]}}
+        )
+        self.assertEqual((params.max_tokens, params.stop_token_ids), (0, [72]))
+        with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+            parse(server, {"stop_token_ids": [True]})
+        self.assertEqual(parse(server, {"stop": "END"}).stop, ["END"])
+        with self.assertRaisesRegex(ValueError, "supports integer n=1 only"):
+            parse(server, {"n": 2})
+        with self.assertRaisesRegex(ValueError, "stop must contain nonempty strings"):
+            parse(server, {"stop": [""]})
+        server.enable_deepseek_v4_mtp = False
+        with self.assertRaisesRegex(ValueError, "max_tokens must be greater than 0"):
+            parse(server, {"max_tokens": 0})
 
     def test_waiting_and_running_abort_skip_native_and_release_once(self):
         active = self.enqueue("active")

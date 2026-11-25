@@ -1,12 +1,12 @@
 #pragma once
 
+#include "cache_geometry.hpp"
 #include "runtime/tensor.hpp"
 
 #include <vector>
 
 namespace infinilm::models::deepseek_v4 {
 
-constexpr size_t kV4PageSize = 256;
 constexpr size_t kV4FlashMlaWidth = 584;
 constexpr size_t kV4HeadDim = 512;
 
@@ -48,7 +48,8 @@ class PagedCacheSnapshot {
 public:
     PagedCacheSnapshot(runtime::Runtime &runtime,
                        const std::vector<LayerPagedCache> &layers,
-                       const PagedCacheWriteSet &writes);
+                       const PagedCacheWriteSet &writes,
+                       runtime::Tensor *reusable_backup = nullptr);
     ~PagedCacheSnapshot() noexcept;
 
     PagedCacheSnapshot(const PagedCacheSnapshot &) = delete;
