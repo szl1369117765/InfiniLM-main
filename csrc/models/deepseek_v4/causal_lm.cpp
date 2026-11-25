@@ -42,7 +42,7 @@ struct V4Config {
     double rms_eps, hc_eps, route_scale, swiglu_limit;
     std::vector<size_t> ratios;
     std::shared_ptr<Quant> quant;
-    bool is_mtp;
+    bool is_mtp, classic_mtp_target;
 
     V4Config(const ModelConfig &config, const Rank &rank)
         : hidden(config.get<size_t>("hidden_size")), vocab(config.get<size_t>("vocab_size")),
@@ -55,7 +55,8 @@ struct V4Config {
           rms_eps(config.get<double>("rms_norm_eps")), hc_eps(config.get<double>("hc_eps")),
           route_scale(config.get<double>("routed_scaling_factor")), swiglu_limit(config.get<double>("swiglu_limit")),
           ratios(config.get<std::vector<size_t>>("compress_ratios")),
-          is_mtp(config.get<std::string>("model_type") == "deepseek_v4_mtp") {
+          is_mtp(config.get<std::string>("model_type") == "deepseek_v4_mtp"),
+          classic_mtp_target(!is_mtp && config.get_or<bool>(kClassicMtpTargetKey, false)) {
         const auto layers = config.get<size_t>("num_hidden_layers");
         const auto &json = config.get_config_json();
         if (!json.contains("quantization_config") || !json.at("quantization_config").is_object() ||
@@ -165,6 +166,7 @@ bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) 
 }
 
 BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
+                         bool classic_mtp_target,
                          PagedCacheWriteSet *writes = nullptr) {
     const runtime::Device cpu{runtime::Device::Type::kCpu};
     auto host = [&](const std::optional<Tensor> &value) {
@@ -183,7 +185,7 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
     const auto metadata = plans ? plans->attention : engine::build_deepseek_v4_attention_metadata(
         prepared ? prepared->tables() : host(input.block_tables),
         prepared ? prepared->slots() : host(input.slot_mapping),
-        positions, offsets, std::nullopt, kV4PageSize);
+        positions, offsets, std::nullopt, kV4PageSize, classic_mtp_target);
     const auto c4 = plans ? plans->c4 : engine::build_deepseek_v4_compression_plan(
         metadata, positions, offsets, 4);
     const auto c128 = plans ? plans->c128 : engine::build_deepseek_v4_compression_plan(
@@ -531,7 +533,8 @@ public:
             throw std::invalid_argument("DeepSeek V4 requires initialized paged cache and eager input preparation");
         auto ids = (*input.input_ids)->view({(*input.input_ids)->numel()});
         PagedCacheWriteSet writes;
-        auto batch = make_batch(rt,input,input.rollback_v4_cache ? &writes : nullptr);
+        auto batch = make_batch(rt, input, cfg_.classic_mtp_target,
+                                input.rollback_v4_cache ? &writes : nullptr);
         if (input.mtp_draft_cache_only) {
             if (!cfg_.is_mtp || input.return_draft_hidden_states || input.rollback_v4_cache ||
                 ctx.model_decode_barrier || ctx.mtp_graph_barrier) {
@@ -626,7 +629,8 @@ public:
         std::vector<LayerPagedCache> pending;
         pending.reserve(cfg_.ratios.size());
         for (auto ratio : cfg_.ratios)
-            pending.push_back(allocate_layer_paged_cache(rt,paged->num_blocks(),paged->num_blocks(),ratio));
+            pending.push_back(allocate_layer_paged_cache(
+                rt, paged->num_blocks(), paged->num_blocks(), ratio, 128, cfg_.classic_mtp_target));
         caches_ = std::move(pending);
         swa_rope_ = std::move(swa);
         compressed_rope_ = std::move(compressed);

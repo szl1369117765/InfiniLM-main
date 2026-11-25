@@ -36,7 +36,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
     const runtime::Tensor &position_ids,
     const runtime::Tensor &input_offsets,
     const std::optional<std::vector<int64_t>> &full_to_swa_block_ids,
-    size_t block_size);
+    size_t block_size,
+    bool classic_mtp_target = false);
 
 struct DeepSeekV4CompressionPlan {
     runtime::Tensor sources;
@@ -66,7 +67,7 @@ public:
     static std::shared_ptr<const DeepSeekV4HostBatch> prepare_short(
         const runtime::Tensor &positions, const runtime::Tensor &offsets,
         const runtime::Tensor &tables, const runtime::Tensor &slots,
-        size_t rows, size_t page_count, bool share_plan);
+        size_t rows, size_t page_count, bool share_plan, bool classic_mtp_target = false);
 
     const runtime::Tensor &positions() const { return positions_; }
     const runtime::Tensor &offsets() const { return offsets_; }

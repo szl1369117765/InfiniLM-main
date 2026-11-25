@@ -723,6 +723,7 @@ def make_client(text=XML, parser="qwen3_coder"):
         stubs[name] = types.ModuleType(name)
     stubs["infinilm.base_config"].BaseConfig = object
     stubs["infinilm.config"].KVTransferConfig = object
+    stubs["infinilm.llm"].__path__ = [str(SERVER.parent / "llm")]
     stubs["infinilm.llm"].AsyncLLMEngine = object
     stubs["infinilm.llm"].FinishReason = FinishReason
     stubs["infinilm.llm"].SamplingParams = lambda **kw: kw

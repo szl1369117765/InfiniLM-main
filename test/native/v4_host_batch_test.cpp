@@ -37,7 +37,7 @@ void rejects(Callback callback) {
     throw std::runtime_error("invalid frozen V4 metadata accepted");
 }
 
-void compare_short_query(size_t query) {
+void compare_short_query(size_t query, bool classic_mtp_target) {
     int64_t positions[] = {255, 256, 257, 258, 259};
     int32_t offsets[] = {0, static_cast<int32_t>(query)};
     int32_t pages[] = {3, 1};
@@ -47,8 +47,8 @@ void compare_short_query(size_t query) {
     const auto off = Tensor::from_blob(offsets, {2}, DataType::kInt32, cpu);
     const auto table = Tensor::from_blob(pages, {1, 2}, DataType::kInt32, cpu);
     const auto loc = Tensor::from_blob(slots, {query}, DataType::kInt64, cpu);
-    const auto shared = DeepSeekV4HostBatch::prepare_short(pos, off, table, loc, query, 4, true);
-    const auto shadow = DeepSeekV4HostBatch::prepare_short(pos, off, table, loc, query, 4, false);
+    const auto shared = DeepSeekV4HostBatch::prepare_short(pos, off, table, loc, query, 4, true, classic_mtp_target);
+    const auto shadow = DeepSeekV4HostBatch::prepare_short(pos, off, table, loc, query, 4, false, classic_mtp_target);
     if (query > 4) {
         require(!shared && !shadow, "long queries must use the original path");
         return;
@@ -56,9 +56,14 @@ void compare_short_query(size_t query) {
     require(shared && shared->plans() && shadow && !shadow->plans(), "mode contract failed");
 
     const auto reference_attention = build_deepseek_v4_attention_metadata(
-        table, loc, pos, off, std::nullopt, page_size);
+        table, loc, pos, off, std::nullopt, page_size, classic_mtp_target);
     const auto reference_c4 = build_deepseek_v4_compression_plan(reference_attention, pos, off, 4);
     const auto reference_c128 = build_deepseek_v4_compression_plan(reference_attention, pos, off, 128);
+    // Position 255 is the last token on physical page 3.
+    require(reinterpret_cast<const int32_t *>(reference_c4.state_slots->data())[0] ==
+                (classic_mtp_target ? 63 : 31), "C4 raw ring does not use the selected page stride");
+    require(reinterpret_cast<const int32_t *>(reference_c128.state_slots->data())[0] ==
+                (classic_mtp_target ? 1023 : 511), "C128 raw ring does not use the selected page stride");
 
     // Mutating the caller's storage after preparation cannot change the
     // host plan, the worker's fallback plan, or the transfer inputs.
@@ -79,7 +84,8 @@ void compare_short_query(size_t query) {
     }
     const auto &plans = *shared->plans();
     const auto shadow_attention = build_deepseek_v4_attention_metadata(
-        shadow->tables(), shadow->slots(), shadow->positions(), shadow->offsets(), std::nullopt, page_size);
+        shadow->tables(), shadow->slots(), shadow->positions(), shadow->offsets(), std::nullopt,
+        page_size, classic_mtp_target);
     const auto shadow_c4 = build_deepseek_v4_compression_plan(shadow_attention, shadow->positions(),
                                                               shadow->offsets(), 4);
     const auto shadow_c128 = build_deepseek_v4_compression_plan(shadow_attention, shadow->positions(),
@@ -114,7 +120,8 @@ void compare_short_query(size_t query) {
 int main() {
     try {
         for (const size_t query : {1, 2, 3, 4, 5}) {
-            compare_short_query(query);
+            compare_short_query(query, false);
+            compare_short_query(query, true);
         }
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());

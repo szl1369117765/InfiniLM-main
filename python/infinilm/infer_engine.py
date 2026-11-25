@@ -230,6 +230,7 @@ class InferEngine(_infinilm.InferEngine):
         moe_ep_size=1,
         pre_transpose=False,
         classic_mtp_draft=False,
+        classic_mtp_target=False,
     ):
         self.hf_config = read_hf_config(model_path)
         if classic_mtp_draft:
@@ -246,6 +247,8 @@ class InferEngine(_infinilm.InferEngine):
                 "num_hash_layers": 0,
                 "compress_ratios": [0],
             }
+        if self.hf_config.get("model_type") == "deepseek_v4":
+            self.hf_config["_infinilm_classic_mtp_target"] = bool(classic_mtp_target)
         self.hf_generation_config = read_hf_generation_config(model_path)
         self.position_id_axes = _infer_position_id_axes(self.hf_config)
         self.hf_config["position_id_axes"] = self.position_id_axes

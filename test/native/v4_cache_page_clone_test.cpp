@@ -35,13 +35,15 @@ void rejects(const std::vector<std::pair<size_t, size_t>> &values) {
 }
 
 template <class Function>
-void visit_stores(std::vector<LayerPagedCache> &layers, Function visit) {
+void visit_stores(std::vector<LayerPagedCache> &layers, bool classic_mtp_target, Function visit) {
     int store = 0;
     for (auto &layer : layers) {
         visit(layer.swa, 1, ++store);
         if (layer.compression_ratio != 0) {
             visit(layer.compressed, 1, ++store);
-            const size_t raw_rows = layer.compression_ratio == 4 ? 16 : 256;
+            const size_t rows = layer.compression_ratio == 4 ? 8 : 128;
+            const size_t raw_rows = classic_mtp_target ? 2 * rows : rows;
+            require(layer.compressor_ring_size == raw_rows, "Cache allocation recorded the wrong raw ring stride");
             visit(layer.compressor_state, raw_rows, ++store);
             if (layer.compression_ratio == 4) {
                 visit(layer.indexer, 1, ++store);
@@ -51,13 +53,14 @@ void visit_stores(std::vector<LayerPagedCache> &layers, Function visit) {
     }
 }
 
-std::vector<LayerPagedCache> make_fixture(Runtime &runtime) {
+std::vector<LayerPagedCache> make_fixture(Runtime &runtime, bool classic_mtp_target) {
     std::vector<LayerPagedCache> layers;
     for (const size_t ratio : {0, 4, 128}) {
-        layers.push_back(allocate_layer_paged_cache(runtime, pages, pages, ratio));
+        layers.push_back(allocate_layer_paged_cache(runtime, pages, pages, ratio, 128, classic_mtp_target));
     }
-    visit_stores(layers, [](Tensor &storage, size_t rows, int store) {
+    visit_stores(layers, classic_mtp_target, [](Tensor &storage, size_t rows, int store) {
         const auto bytes = rows * storage->size(1) * storage->element_size();
+        require(storage->nbytes() >= pages * bytes, "Cache allocation is smaller than its physical page stride");
         std::memset(storage->data(), padding, storage->nbytes());
         for (size_t page = 0; page < pages; ++page) {
             std::memset(storage->data() + page * bytes, 16 * store + page, bytes);
@@ -66,8 +69,9 @@ std::vector<LayerPagedCache> make_fixture(Runtime &runtime) {
     return layers;
 }
 
-void expect_pages(std::vector<LayerPagedCache> &layers, const std::vector<int> &source_pages) {
-    visit_stores(layers, [&](Tensor &storage, size_t rows, int store) {
+void expect_pages(std::vector<LayerPagedCache> &layers, bool classic_mtp_target,
+                  const std::vector<int> &source_pages) {
+    visit_stores(layers, classic_mtp_target, [&](Tensor &storage, size_t rows, int store) {
         const auto *data = storage->data();
         const auto bytes = rows * storage->size(1) * storage->element_size();
         for (size_t page = 0; page < pages; ++page) {
@@ -93,10 +97,12 @@ void test_clone() {
 
     const auto runtime = Runtime::create(Device{Device::Type::kCpu, 0});
     runtime->activate();
-    auto layers = make_fixture(*runtime);
-    RankBarrier barrier(1);
-    clone_cache_pages(*runtime, layers, pages, copies, barrier);
-    expect_pages(layers, {0, 1, 0, 1, 0});
+    for (const bool classic_mtp_target : {false, true}) {
+        auto layers = make_fixture(*runtime, classic_mtp_target);
+        RankBarrier barrier(1);
+        clone_cache_pages(*runtime, layers, pages, copies, barrier);
+        expect_pages(layers, classic_mtp_target, {0, 1, 0, 1, 0});
+    }
 }
 
 void test_invalid_rank_releases_peer() {
@@ -105,7 +111,7 @@ void test_invalid_rank_releases_peer() {
         try {
             const auto runtime = Runtime::create(Device{Device::Type::kCpu, 0});
             runtime->activate();
-            auto layers = make_fixture(*runtime);
+            auto layers = make_fixture(*runtime, false);
             if (alias) {
                 layers[1].swa = layers[0].swa;
             }
@@ -117,7 +123,7 @@ void test_invalid_rank_releases_peer() {
                 require(std::string(error.what()) == "V4 cache page clone stores alias",
                         "The alias error was not propagated to both ranks");
                 if (!alias) {
-                    expect_pages(layers, {0, 1, 2, 3, 4});
+                    expect_pages(layers, false, {0, 1, 2, 3, 4});
                 }
                 return;
             }

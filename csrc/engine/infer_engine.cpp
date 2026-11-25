@@ -149,6 +149,8 @@ InferEngine::InferEngine(
 
     // Load model config if model_path is provided, model_path must be valid, and config.json exists
     this->model_config_ = infinilm::config::ConfigFactory::createConfig(config_str);
+    classic_mtp_target_ = model_config_->get<std::string>("model_type") == "deepseek_v4" &&
+        model_config_->get_or<bool>(models::deepseek_v4::kClassicMtpTargetKey, false);
     auto infinilm_config = std::make_shared<infinilm::global_state::InfinilmConfig>(
         attention_backend,
         this->model_config_,
@@ -507,7 +509,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             v4_host_batch = DeepSeekV4HostBatch::prepare_short(
                 *original.position_ids, *original.input_offsets, *original.block_tables,
                 *original.slot_mapping, (*original.input_ids)->numel(), paged->num_blocks(),
-                original.mtp_shared_compression_plan);
+                original.mtp_shared_compression_plan, classic_mtp_target_);
             if (v4_host_batch) {
                 frozen_dispatch.emplace(original);
                 frozen_dispatch->position_ids = v4_host_batch->positions();
@@ -870,6 +872,11 @@ void InferEngine::reset_cache(const cache::CacheConfig *new_config) {
         weight_state_ = WeightState::Failed;
         throw;
     }
+}
+
+std::pair<size_t, size_t> InferEngine::deepseek_v4_raw_ring_rows() const {
+    return {models::deepseek_v4::compressor_ring_rows(4, classic_mtp_target_),
+            models::deepseek_v4::compressor_ring_rows(128, classic_mtp_target_)};
 }
 
 void InferEngine::clone_v4_cache_pages(const std::vector<std::pair<size_t, size_t>> &copies) {

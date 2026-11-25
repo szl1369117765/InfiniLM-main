@@ -24,6 +24,7 @@ struct LayerPagedCache {
     size_t compression_ratio{};
     size_t swa_blocks{};
     size_t full_blocks{};
+    size_t compressor_ring_size{};
 
     // FlashMLA expects a 4D byte view, with an aligned stride between pages.
     runtime::Tensor swa_flashmla_view() const;
@@ -34,7 +35,7 @@ struct LayerPagedCache {
 // mapping and compressor state updates are separate from this allocation.
 LayerPagedCache allocate_layer_paged_cache(
     runtime::Runtime &runtime, size_t full_blocks, size_t swa_blocks,
-    size_t compression_ratio, size_t index_head_dim = 128);
+    size_t compression_ratio, size_t index_head_dim = 128, bool classic_mtp_target = false);
 
 // The caller owns the source pages and all private destination leases.
 void validate_cache_page_copies(

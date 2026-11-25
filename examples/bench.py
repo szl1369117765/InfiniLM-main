@@ -791,6 +791,12 @@ if __name__ == "__main__":
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    if (
+        cfg.enable_deepseek_v4_mtp
+        or cfg.nextn_branch_draft_lengths is not None
+        or cfg.nextn_branch_execution != "serial"
+    ):
+        cfg.parser.error("classic DeepSeek V4 MTP is available in examples/test_infer.py")
 
     benchmark_prompt = (
         cfg.prompt if cli_option_is_set("--prompt") or cfg.image else prompt
@@ -961,7 +967,6 @@ if __name__ == "__main__":
         model_path,
         draft_model_path=cfg.draft_model,
         num_draft_tokens=cfg.num_draft_tokens,
-        enable_deepseek_v4_mtp=cfg.enable_deepseek_v4_mtp,
         infini_device=infini_device,
         tp=tp,
         skip_load=skip_load,

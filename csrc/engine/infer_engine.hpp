@@ -64,6 +64,7 @@ public:
     // Copy currently leased source pages into private destination pages.
     // A successful return proves completion on every rank's owning stream.
     void clone_v4_cache_pages(const std::vector<std::pair<size_t, size_t>> &copies);
+    std::pair<size_t, size_t> deepseek_v4_raw_ring_rows() const;
 
     std::vector<std::vector<infinilm::runtime::Tensor>> get_kv_cache();
     // Readonly real VideoNSA raw-pool lifetime; never a tensor pointer.
@@ -100,6 +101,7 @@ protected:
     mutable std::mutex submission_mutex_;
     bool use_mla_{false};
     bool enable_graph_compiling_{false};
+    bool classic_mtp_target_{false};
     std::uint64_t nsa_pool_epoch_{0};
 };
 

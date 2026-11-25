@@ -121,6 +121,7 @@ class ModelRunner:
             use_mla=config.use_mla,
             weight_load_mode=config.weight_load_mode,
             pre_transpose=config.pre_transpose,
+            classic_mtp_target=config.enable_deepseek_v4_mtp,
         )
 
         if self.model_engine.model_type == "minicpm_eagle":

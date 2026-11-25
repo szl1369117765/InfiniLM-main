@@ -89,7 +89,8 @@ runtime::Tensor LayerPagedCache::compressed_flashmla_view() const {
 }
 
 LayerPagedCache allocate_layer_paged_cache(runtime::Runtime &rt, size_t full_blocks,
-                                           size_t swa_blocks, size_t ratio, size_t index_head_dim) {
+                                           size_t swa_blocks, size_t ratio, size_t index_head_dim,
+                                           bool classic_mtp_target) {
     rt.assertOwnerThread();
     if (rt.isGraphRecording()) {
         throw std::logic_error("DeepSeek V4 cache allocation cannot run during graph recording");
@@ -112,7 +113,8 @@ LayerPagedCache allocate_layer_paged_cache(runtime::Runtime &rt, size_t full_blo
     const auto page_tokens = kV4PageSize / ratio;
     cache.compressed = zeros(rt, full_blocks, align(page_tokens * kV4FlashMlaWidth, kFlashMlaAlignment),
                              DataType::kUInt8);
-    const size_t ring = compressor_ring_rows(ratio);
+    const size_t ring = compressor_ring_rows(ratio, classic_mtp_target);
+    cache.compressor_ring_size = ring;
     const size_t coeff = ratio == 4 ? 2 : 1;
     if (swa_blocks > std::numeric_limits<size_t>::max() / ring - 2) {
         throw std::overflow_error("DeepSeek V4 compressor ring size overflows");
@@ -202,7 +204,10 @@ void clone_cache_pages(
         if (ratio != 4 && ratio != 128) {
             throw std::invalid_argument("Invalid V4 cache page clone compression ratio");
         }
-        const auto ring = compressor_ring_rows(ratio);
+        const auto ring = layer.compressor_ring_size;
+        if (ring != compressor_ring_rows(ratio, false) && ring != compressor_ring_rows(ratio, true)) {
+            throw std::invalid_argument("Invalid V4 cache page clone compressor ring");
+        }
         if (page_count > std::numeric_limits<size_t>::max() / ring - 2) {
             throw std::overflow_error("V4 cache page clone ring size overflows");
         }

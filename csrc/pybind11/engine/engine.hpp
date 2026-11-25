@@ -1,6 +1,5 @@
 #include "../../debug_utils/hooks.hpp"
 #include "../../engine/infer_engine.hpp"
-#include "models/deepseek_v4/cache_geometry.hpp"
 #include "runtime/tensor.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -70,9 +69,7 @@ inline void bind_hook_registry(py::module &m) {
 inline void bind_infer_engine(py::module &m) {
     py::class_<InferEngine, std::shared_ptr<InferEngine>> infer_engine(
         m, "InferEngine", py::release_gil_before_calling_cpp_dtor());
-    infer_engine.attr("deepseek_v4_raw_ring_rows") = py::make_tuple(
-        models::deepseek_v4::compressor_ring_rows(4),
-        models::deepseek_v4::compressor_ring_rows(128));
+    infer_engine.def_property_readonly("deepseek_v4_raw_ring_rows", &InferEngine::deepseek_v4_raw_ring_rows);
     infer_engine.attr("mtp_draft_cache_only_version") = 1;
     infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
     infer_engine.attr("mtp_shared_compression_plan_version") = 1;
