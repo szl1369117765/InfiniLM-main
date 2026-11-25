@@ -6,6 +6,7 @@
 #include "compiler/paged_compiler.hpp"
 #include "compiler/paged_decode_bucket.hpp"
 #include "compiler/static_batching_compiler.hpp"
+#include "deepseek_v4_metadata.hpp"
 #include "nsa_run_failure.hpp"
 #include "nsa_video_input.hpp"
 #include "request_sampling.hpp"

@@ -673,9 +673,9 @@ class InferEngine(_infinilm.InferEngine):
                 )
             )
             metadata_evidence = {}
-            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan:
+            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan or mtp_graph_direct_commit:
                 metadata_evidence["mtp_cpu_metadata_shadow_used"] = output.mtp_cpu_metadata_shadow_used
-                if mtp_shared_compression_plan:
+                if mtp_shared_compression_plan or mtp_graph_direct_commit:
                     metadata_evidence["mtp_shared_compression_plan_used"] = output.mtp_shared_compression_plan_used
             if mtp_draft_cache_only:
                 if not output.mtp_draft_cache_only_used or any(
