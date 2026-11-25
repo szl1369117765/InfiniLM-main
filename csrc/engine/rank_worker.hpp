@@ -23,6 +23,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace infinilm::engine {
@@ -39,6 +40,7 @@ class RankWorker {
         PREPARE_W4,
         COMMIT_W4,
         RUN,
+        CLONE_V4_CACHE_PAGES,
         RESET_CACHE,
         COMPILE,
         STOP
@@ -98,6 +100,14 @@ public:
         std::optional<std::vector<std::tuple<float, float, int>>> sampling_rows;
 
         std::optional<nsa::Snapshot> nsa_owner_snapshot;
+        bool return_draft_hidden_states{false};
+        bool rollback_v4_cache{false};
+        std::optional<std::vector<infinilm::runtime::Tensor>> target_hidden_states_by_rank;
+        bool mtp_draft_cache_only{false};
+        bool mtp_cpu_metadata_shadow{false};
+        bool mtp_shared_compression_plan{false};
+        bool mtp_scratch_step{false};
+        bool mtp_last_logits{false};
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,
@@ -115,6 +125,11 @@ public:
         // Present only after this forward actually submitted the selected plan.
         std::optional<infinilm::execution::graph::Graph::ExecutionReport> graph_execution;
         const char *eager_reason = "graphs_disabled";
+        std::vector<infinilm::runtime::Tensor> hidden_states_by_rank;
+        bool mtp_draft_cache_only_used{false};
+        bool mtp_cpu_metadata_shadow_used{false};
+        bool mtp_shared_compression_plan_used{false};
+        bool mtp_last_logits_used{false};
     };
 
     RankWorker(std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,
@@ -147,7 +162,9 @@ public:
     std::vector<std::string> state_required_keys();
 
     // Submit a run (forward + sampling) job.
-    void run(const Input &args);
+    void run(const Input &args, std::shared_ptr<const DeepSeekV4HostBatch> v4_host_batch = {});
+
+    void clone_v4_cache_pages(std::shared_ptr<const std::vector<std::pair<size_t, size_t>>> copies);
 
     // Reset the internal cache with a new configuration
     void reset_cache(const cache::CacheConfig *new_config, std::uint64_t nsa_pool_epoch = 0);
@@ -221,6 +238,8 @@ private:
     std::unordered_map<std::string, infinilm::runtime::Tensor> pending_params_;
     bool pending_params_strict_ = true;
     Input pending_args_;
+    std::shared_ptr<const DeepSeekV4HostBatch> pending_v4_host_batch_;
+    std::shared_ptr<const std::vector<std::pair<size_t, size_t>>> pending_v4_page_copies_;
     std::unique_ptr<cache::CacheConfig> pending_cache_config_;
 
     // Output (protected by mutex)

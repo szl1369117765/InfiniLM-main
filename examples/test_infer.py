@@ -39,6 +39,10 @@ def test(
     weight_load_mode="async",
     enable_prefix_caching=True,
     pre_transpose=False,
+    *,
+    enable_deepseek_v4_mtp=False,
+    nextn_branch_draft_lengths=None,
+    nextn_branch_execution="serial",
 ):
     if video_path is not None:
         from infinilm.processors.videonsa_processor import decode_video_frames
@@ -77,6 +81,9 @@ def test(
         weight_load_mode=weight_load_mode,
         enable_prefix_caching=enable_prefix_caching,
         pre_transpose=pre_transpose,
+        enable_deepseek_v4_mtp=enable_deepseek_v4_mtp,
+        nextn_branch_draft_lengths=nextn_branch_draft_lengths,
+        nextn_branch_execution=nextn_branch_execution,
     )
 
     conversations = [
@@ -127,6 +134,8 @@ if __name__ == "__main__":
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    if cfg.enable_deepseek_v4_mtp and cfg.pp != 1:
+        cfg.parser.error("classic DeepSeek V4 MTP does not support pipeline parallelism")
     if cfg.pp > 1 and cfg.node_rank > 0:
         from infinilm.server.pipeline_worker import run_worker
 
@@ -156,6 +165,9 @@ if __name__ == "__main__":
         model_path,
         draft_model_path=cfg.draft_model,
         num_draft_tokens=cfg.num_draft_tokens,
+        enable_deepseek_v4_mtp=cfg.enable_deepseek_v4_mtp,
+        nextn_branch_draft_lengths=cfg.nextn_branch_draft_lengths,
+        nextn_branch_execution=cfg.nextn_branch_execution,
         max_new_tokens=max_new_tokens,
         device=device_str,
         tp=tp,

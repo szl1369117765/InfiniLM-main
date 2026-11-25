@@ -1,6 +1,8 @@
 #include "infer_engine.hpp"
 #include "../cache/kv_cache.hpp"
 #include "../config/config_factory.hpp"
+#include "../models/deepseek_v4/paged_cache.hpp"
+#include "deepseek_v4_metadata.hpp"
 #include "../weights/weights.hpp"
 #include "runtime/runtime.hpp"
 #include "spdlog/spdlog.h"
@@ -122,7 +124,8 @@ InferEngine::InferEngine(
     : communication_group_(distributed_config, device_type),
       attention_backend_(attention_backend),
       weight_load_mode_(weight_load_mode),
-      use_mla_(use_mla) {
+      use_mla_(use_mla),
+      enable_graph_compiling_(enable_graph_compiling) {
     if (weight_load_mode_ != "async" && weight_load_mode_ != "sync") {
         throw std::invalid_argument("weight_load_mode must be either 'async' or 'sync'");
     }
@@ -146,6 +149,8 @@ InferEngine::InferEngine(
 
     // Load model config if model_path is provided, model_path must be valid, and config.json exists
     this->model_config_ = infinilm::config::ConfigFactory::createConfig(config_str);
+    classic_mtp_target_ = model_config_->get<std::string>("model_type") == "deepseek_v4" &&
+        model_config_->get_or<bool>(models::deepseek_v4::kClassicMtpTargetKey, false);
     auto infinilm_config = std::make_shared<infinilm::global_state::InfinilmConfig>(
         attention_backend,
         this->model_config_,
@@ -448,6 +453,11 @@ InferEngine::Input::to_model_input(
             : to_device(target_hidden_states),
         sample_all_positions};
     input.logical_kv_upper_bound = logical_kv_upper_bound;
+    input.return_draft_hidden_states = return_draft_hidden_states;
+    input.rollback_v4_cache = rollback_v4_cache;
+    input.mtp_draft_cache_only = mtp_draft_cache_only;
+    input.mtp_scratch_step = mtp_scratch_step;
+    input.mtp_last_logits = mtp_last_logits;
 
     auto &attn_metadata = forward_context.attn_metadata;
     attn_metadata = {
@@ -475,13 +485,41 @@ InferEngine::Input::to_model_input(
     return input;
 }
 
-InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
+InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     std::lock_guard<std::mutex> submission_lock(submission_mutex_);
     if (weight_state_ == WeightState::Failed
         || weight_state_ == WeightState::Finalizing
         || (weight_state_ == WeightState::Loading && weight_load_started_)) {
         throw std::logic_error("cannot execute an incomplete or failed weight load");
     }
+    std::shared_ptr<const DeepSeekV4HostBatch> v4_host_batch;
+    std::optional<Input> frozen_dispatch;
+    if ((original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan)
+        && !enable_graph_compiling_ && communication_group_.get_dist_config().pp_size == 1
+        && original.input_ids && *original.input_ids && (*original.input_ids)->ndim() == 2
+        && (*original.input_ids)->size(0) == 1) {
+        const auto type = model_config_->get<std::string>("model_type");
+        const bool classic = (type == "deepseek_v4" &&
+                              (original.return_draft_hidden_states || original.rollback_v4_cache))
+            || (type == "deepseek_v4_mtp" && original.target_hidden_states_by_rank);
+        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+        if (classic && paged && paged->block_size() == models::deepseek_v4::kV4PageSize
+            && original.position_ids && original.input_offsets &&
+            original.block_tables && original.slot_mapping) {
+            v4_host_batch = DeepSeekV4HostBatch::prepare_short(
+                *original.position_ids, *original.input_offsets, *original.block_tables,
+                *original.slot_mapping, (*original.input_ids)->numel(), paged->num_blocks(),
+                original.mtp_shared_compression_plan, classic_mtp_target_);
+            if (v4_host_batch) {
+                frozen_dispatch.emplace(original);
+                frozen_dispatch->position_ids = v4_host_batch->positions();
+                frozen_dispatch->input_offsets = v4_host_batch->offsets();
+                frozen_dispatch->block_tables = v4_host_batch->tables();
+                frozen_dispatch->slot_mapping = v4_host_batch->slots();
+            }
+        }
+    }
+    const auto &input = frozen_dispatch ? *frozen_dispatch : original;
     if (input.random_values.has_value()) {
         if (input.sample_all_positions || !input.input_offsets.has_value()
             || input.input_offsets.value()->ndim() != 1
@@ -512,9 +550,185 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
             }
         }
     }
-    // Trigger each worker to run inference
-    for (auto &worker : workers_) {
-        worker->run(input);
+    const auto &rank_hidden = input.target_hidden_states_by_rank;
+    bool last_logits_expected = false;
+    if (input.mtp_last_logits) {
+        using namespace infinilm::runtime;
+        const auto type = model_config_->get<std::string>("model_type");
+        const bool target = type == "deepseek_v4" && !rank_hidden;
+        const bool draft = type == "deepseek_v4_mtp" && rank_hidden.has_value();
+        if ((!target && !draft) || enable_graph_compiling_
+            || communication_group_.get_dist_config().pp_size != 1
+            || input.target_hidden_states || !input.return_draft_hidden_states
+            || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_draft_cache_only
+            || input.sample_all_positions || input.top_k != 1 || input.sampling_rows
+            || input.random_values) {
+            throw std::invalid_argument(
+                "Classic NextN last logits require eager greedy Target prefill or Draft repair with full returned HC");
+        }
+        const auto cpu_vector = [](const std::optional<Tensor> &value, DataType type) {
+            return value && *value && (*value)->device().type() == Device::Type::kCpu
+                && (*value)->dtype() == type && (*value)->is_contiguous() && (*value)->ndim() == 1;
+        };
+        const auto &ids = input.input_ids;
+        const auto &offsets = input.input_offsets;
+        const auto &past = input.past_sequence_lengths;
+        const auto &positions = input.position_ids;
+        const bool positions_i64 = cpu_vector(positions, DataType::kInt64);
+        if (!ids || !*ids || (*ids)->ndim() != 2 || (*ids)->size(0) != 1
+            || !cpu_vector(offsets, DataType::kInt32) || (*offsets)->numel() < 2
+            || !cpu_vector(past, DataType::kInt32) || (*past)->numel() != (*offsets)->numel() - 1
+            || (!positions_i64 && !cpu_vector(positions, DataType::kInt32))
+            || (*positions)->numel() != (*ids)->numel()) {
+            throw std::invalid_argument("Classic NextN last logits require packed IDs and matching CPU metadata");
+        }
+        const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
+        const auto *past_lengths = reinterpret_cast<const int32_t *>((*past)->data());
+        const auto requests = (*past)->numel();
+        const auto rows = (*ids)->numel();
+        if (bounds[0] != 0 || bounds[requests] <= 0 || static_cast<size_t>(bounds[requests]) != rows) {
+            throw std::invalid_argument("Classic NextN last logits offsets must cover every packed token");
+        }
+        for (size_t request = 0; request < requests; ++request) {
+            const auto begin = bounds[request];
+            const auto end = bounds[request + 1];
+            if (end <= begin || static_cast<size_t>(end) > rows) {
+                throw std::invalid_argument("Classic NextN last logits require nonempty packed spans");
+            }
+            const auto position = positions_i64
+                ? reinterpret_cast<const int64_t *>((*positions)->data())[begin]
+                : reinterpret_cast<const int32_t *>((*positions)->data())[begin];
+            if (past_lengths[request] < 0 || position != past_lengths[request]
+                || (target && past_lengths[request] != 0)) {
+                throw std::invalid_argument("Classic NextN last logits require matching positions and fresh Target prefill");
+            }
+        }
+        last_logits_expected = rows > requests;
+    }
+    if (input.mtp_draft_cache_only) {
+        if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp" ||
+            communication_group_.get_dist_config().pp_size != 1 || enable_graph_compiling_ ||
+            !rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
+            throw std::invalid_argument("Classic NextN cache-only requires an eager Draft with rank-local input HC and no outputs");
+        }
+        using namespace infinilm::runtime;
+        const auto &offsets = input.input_offsets;
+        if (!input.input_ids || !*input.input_ids || !offsets || !*offsets ||
+            (*offsets)->device().type() != Device::Type::kCpu ||
+            (*offsets)->dtype() != DataType::kInt32 || !(*offsets)->is_contiguous() ||
+            (*offsets)->ndim() != 1 || (*offsets)->size(0) != 2) {
+            throw std::invalid_argument("Classic NextN cache-only requires one span with CPU int32 offsets");
+        }
+        const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
+        if (bounds[0] != 0 || bounds[1] <= 0 ||
+            static_cast<size_t>(bounds[1]) != (*input.input_ids)->numel()) {
+            throw std::invalid_argument("Classic NextN cache-only offsets must cover all input tokens");
+        }
+    }
+    if (input.mtp_scratch_step) {
+        using namespace infinilm::runtime;
+        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+        if (model_config_->get<std::string>("model_type") != "deepseek_v4"
+            || communication_group_.get_dist_config().pp_size != 1 || !paged
+            || paged->block_size() != models::deepseek_v4::kV4PageSize
+            || input.rollback_v4_cache || input.mtp_draft_cache_only
+            || input.target_hidden_states || rank_hidden || !input.sample_all_positions || input.top_k != 1) {
+            throw std::invalid_argument("Classic NextN scratch steps require a greedy V4 Target without rollback");
+        }
+        const auto cpu_tensor = [](const std::optional<Tensor> &value, DataType type, size_t ndim) {
+            return value && *value && (*value)->device().type() == Device::Type::kCpu
+                && (*value)->dtype() == type && (*value)->is_contiguous() && (*value)->ndim() == ndim;
+        };
+        const auto &ids = input.input_ids;
+        const auto &offsets = input.input_offsets;
+        const auto &positions = input.position_ids;
+        const auto &tables = input.block_tables;
+        const auto &slots = input.slot_mapping;
+        if (!cpu_tensor(ids, DataType::kInt64, 2) || (*ids)->size(0) != 1 ||
+            !cpu_tensor(offsets, DataType::kInt32, 1) || !cpu_tensor(positions, DataType::kInt64, 1) ||
+            !cpu_tensor(tables, DataType::kInt32, 2) || !cpu_tensor(slots, DataType::kInt64, 1)) {
+            throw std::invalid_argument("Classic NextN scratch step requires contiguous CPU input metadata");
+        }
+        const auto rows = (*ids)->numel();
+        const auto width = (*tables)->size(1);
+        if (rows < 1 || rows > 3 || (*offsets)->numel() != rows + 1 ||
+            (*positions)->numel() != rows || (*tables)->size(0) != rows || (*slots)->numel() != rows) {
+            throw std::invalid_argument("Classic NextN scratch step requires 1-3 q1 siblings");
+        }
+        const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
+        const auto *pos = reinterpret_cast<const int64_t *>((*positions)->data());
+        const auto *pages = reinterpret_cast<const int32_t *>((*tables)->data());
+        const auto *slot = reinterpret_cast<const int64_t *>((*slots)->data());
+        const auto page_size = paged->block_size();
+        if (pos[0] <= 0 || pos[0] >= std::numeric_limits<int32_t>::max() ||
+            static_cast<size_t>(pos[0]) / page_size >= width || bounds[0] != 0) {
+            throw std::invalid_argument("Classic NextN scratch position exceeds its private table");
+        }
+        const auto page_index = static_cast<size_t>(pos[0]) / page_size;
+        std::unordered_set<int32_t> private_pages;
+        for (size_t row = 0; row < rows; ++row) {
+            if (bounds[row + 1] != static_cast<int32_t>(row + 1) || pos[row] != pos[0]) {
+                throw std::invalid_argument("Classic NextN scratch step must advance all active siblings by one row");
+            }
+            const auto *block_table = pages + row * width;
+            bool padding = false;
+            for (size_t column = 0; column < width; ++column) {
+                const int32_t page = block_table[column];
+                if (page == -1 && column > page_index) {
+                    padding = true;
+                    continue;
+                }
+                if (page < 0 || padding || static_cast<size_t>(page) >= paged->num_blocks() ||
+                    !private_pages.insert(page).second) {
+                    throw std::invalid_argument("Classic NextN scratch pages must be distinct and valid");
+                }
+            }
+            if (slot[row] != static_cast<int64_t>(block_table[page_index]) * static_cast<int64_t>(page_size)
+                                + pos[0] % static_cast<int64_t>(page_size)) {
+                throw std::invalid_argument("Classic NextN scratch slot differs from its private page");
+            }
+        }
+    }
+    if (rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
+        const auto type = model_config_->get<std::string>("model_type");
+        if ((type != "deepseek_v4" && type != "deepseek_v4_mtp")
+            || communication_group_.get_dist_config().pp_size != 1
+            || (rank_hidden && type != "deepseek_v4_mtp")) {
+            throw std::invalid_argument("Classic V4 MTP input requires a single-stage V4 model");
+        }
+    }
+    if (rank_hidden && (rank_hidden->size() != workers_.size() || input.target_hidden_states
+                        || std::any_of(rank_hidden->begin(), rank_hidden->end(),
+                                       [](const auto &tensor) { return !tensor; }))) {
+        throw std::invalid_argument("MTP requires one non-null hidden-state tensor per rank");
+    }
+    if (rank_hidden) {
+        if (!input.input_ids || !*input.input_ids) {
+            throw std::invalid_argument("Classic V4 MTP requires input IDs");
+        }
+        const auto hidden_size = model_config_->get<size_t>("hidden_size");
+        for (size_t i = 0; i < rank_hidden->size(); ++i) {
+            const auto &tensor = (*rank_hidden)[i];
+            if (tensor->device() != communication_group_.get_rank_info(i).device
+                || tensor->dtype() != infinilm::runtime::DataType::kBFloat16
+                || tensor->ndim() != 3 || tensor->size(0) != (*input.input_ids)->numel()
+                || tensor->size(1) != 4 || tensor->size(2) != hidden_size) {
+                throw std::invalid_argument("Invalid rank-local BF16 hidden states for Classic V4 MTP");
+            }
+        }
+    }
+    // All rank-local tensors are prepared before any worker can enter a collective.
+    if (rank_hidden) {
+        auto rank_input = input;
+        rank_input.target_hidden_states_by_rank.reset();
+        for (size_t i = 0; i < workers_.size(); ++i) {
+            rank_input.target_hidden_states = (*rank_hidden)[i];
+            workers_[i]->run(rank_input, v4_host_batch);
+        }
+    } else {
+        for (auto &worker : workers_) {
+            worker->run(input, v4_host_batch);
+        }
     }
     // Wait for all workers
     for (auto &worker : workers_) {
@@ -522,6 +736,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
     }
 
     auto output = workers_[0]->get_output();
+    output.mtp_cpu_metadata_shadow_used = bool(v4_host_batch);
+    output.mtp_shared_compression_plan_used = v4_host_batch && bool(v4_host_batch->plans());
     // Completed worker output remains a mutable borrowed view, not a snapshot.
     const auto completed_view = [](infinilm::runtime::Tensor tensor) {
         if (!tensor) {
@@ -533,7 +749,27 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &input) {
     };
     output.output_ids = completed_view(output.output_ids);
     output.logits = completed_view(output.logits);
-    output.hidden_states = completed_view(output.hidden_states);
+    const bool owns_scratch_hc = input.mtp_scratch_step && input.return_draft_hidden_states;
+    if (!owns_scratch_hc) {
+        output.hidden_states = completed_view(output.hidden_states);
+    }
+    if (input.return_draft_hidden_states) {
+        output.hidden_states_by_rank.reserve(workers_.size());
+        for (const auto &worker : workers_) {
+            auto rank_output = worker->get_output();
+            auto hidden = std::move(rank_output.hidden_states);
+            if (!hidden) {
+                throw std::runtime_error("V4 MTP did not return hidden states on every rank");
+            }
+            if (input.mtp_last_logits
+                && (rank_output.mtp_last_logits_used != last_logits_expected
+                    || hidden->ndim() != 3 || hidden->size(0) != (*input.input_ids)->numel())) {
+                throw std::runtime_error("Classic NextN last logits receipt or HC rows differ across ranks");
+            }
+            output.hidden_states_by_rank.push_back(
+                owns_scratch_hc ? std::move(hidden) : completed_view(std::move(hidden)));
+        }
+    }
     return output;
 }
 
@@ -635,6 +871,53 @@ void InferEngine::reset_cache(const cache::CacheConfig *new_config) {
     } catch (...) {
         weight_state_ = WeightState::Failed;
         throw;
+    }
+}
+
+std::pair<size_t, size_t> InferEngine::deepseek_v4_raw_ring_rows() const {
+    return {models::deepseek_v4::compressor_ring_rows(4, classic_mtp_target_),
+            models::deepseek_v4::compressor_ring_rows(128, classic_mtp_target_)};
+}
+
+void InferEngine::clone_v4_cache_pages(const std::vector<std::pair<size_t, size_t>> &copies) {
+    std::lock_guard<std::mutex> submission_lock(submission_mutex_);
+    if (weight_state_ != WeightState::Ready &&
+        (weight_state_ != WeightState::Loading || weight_load_started_)) {
+        throw std::logic_error("cannot clone cache pages of an incomplete or failed engine");
+    }
+    const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+    if (model_config_->get<std::string>("model_type") != "deepseek_v4" ||
+        communication_group_.get_dist_config().pp_size != 1 || !paged ||
+        paged->block_size() != models::deepseek_v4::kV4PageSize || workers_.empty()) {
+        throw std::invalid_argument("V4 cache page clone requires a single-stage paged DeepSeek V4 Target");
+    }
+    models::deepseek_v4::validate_cache_page_copies(copies, paged->num_blocks());
+    barrier_->rethrow_if_broken();
+    const auto frozen = std::make_shared<const std::vector<std::pair<size_t, size_t>>>(copies);
+    size_t submitted = 0;
+    std::exception_ptr error;
+    try {
+        for (; submitted < workers_.size(); ++submitted) {
+            workers_[submitted]->clone_v4_cache_pages(frozen);
+        }
+    } catch (...) {
+        error = std::current_exception();
+        // A submitted worker may be waiting for a rank that never received
+        // the command. Abort the rendezvous before waiting for those workers.
+        barrier_->abort(error);
+    }
+    for (size_t rank = 0; rank < submitted; ++rank) {
+        try {
+            workers_[rank]->wait();
+        } catch (...) {
+            if (!error) {
+                error = std::current_exception();
+            }
+        }
+    }
+    if (error) {
+        weight_state_ = WeightState::Failed;
+        std::rethrow_exception(error);
     }
 }
 

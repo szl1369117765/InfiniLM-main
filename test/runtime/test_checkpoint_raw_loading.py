@@ -49,6 +49,117 @@ def _write_shard(path, entries, metadata=_MISSING_METADATA):
 
 
 class RawCheckpointLoadingTest(unittest.TestCase):
+    def test_deepseek_v4_mtp_uses_header_keys_and_local_shared_weight(self):
+        cases = {
+            "model.embed_tokens.weight": (infinicore.bfloat16, b"\x80\x3f"),
+            "lm_head.weight": (infinicore.bfloat16, b"\x00\x40"),
+            "model.norm.weight": (infinicore.bfloat16, b"\x40\x40"),
+            "model.e_proj.weight": (infinicore.int8, b"\x81"),
+            "model.e_proj.weight_scale": (infinicore.float32, struct.pack("<f", 0.125)),
+            "model.layers.0.attn.wo_a.weight": (infinicore.bfloat16, b"\x80\x40"),
+        }
+        seen = {}
+        finalizations = []
+
+        def load(tensors, strict):
+            self.assertFalse(strict)
+            for name, tensor in tensors.items():
+                self.assertNotIn(name, seen)
+                dtype, bits = cases[name]
+                self.assertEqual(tensor.dtype, dtype)
+                seen[name] = ctypes.string_at(tensor.data_ptr(), len(bits))
+
+        consumer = SimpleNamespace(
+            hf_config={"model_type": "deepseek_v4_mtp", "tie_word_embeddings": True},
+            state_dict=lambda: _parameter_metadata(
+                {name: pair[0] for name, pair in cases.items()}
+            ),
+            state_dict_keyname=lambda: list(cases),
+            load_state_dict=load,
+            process_weights_after_loading=lambda: finalizations.append(dict(seen)),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text('{"model_type": "deepseek_v4"}')
+            _write_shard(
+                root / "a.safetensors",
+                [
+                    ("embed.weight", "BF16", [1], b"\x00\x00"),
+                    ("head.weight", "BF16", [1], b"\x00\x40"),
+                ],
+            )
+            _write_shard(
+                root / "b.safetensors",
+                [("layers.0.norm.weight", "BF16", [1], b"\x00\x00")],
+            )
+            _write_shard(
+                root / "c.safetensors",
+                [
+                    ("mtp.0.emb.tok_emb.weight", "BF16", [1], b"\x80\x3f"),
+                    ("mtp.0.norm.weight", "BF16", [1], b"\x40\x40"),
+                    ("mtp.0.e_proj.weight", "I8", [1], b"\x81"),
+                    ("mtp.0.e_proj.scale", "F32", [1], struct.pack("<f", 0.125)),
+                    ("mtp.0.attn.wo_a.weight", "BF16", [1], b"\x80\x40"),
+                    ("mtp.1.norm.weight", "BF16", [1], b"\x00\x00"),
+                ],
+            )
+            weight_map = {
+                "embed.weight": "a.safetensors",
+                "layers.0.norm.weight": "b.safetensors",
+                "mtp.0.attn.wo_a.scale": "c.safetensors",
+            }
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": weight_map})
+            )
+            with (
+                patch.object(
+                    loading, "_load_checkpoint_shard", wraps=loading._load_checkpoint_shard
+                ) as reader,
+                patch.object(
+                    loading, "_require_torch_checkpoint",
+                    side_effect=AssertionError("unexpected Torch fallback"),
+                ),
+            ):
+                loading.load_model_state_dict_by_file(consumer, str(root), infinicore.bfloat16)
+
+        expected = {name: pair[1] for name, pair in cases.items()}
+        self.assertEqual(finalizations, [expected])
+        self.assertEqual(
+            {Path(call.args[0]).name: set(call.kwargs["keys"]) for call in reader.call_args_list},
+            {
+                "a.safetensors": {"head.weight"},
+                "c.safetensors": {
+                    "mtp.0.emb.tok_emb.weight",
+                    "mtp.0.norm.weight",
+                    "mtp.0.e_proj.weight",
+                    "mtp.0.e_proj.scale",
+                    "mtp.0.attn.wo_a.weight",
+                },
+            },
+        )
+
+    def test_deepseek_v4_mtp_rejects_cross_shard_alias_collision_before_loading(self):
+        native_name = "model.e_proj.weight_scale"
+        consumer = SimpleNamespace(
+            hf_config={"model_type": "deepseek_v4_mtp"},
+            state_dict=lambda: _parameter_metadata({native_name: infinicore.float32}),
+            state_dict_keyname=lambda: [native_name],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text('{"model_type": "deepseek_v4"}')
+            for index, suffix in enumerate(("scale", "weight_scale")):
+                _write_shard(
+                    root / f"{index}.safetensors",
+                    [(f"mtp.0.e_proj.{suffix}", "F32", [1], struct.pack("<f", 1.0))],
+                )
+            with patch.object(loading, "_load_checkpoint_shard") as reader:
+                with self.assertRaisesRegex(
+                    ValueError, "Duplicate DeepSeek V4 MTP checkpoint weight"
+                ):
+                    loading.load_model_state_dict_by_file(consumer, str(root), infinicore.bfloat16)
+            reader.assert_not_called()
+
     def test_qwen35_final_norm_offset_preserves_gated_norm(self):
         config = {"text_config": {"linear_key_head_dim": 2, "linear_num_key_heads": 1}}
         gated_key = "model.language_model.layers.0.linear_attn.norm.weight"

@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace infinilm::engine {
@@ -60,6 +61,11 @@ public:
 
     void reset_cache(const cache::CacheConfig *new_config);
 
+    // Copy currently leased source pages into private destination pages.
+    // A successful return proves completion on every rank's owning stream.
+    void clone_v4_cache_pages(const std::vector<std::pair<size_t, size_t>> &copies);
+    std::pair<size_t, size_t> deepseek_v4_raw_ring_rows() const;
+
     std::vector<std::vector<infinilm::runtime::Tensor>> get_kv_cache();
     // Readonly real VideoNSA raw-pool lifetime; never a tensor pointer.
     std::uint64_t get_nsa_pool_epoch();
@@ -94,6 +100,8 @@ protected:
     // time. RankWorker queues are not reentrant for concurrent callers.
     mutable std::mutex submission_mutex_;
     bool use_mla_{false};
+    bool enable_graph_compiling_{false};
+    bool classic_mtp_target_{false};
     std::uint64_t nsa_pool_epoch_{0};
 };
 

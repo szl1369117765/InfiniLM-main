@@ -184,6 +184,29 @@ target("test_rank_barrier")
     end
 target_end()
 
+target("test_v4_cache_page_clone")
+    set_default(false)
+    set_kind("binary")
+    set_languages("cxx17")
+    add_deps("infinilm_runtime")
+    add_includedirs("csrc")
+    add_files("test/native/v4_cache_page_clone_test.cpp",
+              "csrc/engine/rank_barrier.cpp",
+              "csrc/models/deepseek_v4/paged_cache.cpp")
+    if is_plat("linux") then
+        add_syslinks("pthread")
+    end
+target_end()
+
+target("test_v4_host_batch")
+    set_default(false)
+    set_kind("binary")
+    set_languages("cxx17")
+    add_deps("infinilm_runtime")
+    add_includedirs("csrc")
+    add_files("test/native/v4_host_batch_test.cpp", "csrc/engine/deepseek_v4_metadata.cpp")
+target_end()
+
 for _, name in ipairs({"operator_tuning", "tensor_empty_view", "optional_submit"}) do
     target("test_" .. name)
         set_default(false)

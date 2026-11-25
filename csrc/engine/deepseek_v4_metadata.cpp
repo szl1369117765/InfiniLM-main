@@ -1,5 +1,7 @@
 #include "deepseek_v4_metadata.hpp"
 
+#include "models/deepseek_v4/cache_geometry.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -7,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace infinilm::engine {
 namespace {
@@ -86,11 +89,10 @@ int64_t full_slot_to_swa_slot(int64_t slot,
                              : -1;
 }
 
-int64_t state_loc(int64_t raw_slot, size_t ratio, size_t block_size) {
+int64_t state_loc(int64_t raw_slot, size_t ratio, size_t block_size, size_t ring_size) {
     if (raw_slot < 0) {
         return -1;
     }
-    const size_t ring_size = ratio == 4 ? 8 : 128;
     const auto slot = static_cast<size_t>(raw_slot);
     return static_cast<int64_t>(((slot / block_size) * ring_size + (slot % ring_size)) / ratio);
 }
@@ -109,9 +111,10 @@ CompressLocations compress_locations_for_position(
     int64_t position,
     size_t ratio,
     size_t block_size,
+    size_t ring_size,
     const std::optional<std::vector<int64_t>> &full_to_state_block_ids) {
     const int64_t state_slot = full_slot_to_swa_slot(slot, full_to_state_block_ids, block_size);
-    const int64_t state_index = state_loc(state_slot, ratio, block_size);
+    const int64_t state_index = state_loc(state_slot, ratio, block_size, ring_size);
     const int64_t out_loc = slot >= 0 && (position + 1) % static_cast<int64_t>(ratio) == 0
                                 ? slot / static_cast<int64_t>(ratio)
                                 : -1;
@@ -119,7 +122,7 @@ CompressLocations compress_locations_for_position(
                                    * static_cast<int64_t>(ratio);
     const int64_t clipped_slot = slot_for_position(block_table, block_table_len, clipped_position, block_size);
     const int64_t clipped_state_slot = full_slot_to_swa_slot(clipped_slot, full_to_state_block_ids, block_size);
-    int64_t write_loc = state_loc(clipped_state_slot, ratio, block_size);
+    int64_t write_loc = state_loc(clipped_state_slot, ratio, block_size, ring_size);
     if (write_loc < 0) {
         write_loc = state_index;
     }
@@ -127,7 +130,7 @@ CompressLocations compress_locations_for_position(
     const int64_t prev_position = clipped_position - static_cast<int64_t>(ratio);
     const int64_t prev_slot = slot_for_position(block_table, block_table_len, prev_position, block_size);
     const int64_t prev_state_slot = full_slot_to_swa_slot(prev_slot, full_to_state_block_ids, block_size);
-    int64_t prev_state_index = state_loc(prev_state_slot, ratio, block_size);
+    int64_t prev_state_index = state_loc(prev_state_slot, ratio, block_size, ring_size);
     if (prev_state_index < 0) {
         prev_state_index = write_loc >= 0 ? write_loc : 0;
     }
@@ -195,10 +198,11 @@ int32_t mapped_slot_for_position(
 
 std::vector<int32_t> build_state_locs_by_position(const std::vector<int32_t> &mapped_slots,
                                                   size_t ratio,
-                                                  size_t block_size) {
+                                                  size_t block_size,
+                                                  size_t ring_size) {
     std::vector<int32_t> result(mapped_slots.size());
     for (size_t pos = 0; pos < mapped_slots.size(); ++pos) {
-        result[pos] = checked_i32(state_loc(mapped_slots[pos], ratio, block_size), "state_locs");
+        result[pos] = checked_i32(state_loc(mapped_slots[pos], ratio, block_size, ring_size), "state_locs");
     }
     return result;
 }
@@ -211,6 +215,7 @@ int32_t state_loc_for_mapped_position(
     int64_t position,
     size_t ratio,
     size_t block_size,
+    size_t ring_size,
     const std::optional<std::vector<int64_t>> &full_to_swa_block_ids) {
     if (position < 0) {
         return -1;
@@ -220,10 +225,99 @@ int32_t state_loc_for_mapped_position(
     }
     const int32_t mapped_slot = mapped_slot_for_position(
         mapped_slots, block_table, block_table_len, position, block_size, full_to_swa_block_ids);
-    return checked_i32(state_loc(mapped_slot, ratio, block_size), "state_loc_for_mapped_position");
+    return checked_i32(state_loc(mapped_slot, ratio, block_size, ring_size), "state_loc_for_mapped_position");
 }
 
 } // namespace
+
+DeepSeekV4HostBatch::DeepSeekV4HostBatch(
+    runtime::Tensor positions, runtime::Tensor offsets, runtime::Tensor tables,
+    runtime::Tensor slots, std::optional<Plans> plans)
+    : positions_(std::move(positions)), offsets_(std::move(offsets)),
+      tables_(std::move(tables)), slots_(std::move(slots)), plans_(std::move(plans)) {}
+
+namespace {
+template <typename T>
+runtime::Tensor copy_host_batch_tensor(const runtime::Tensor &tensor) {
+    auto owner = std::make_shared<std::vector<T>>(tensor->numel());
+    std::memcpy(owner->data(), tensor->data(), owner->size() * sizeof(T));
+    return runtime::Tensor::from_blob(owner->data(), tensor->shape(), tensor->dtype(), kCpu, owner);
+}
+} // namespace
+
+std::shared_ptr<const DeepSeekV4HostBatch> DeepSeekV4HostBatch::prepare_short(
+    const runtime::Tensor &positions, const runtime::Tensor &offsets,
+    const runtime::Tensor &tables, const runtime::Tensor &slots,
+    size_t rows, size_t page_count, bool share_plan, bool classic_mtp_target) {
+    using runtime::DataType;
+    constexpr auto block_size = models::deepseek_v4::kV4PageSize;
+    const auto host = [](const runtime::Tensor &tensor, size_t rank) {
+        return tensor && tensor->device().type() == runtime::Device::Type::kCpu
+            && tensor->is_contiguous() && tensor->ndim() == rank;
+    };
+    if (rows == 0 || rows > 12 || page_count == 0 ||
+        page_count > static_cast<size_t>(std::numeric_limits<int32_t>::max()) / block_size ||
+        !host(positions, 1) || !host(offsets, 1) || !host(tables, 2) || !host(slots, 1) ||
+        (positions->dtype() != DataType::kInt32 && positions->dtype() != DataType::kInt64) ||
+        offsets->dtype() != DataType::kInt32 || tables->dtype() != DataType::kInt32 ||
+        slots->dtype() != DataType::kInt64 || positions->numel() != rows || slots->numel() != rows ||
+        tables->size(0) < 1 || tables->size(0) > 3 ||
+        tables->size(1) < 1 || tables->size(1) > page_count ||
+        offsets->numel() != tables->size(0) + 1) {
+        return {};
+    }
+
+    auto owned_offsets = copy_host_batch_tensor<int32_t>(offsets);
+    const auto *offset_values = reinterpret_cast<const int32_t *>(owned_offsets->data());
+    const auto requests = tables->size(0);
+    if (offset_values[0] != 0 || offset_values[requests] != static_cast<int32_t>(rows)) {
+        throw std::invalid_argument("DeepSeek V4 host batch offsets do not cover input IDs");
+    }
+    for (size_t row = 0; row < requests; ++row) {
+        const auto query = static_cast<int64_t>(offset_values[row + 1]) - offset_values[row];
+        if (query <= 0) {
+            throw std::invalid_argument("DeepSeek V4 host batch offsets must increase");
+        }
+        if (query > 4) {
+            return {};
+        }
+    }
+
+    auto owned_positions = positions->dtype() == DataType::kInt32
+        ? copy_host_batch_tensor<int32_t>(positions) : copy_host_batch_tensor<int64_t>(positions);
+    auto owned_tables = copy_host_batch_tensor<int32_t>(tables);
+    auto owned_slots = copy_host_batch_tensor<int64_t>(slots);
+    const auto *table_values = reinterpret_cast<const int32_t *>(owned_tables->data());
+    const auto *slot_values = reinterpret_cast<const int64_t *>(owned_slots->data());
+    for (size_t i = 0; i < owned_tables->numel(); ++i) {
+        const auto page = table_values[i];
+        if (page < -1 || (page >= 0 && static_cast<size_t>(page) >= page_count)) {
+            throw std::out_of_range("DeepSeek V4 host batch table exceeds the page pool");
+        }
+    }
+    const auto columns = owned_tables->size(1);
+    for (size_t request = 0; request < requests; ++request) {
+        for (auto row = offset_values[request]; row < offset_values[request + 1]; ++row) {
+            const auto position = read_position(owned_positions->data(), owned_positions->dtype(), row);
+            const auto slot = slot_for_position(table_values + request * columns, columns,
+                                                position, block_size);
+            if (slot < 0 || slot != slot_values[row]) {
+                throw std::invalid_argument("DeepSeek V4 host batch slot and page table disagree");
+            }
+        }
+    }
+    std::optional<Plans> plans;
+    if (share_plan) {
+        auto metadata = build_deepseek_v4_attention_metadata(
+            owned_tables, owned_slots, owned_positions, owned_offsets, std::nullopt, block_size, classic_mtp_target);
+        auto c4 = build_deepseek_v4_compression_plan(metadata, owned_positions, owned_offsets, 4);
+        auto c128 = build_deepseek_v4_compression_plan(metadata, owned_positions, owned_offsets, 128);
+        plans.emplace(Plans{std::move(metadata), std::move(c4), std::move(c128)});
+    }
+    return std::shared_ptr<const DeepSeekV4HostBatch>(new DeepSeekV4HostBatch(
+        std::move(owned_positions), std::move(owned_offsets), std::move(owned_tables),
+        std::move(owned_slots), std::move(plans)));
+}
 
 DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
     const runtime::Tensor &block_tables,
@@ -231,7 +325,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
     const runtime::Tensor &position_ids,
     const runtime::Tensor &input_offsets,
     const std::optional<std::vector<int64_t>> &full_to_swa_block_ids,
-    size_t block_size) {
+    size_t block_size,
+    bool classic_mtp_target) {
     if (block_size == 0 || block_size > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
         throw std::runtime_error("build_deepseek_v4_attention_metadata: block_size must be positive and fit int32");
     }
@@ -282,6 +377,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
     const size_t c128_width = align_up(std::max(max_c128_visible, static_cast<size_t>(1)), 64);
     constexpr size_t swa_window_size = 128;
     constexpr size_t c4_sparse_topk = 512;
+    const auto c4_ring = models::deepseek_v4::compressor_ring_rows(4, classic_mtp_target);
+    const auto c128_ring = models::deepseek_v4::compressor_ring_rows(128, classic_mtp_target);
 
     auto swa_indices = make_i32_tensor({rows, swa_window_size});
     auto swa_topk_lengths = make_i32_tensor({rows});
@@ -357,7 +454,7 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
                 c4_sparse_topk_lengths_ptr[row] = checked_i32(std::min<int64_t>(c4_clamp1, c4_sparse_topk),
                                                               "c4_sparse_topk_lengths");
                 const auto c4_loc = compress_locations_for_position(
-                    block_table, max_block_table_len, slot, position, 4, block_size, full_to_swa_block_ids);
+                    block_table, max_block_table_len, slot, position, 4, block_size, c4_ring, full_to_swa_block_ids);
                 c4_out_loc_ptr[row] = checked_i32(c4_loc.out_loc, "c4_out_loc");
                 c4_positions_ptr[row] = checked_i32(c4_loc.clipped_position, "c4_positions");
                 c4_compress_write_loc_ptr[row] = checked_i32(c4_loc.write_loc, "c4_compress_write_loc");
@@ -378,7 +475,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
                 }
 
                 const auto c128_loc = compress_locations_for_position(
-                    block_table, max_block_table_len, slot, position, 128, block_size, full_to_swa_block_ids);
+                    block_table, max_block_table_len, slot, position, 128, block_size, c128_ring,
+                    full_to_swa_block_ids);
                 c128_out_loc_ptr[row] = checked_i32(c128_loc.out_loc, "c128_out_loc");
                 c128_positions_ptr[row] = checked_i32(c128_loc.clipped_position, "c128_positions");
                 c128_compress_write_loc_ptr[row] = checked_i32(c128_loc.write_loc, "c128_compress_write_loc");
@@ -393,8 +491,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
         }
         const auto mapped_slots = build_mapped_slots_by_position(
             block_table, max_block_table_len, max_req_position, block_size, full_to_swa_block_ids);
-        const auto c4_state_locs = build_state_locs_by_position(mapped_slots, 4, block_size);
-        const auto c128_state_locs = build_state_locs_by_position(mapped_slots, 128, block_size);
+        const auto c4_state_locs = build_state_locs_by_position(mapped_slots, 4, block_size, c4_ring);
+        const auto c128_state_locs = build_state_locs_by_position(mapped_slots, 128, block_size, c128_ring);
 
         std::vector<int32_t> c128_page_by_index(c128_width, -1);
         for (size_t compressed_idx = 0; compressed_idx < c128_width; ++compressed_idx) {
@@ -439,7 +537,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
 
             const int64_t c4_clipped_position = (position / 4) * 4;
             const int64_t c4_state_slot = full_slot_to_swa_slot(slot, full_to_swa_block_ids, block_size);
-            const int32_t c4_state_index = checked_i32(state_loc(c4_state_slot, 4, block_size), "c4_state_index");
+            const int32_t c4_state_index = checked_i32(state_loc(c4_state_slot, 4, block_size, c4_ring),
+                                                       "c4_state_index");
             int32_t c4_write = state_loc_for_mapped_position(
                 c4_state_locs,
                 mapped_slots,
@@ -448,6 +547,7 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
                 c4_clipped_position,
                 4,
                 block_size,
+                c4_ring,
                 full_to_swa_block_ids);
             if (c4_write < 0) {
                 c4_write = c4_state_index;
@@ -460,6 +560,7 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
                 c4_clipped_position - 4,
                 4,
                 block_size,
+                c4_ring,
                 full_to_swa_block_ids);
             if (c4_prev < 0) {
                 c4_prev = c4_write >= 0 ? c4_write : 0;
@@ -480,7 +581,8 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
 
             const int64_t c128_clipped_position = (position / 128) * 128;
             const int64_t c128_state_slot = full_slot_to_swa_slot(slot, full_to_swa_block_ids, block_size);
-            const int32_t c128_state_index = checked_i32(state_loc(c128_state_slot, 128, block_size), "c128_state_index");
+            const int32_t c128_state_index = checked_i32(state_loc(c128_state_slot, 128, block_size, c128_ring),
+                                                         "c128_state_index");
             int32_t c128_write = state_loc_for_mapped_position(
                 c128_state_locs,
                 mapped_slots,
@@ -489,6 +591,7 @@ DeepSeekV4AttentionMetadata build_deepseek_v4_attention_metadata(
                 c128_clipped_position,
                 128,
                 block_size,
+                c128_ring,
                 full_to_swa_block_ids);
             if (c128_write < 0) {
                 c128_write = c128_state_index;
@@ -557,7 +660,7 @@ DeepSeekV4CompressionPlan build_deepseek_v4_compression_plan(
         throw std::invalid_argument("DeepSeek V4 compression offsets must cover all input rows");
     }
     const auto group_width = static_cast<int64_t>(ratio);
-    const size_t window = ratio == 4 ? 8 : 128;
+    const size_t window = models::deepseek_v4::compression_window(ratio);
     DeepSeekV4CompressionPlan plan{make_i32_tensor({rows, window}), make_i32_tensor(row_shape)};
     auto *sources = i32_data(plan.sources);
     auto *slots = i32_data(plan.state_slots);

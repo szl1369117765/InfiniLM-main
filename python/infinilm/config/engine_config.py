@@ -11,7 +11,10 @@ class EngineConfig:
     Attributes:
         model_path: Path to the model directory.
         draft_model_path: Optional Eagle/MTP draft model directory.
-        num_draft_tokens: Number of Eagle draft tokens to verify per step.
+        num_draft_tokens: Number of draft tokens to verify per step.
+        enable_deepseek_v4_mtp: Opt in to classic DeepSeek V4 NextN (C1-C3, K1-K3).
+        nextn_branch_draft_lengths: Ordered candidate depths for single-owner NextN.
+        nextn_branch_execution: Serial verification or packed verification on private cache pages.
         device: Device type string ('cpu', 'cuda', 'mlu', etc.).
         dtype: Data type string ('float16', 'bfloat16', 'float32').
         tensor_parallel_size: Number of devices for tensor parallelism.
@@ -70,8 +73,56 @@ class EngineConfig:
     enable_prefix_caching: bool = True
     static_cache_capacity: int = 1
     chunked_prefill_size: int = 0
+    enable_deepseek_v4_mtp: bool = False
+    nextn_branch_draft_lengths: Optional[tuple[int, ...]] = None
+    nextn_branch_execution: str = "serial"
 
     def __post_init__(self) -> None:
+        if self.enable_deepseek_v4_mtp and (
+            not self.draft_model_path
+            or type(self.num_draft_tokens) is not int
+            or self.num_draft_tokens not in (1, 2, 3)
+            or type(self.max_batch_size) is not int
+            or self.max_batch_size not in (1, 2, 3)
+            or self.cache_type != "paged"
+            or self.attn_backend != "paged-attn"
+            or self.block_size != 256
+            or self.enable_prefix_caching
+            or self.chunked_prefill_size
+            or self.skip_load
+            or self.pipeline_parallel_size != 1
+            or self.moe_ep_backend != "disabled"
+            or self.moe_ep_size != 1
+            or (self.kv_transfer_config is not None and self.kv_transfer_config.kv_connector)
+        ):
+            raise ValueError(
+                "classic DeepSeek V4 MTP requires a Draft and paged-attn "
+                "with 256-token pages, 1-3 requests, 1-3 draft tokens, local KV, "
+                "and TP expert placement"
+            )
+        lengths = self.nextn_branch_draft_lengths
+        execution = self.nextn_branch_execution
+        if execution not in ("serial", "packed", "packed-stepwise") or (execution != "serial" and lengths is None):
+            raise ValueError("classic NextN branch execution requires serial, packed or packed-stepwise with candidate depths")
+        if lengths is not None:
+            if (
+                not self.enable_deepseek_v4_mtp
+                or (self.enable_graph and execution == "serial")
+                or self.max_batch_size != 1
+                or not isinstance(lengths, (list, tuple))
+                or not lengths
+                or any(type(k) is not int or k not in (1, 2, 3) for k in lengths)
+                or len(set(lengths)) != len(lengths)
+                or min(lengths) > self.num_draft_tokens
+            ):
+                required_mode = (
+                    "serial branches require eager C1" if execution == "serial" else "packed branches require C1"
+                )
+                raise ValueError(
+                    f"classic NextN {required_mode} and distinct "
+                    "K1/K2/K3 candidate depths with at least one within the draft limit"
+                )
+            self.nextn_branch_draft_lengths = tuple(lengths)
         if (
             type(self.static_cache_capacity) is not int
             or self.static_cache_capacity < 1

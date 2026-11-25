@@ -23,6 +23,7 @@ class _SpeculativeCacheReservation:
     def __init__(self, ops):
         self.ops = ops
         self.rows = []  # (request, base length, original table, provisional table, draft count)
+        self.scratch_pages = ()
         self.submitted = False
         self.completed = False
 
@@ -39,10 +40,35 @@ class _SpeculativeCacheReservation:
             raise RuntimeError("verification reservation cannot be submitted twice")
         self.submitted = True
 
+    def reserve_branch_tables(self, ends):
+        """Give candidates private page tables within this single-owner verify."""
+        self._assert_active()
+        if self.submitted or self.scratch_pages or len(self.rows) != 1:
+            raise RuntimeError("packed NextN branches require an unused single-owner reservation")
+        _, base, _, _, draft_count = self.rows[0]
+        if not 2 <= len(ends) <= 3 or any(not base < end <= base + draft_count for end in ends):
+            raise ValueError("packed NextN branch exceeds its verification reservation")
+        manager = self.ops._cache_manager
+        page_size = manager.block_size
+        counts = [(end + page_size - 1) // page_size for end in ends]
+        self.scratch_pages = manager.allocate_private_blocks(sum(counts))
+        tables = []
+        offset = 0
+        for count in counts:
+            tables.append(tuple(self.scratch_pages[offset:offset + count]))
+            offset += count
+        return tuple(tables)
+
+    def release_branch_tables(self):
+        if self.scratch_pages:
+            self.ops._cache_manager.release_private_blocks(self.scratch_pages)
+            self.scratch_pages = ()
+
     def mark_completed(self):
         self._assert_active()
         if not self.submitted or self.completed:
             raise RuntimeError("verification has no unfinished submitted reservation")
+        self.release_branch_tables()
         self.completed = True
 
     def commit(self, keep_lengths):
@@ -118,7 +144,9 @@ class SpeculativeCacheOps:
         try:
             for candidate in candidates:
                 req, base = candidate["req"], candidate["base_len"]
-                count = len(candidate["draft_tokens"])
+                count = candidate.get("draft_count")
+                if count is None:
+                    count = len(candidate["draft_tokens"])
                 original = tuple(req.block_table)
                 table, slots = self._cache_manager.append_slots(
                     list(original), base + 1, count
@@ -141,6 +169,7 @@ class SpeculativeCacheOps:
                     self._scheduler._completion_failed = True
                 else:
                     try:
+                        batch.release_branch_tables()
                         self._cache_manager.truncate_blocks_many(
                             [table for _, _, _, table, _ in batch.rows],
                             [base for _, base, _, _, _ in batch.rows],
@@ -190,14 +219,20 @@ class Scheduler:
         enable_prefix_caching: bool = True,
         nsa_owner_pool_epoch: int | None = None,
         chunked_prefill_size: int = 0,
+        serial_requests: bool = False,
+        on_aborted_request=None,
     ):
         if nsa_owner_pool_epoch is not None and (
             connector is not None or has_mamba_cache
         ):
             raise ValueError("NSA owner slice excludes connectors and recurrent cache")
+        if serial_requests and max_batch_size != 1:
+            raise ValueError("serial paged scheduling requires max_batch_size=1")
         self.waiting_queue = janus.Queue()
         self.running_queue = janus.Queue()
         self.max_batch_size = max_batch_size
+        self.serial_requests = serial_requests
+        self._on_aborted_request = on_aborted_request
 
         self.finished_receiving_kv_req_ids: set[str] = set()
         self.failed_receiving_kv_req_ids: set[str] = set()
@@ -437,11 +472,13 @@ class Scheduler:
 
         # Alternate phases even without chunking so continuous arrivals cannot
         # indefinitely delay running requests or completed remote transfers.
+        # Serial requests keep the current owner until it finishes.
         ready_remote = self.remote_kv_requests.keys() & (
             self.finished_receiving_kv_req_ids | self.failed_receiving_kv_req_ids
         )
-        skip_waiting = self._last_batch_was_prefill and (
-            self.running_queue.sync_q.qsize() > 0 or bool(ready_remote)
+        has_running = self.running_queue.sync_q.qsize() > 0
+        skip_waiting = (self.serial_requests and has_running) or (
+            self._last_batch_was_prefill and (has_running or bool(ready_remote))
         )
 
         # Process Waiting queue (prefill phase)
@@ -464,6 +501,12 @@ class Scheduler:
             self._claim_request(req)
             self._dequeued_request = None
             # Skip requests that were already finished (e.g., timed out/canceled while waiting)
+            if (
+                self._on_aborted_request is not None
+                and req.is_aborted()
+                and not req.is_finished()
+            ):
+                self._on_aborted_request(req)
             if req.is_finished():
                 self.complete_requests([req])
                 continue
@@ -740,6 +783,12 @@ class Scheduler:
             self._claim_request(req)
             self._dequeued_request = None
             # Skip requests that were already finished (e.g., timed out/canceled while running)
+            if (
+                self._on_aborted_request is not None
+                and req.is_aborted()
+                and not req.is_finished()
+            ):
+                self._on_aborted_request(req)
             if req.is_finished():
                 self.complete_requests([req])
                 continue

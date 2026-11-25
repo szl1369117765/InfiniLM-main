@@ -44,6 +44,27 @@ class SchedulerFairnessTest(unittest.TestCase):
         self.assertTrue(out.is_prefill)
         self.assertEqual(out.scheduled_requests[0].request_id, 'new')
 
+    def test_serial_owner_keeps_decode_priority_until_canceled(self):
+        scheduler = make_scheduler(max_batch_size=1, serial_requests=True)
+        owner = make_request("owner", 8)
+        waiting = make_request("waiting", 8)
+        scheduler.add_request(owner)
+        complete(scheduler, scheduler.schedule())
+        scheduler.add_request(waiting)
+
+        for _ in range(2):
+            output = scheduler.schedule()
+            self.assertIsNotNone(output)
+            self.assertFalse(output.is_prefill)
+            self.assertEqual(output.scheduled_requests, [owner])
+            complete(scheduler, output)
+
+        owner.status = RequestStatus.CANCELED
+        output = scheduler.schedule()
+        self.assertIsNotNone(output)
+        self.assertTrue(output.is_prefill)
+        self.assertEqual(output.scheduled_requests, [waiting])
+
     def test_running_reservation_scanned_once_per_admission_batch(self):
         s = make_scheduler(max_batch_size=4, num_blocks=1024)
         s.add_request(make_request('old', 8))
