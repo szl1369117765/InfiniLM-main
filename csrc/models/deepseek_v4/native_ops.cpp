@@ -2,7 +2,10 @@
 
 #include "execution/submit.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace infinilm::models::deepseek_v4 {
 
@@ -33,6 +36,16 @@ void apply_rotary_tail(runtime::Runtime &runtime, const runtime::Tensor &input,
     execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
                           Op::DefaultConfig(runtime.device().type()), ids, input,
                           std::optional<runtime::Tensor>{}, cos_sin, dim, false, dim - 64, inverse);
+}
+
+void store_swa_rows(runtime::Runtime &runtime, const runtime::Tensor &key,
+                    const runtime::Tensor &weight, const runtime::Tensor &positions,
+                    const runtime::Tensor &frequencies, const runtime::Tensor &slots,
+                    float epsilon, const runtime::Tensor &pages) {
+    using Op = infini::ops::DeepseekV4StoreSwa;
+    execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
+                          Op::DefaultConfig(runtime.device().type()),
+                          key, weight, positions, frequencies, slots, epsilon, pages);
 }
 
 void store_mla_rows(runtime::Runtime &runtime, const runtime::Tensor &kv,
@@ -77,10 +90,38 @@ runtime::Tensor run_routed_experts(runtime::Runtime &runtime, const runtime::Ten
     if (!input) throw std::invalid_argument("DeepSeek V4 routed experts require input");
     using Op = infini::ops::DeepseekV4W8a8Experts;
     auto output = runtime::Tensor::empty(runtime, input->shape(), input->dtype());
-    execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
-                          Op::DefaultConfig(runtime.device().type()), input, routing.weights,
-                          routing.indices, weights.gate_up(), weights.gate_up_scale(),
-                          weights.down(), weights.down_scale(), swiglu_limit, routed_scale, output);
+    const auto submit_rows = [&](const runtime::Tensor &rows, const RoutedExperts &routes,
+                                 const runtime::Tensor &result) {
+        execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
+                              Op::DefaultConfig(runtime.device().type()), rows, routes.weights,
+                              routes.indices, weights.gate_up(), weights.gate_up_scale(),
+                              weights.down(), weights.down_scale(), swiglu_limit, routed_scale, result);
+    };
+    // Bound the Hygon expert workspace and retain the grouped matrix kernel
+    // across a large packed prefill. Each route is local to its token.
+    constexpr size_t grouped_max_rows = 8192;
+    const auto rows = input->size(0);
+    const bool grouped_shape = runtime.device().type() == runtime::Device::Type::kHygon
+        && input->dtype() == runtime::DataType::kBFloat16 && input->size(1) == 4096
+        && weights.down()->size(2) == 256
+        && (routed_scale ? weights.down()->size(0) == 256 && routing.weights->size(1) == 6
+                         : weights.down()->size(0) == 1 && routing.weights->size(1) == 1);
+    if (rows > grouped_max_rows && grouped_shape) {
+        const auto *setting = std::getenv("INFINILM_DSV4_EXPERT_PREFILL_TILING");
+        if (!setting || std::string_view(setting) != "0") {
+            const size_t tile_count = 1 + (rows - 1) / grouped_max_rows;
+            const size_t tile_rows = 1 + (rows - 1) / tile_count;
+            for (size_t first = 0; first < rows; first += tile_rows) {
+                const size_t count = std::min(tile_rows, rows - first);
+                const auto take = [&](const runtime::Tensor &tensor) {
+                    return tensor->narrow({{0, first, count}});
+                };
+                submit_rows(take(input), {take(routing.weights), take(routing.indices)}, take(output));
+            }
+            return output;
+        }
+    }
+    submit_rows(input, routing, output);
     return output;
 }
 

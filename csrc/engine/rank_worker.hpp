@@ -108,6 +108,8 @@ public:
         bool mtp_shared_compression_plan{false};
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
+        // Token-only callers need logits only at the sampled positions.
+        bool sampled_logits_only{false};
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,

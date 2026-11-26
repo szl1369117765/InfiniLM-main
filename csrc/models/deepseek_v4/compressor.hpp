@@ -16,9 +16,21 @@ public:
                             const runtime::Tensor &cos_sin,
                             const std::vector<size_t> &query_offsets) const;
 
+    void store_paged(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                     const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                     const runtime::Tensor &state, const runtime::Tensor &positions,
+                     const runtime::Tensor &cos_sin, const std::vector<size_t> &query_offsets,
+                     const runtime::Tensor &slots, const runtime::Tensor &pages,
+                     size_t page_tokens) const;
+
     std::vector<std::shared_ptr<weights::ModelWeights>> loading_children() const override;
 
 private:
+    runtime::Tensor project_and_pool(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                                     const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                                     const runtime::Tensor &state,
+                                     const std::vector<size_t> &query_offsets) const;
+
     size_t head_dim_;
     runtime::Tensor ape_;
     std::shared_ptr<layers::linear::GateUpParallelLinear> projection_;

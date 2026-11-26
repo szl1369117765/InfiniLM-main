@@ -458,6 +458,7 @@ InferEngine::Input::to_model_input(
     input.mtp_draft_cache_only = mtp_draft_cache_only;
     input.mtp_scratch_step = mtp_scratch_step;
     input.mtp_last_logits = mtp_last_logits;
+    input.sampled_logits_only = sampled_logits_only;
 
     auto &attn_metadata = forward_context.attn_metadata;
     attn_metadata = {

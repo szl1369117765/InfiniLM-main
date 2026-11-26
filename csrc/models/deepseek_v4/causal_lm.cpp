@@ -13,6 +13,7 @@
 #include "layers/embedding/embedding.hpp"
 #include "models/models_registry.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -28,6 +29,7 @@ using runtime::Runtime;
 using runtime::Shape;
 using runtime::Tensor;
 using weights::Weight;
+using C4SequentialIndex = infini::ops::DeepseekV4C4IndexSequential;
 using ModelConfig = config::ModelConfig;
 using Rank = engine::distributed::RankInfo;
 using Linear = nn::Linear;
@@ -103,43 +105,139 @@ Tensor cast(Runtime &rt, const Tensor &value, DataType dtype) {
 // The HCU custom reduction used by the reference accumulates rank-local
 // BF16 contributions in FP32 and truncates only the final writeback.
 Tensor reduce_tp(Runtime &rt, const Tensor &local, infinicclComm_t comm,
-                 const std::vector<size_t> &query_offsets) {
+                 const std::vector<size_t> &query_offsets, bool packed_collectives) {
     auto sum = cast(rt,local,DataType::kFloat32);
-    for_each_request(query_offsets, [&](const RequestRows &rows) {
-        auto part = rows.slice(sum);
-        engine::distributed::allreduce_(rt, part, part, infinicclSum, comm);
-    });
+    if (packed_collectives) {
+        engine::distributed::allreduce_(rt, sum, sum, infinicclSum, comm);
+    } else {
+        for_each_request(query_offsets, [&](const RequestRows &rows) {
+            auto part = rows.slice(sum);
+            engine::distributed::allreduce_(rt, part, part, infinicclSum, comm);
+        });
+    }
     auto output = Tensor::empty(rt,local->shape(),local->dtype());
     submit<infini::ops::DeepseekV4CastRz>(rt,sum,output);
     return output;
 }
 
-Tensor normalize_and_rotate(Runtime &rt, const Tensor &input, const Tensor &weight,
-                            float epsilon, const Tensor &position, const Tensor &frequencies,
-                            bool round_before_rope = false) {
+Tensor normalize_query_and_rotate(Runtime &rt, const Tensor &input, const Tensor &weight,
+                                  float epsilon, const Tensor &positions, const Tensor &frequencies) {
+    if (rt.device().type() == runtime::Device::Type::kHygon && input->dtype() == DataType::kBFloat16) {
+        auto output = Tensor::empty(rt, input->shape(), input->dtype());
+        submit<infini::ops::DeepseekV4QueryNormRope>(rt, input, weight, positions,
+                                                   frequencies, epsilon, output);
+        return output;
+    }
     auto fp32 = cast(rt, input, DataType::kFloat32);
     auto normalized = Tensor::empty(rt, input->shape(), DataType::kFloat32);
-    if (!round_before_rope && input->ndim()==2) {
-        const Shape kv_shape{input->size(0),1,input->size(1)};
-        submit<infini::ops::RmsNorm>(rt,fp32->view(kv_shape),weight,epsilon,normalized->view(kv_shape));
-    } else {
-        submit<infini::ops::RmsNorm>(rt,fp32,weight,epsilon,normalized);
-    }
-    if (round_before_rope) normalized = cast(rt, normalized, input->dtype());
-    apply_rotary_tail(rt, normalized, position, frequencies);
-    return normalized;
+    submit<infini::ops::RmsNorm>(rt, fp32, weight, epsilon, normalized);
+    auto rounded = cast(rt, normalized, input->dtype());
+    apply_rotary_tail(rt, rounded, positions, frequencies);
+    return rounded;
 }
 
 struct MixWeights {
     Tensor projection, scale, base;
 };
 
+struct C4ScorePlan {
+    static constexpr size_t ranks = 8;
+    std::array<std::vector<RequestRows>, ranks> scored;
+    std::vector<RequestRows> sequential;
+    std::array<size_t, ranks> row_counts{};
+    size_t gathered_rows{};
+};
+
+std::optional<C4ScorePlan> make_c4_score_plan(const int32_t *lengths, size_t rows) {
+    constexpr auto top = static_cast<int32_t>(C4SequentialIndex::kMaxCandidates);
+    constexpr size_t stripe_rows = 512;
+    constexpr size_t wide_score_min_rows = 1024;
+    struct Stripe {
+        RequestRows rows;
+        uint64_t candidates;
+    };
+
+    const auto contiguous_rows = (rows + C4ScorePlan::ranks - 1) / C4ScorePlan::ranks;
+    if (contiguous_rows < wide_score_min_rows) {
+        return std::nullopt;
+    }
+
+    C4ScorePlan plan;
+    std::vector<Stripe> stripes;
+    std::array<uint64_t, C4ScorePlan::ranks> contiguous_work{};
+    for (size_t first = 0; first < rows;) {
+        const bool scored = lengths[first] > top;
+        size_t end = first + 1;
+        while (end < rows && (lengths[end] > top) == scored
+               && (!scored || end - first < stripe_rows)) {
+            ++end;
+        }
+        const RequestRows span{first, end - first};
+        if (scored) {
+            uint64_t candidates = 0;
+            for (size_t row = first; row < end; ++row) {
+                const auto length = static_cast<uint64_t>(lengths[row]);
+                candidates += length;
+                contiguous_work[row / contiguous_rows] += length;
+            }
+            stripes.push_back({span, candidates});
+        } else {
+            plan.sequential.push_back(span);
+        }
+        first = end;
+    }
+
+    std::stable_sort(stripes.begin(), stripes.end(), [](const Stripe &a, const Stripe &b) {
+        return a.candidates > b.candidates;
+    });
+    std::array<uint64_t, C4ScorePlan::ranks> work{};
+    for (const auto &stripe : stripes) {
+        const auto rank = std::min_element(work.begin(), work.end()) - work.begin();
+        plan.scored[rank].push_back(stripe.rows);
+        plan.row_counts[rank] += stripe.rows.count;
+        work[rank] += stripe.candidates;
+    }
+    plan.gathered_rows = *std::max_element(plan.row_counts.begin(), plan.row_counts.end());
+    const auto least_rows = *std::min_element(plan.row_counts.begin(), plan.row_counts.end());
+    const auto previous_work = *std::max_element(contiguous_work.begin(), contiguous_work.end());
+    const auto balanced_work = *std::max_element(work.begin(), work.end());
+    // Keep the wide score kernel on every rank. Require a smaller gather
+    // and a meaningful decrease in the maximum per-rank candidate count.
+    if (plan.sequential.empty() || least_rows < wide_score_min_rows
+        || plan.gathered_rows >= contiguous_rows || balanced_work + balanced_work / 10 >= previous_work) {
+        return std::nullopt;
+    }
+
+    for (auto &rank : plan.scored) {
+        std::sort(rank.begin(), rank.end(), [](const RequestRows &a, const RequestRows &b) {
+            return a.first < b.first;
+        });
+        size_t merged = 0;
+        for (const auto span : rank) {
+            if (merged && rank[merged - 1].first + rank[merged - 1].count == span.first) {
+                rank[merged - 1].count += span.count;
+            } else {
+                rank[merged++] = span;
+            }
+        }
+        rank.resize(merged);
+    }
+    return plan;
+}
+
 struct BatchMetadata {
     Tensor position, swa_indices, swa_lengths, swa_slots, page_table;
     Tensor c4_slots, c4_positions, c4_lengths, c4_sparse_lengths, c4_sources, c4_state_slots;
     Tensor c128_slots, c128_positions, c128_indices, c128_lengths, c128_sources, c128_state_slots;
     std::vector<size_t> query_offsets;
-    bool single_decode{};
+    bool packed_decode{};
+    bool c4_sequential{};
+    size_t c4_query_begin{};
+    bool c4_tp_shard{};
+    std::optional<C4ScorePlan> c4_score_plan;
+    std::optional<RoutedExperts> shared_expert_route{};
+    bool packed_decode_collectives{};
+    bool packed_decode_mla{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -194,26 +292,89 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
         *writes = {metadata.raw_out_loc, metadata.c4_out_loc, metadata.c128_out_loc,
                    c4.state_slots, c128.state_slots};
     }
-    const bool decode = positions->numel()==1 &&
-        (positions->dtype()==DataType::kInt64
-          ? *reinterpret_cast<const int64_t*>(positions->data())>0
-          : *reinterpret_cast<const int32_t*>(positions->data())>0);
+    const auto *c4_lengths = reinterpret_cast<const int32_t*>(metadata.c4_topk_lengths_raw->data());
+    const auto rows = positions->numel();
+    const auto *c4_end = c4_lengths + rows;
+    const bool hygon = rt.device().type() == runtime::Device::Type::kHygon;
+    const auto *first_scored = hygon ? std::find_if(c4_lengths, c4_end, [](int32_t length) {
+        return length > static_cast<int32_t>(C4SequentialIndex::kMaxCandidates);
+    }) : c4_lengths;
+    const bool c4_sequential = hygon && first_scored == c4_end;
+    // A single packed request can omit a contiguous prefix. Keep the GEMM
+    // layout for multi-request and small speculative verification batches.
+    const size_t c4_query_begin = !c4_sequential && offsets->numel() == 2 && rows >= 16
+        ? static_cast<size_t>(first_scored - c4_lengths) : 0;
     const auto *row_offsets = reinterpret_cast<const int32_t*>(offsets->data());
     std::vector<size_t> query_offsets(row_offsets, row_offsets + offsets->numel());
-    return {input.position_ids.value()->view({positions->numel()}),
+    const auto all_past_prefill = [rows](const auto *values) {
+        return std::all_of(values, values + rows, [](auto position) { return position > 0; });
+    };
+    // The body specializes request-local projections by their query spans.
+    // Only a full batch with one new token per request uses the decode plan.
+    const bool packed_decode = (rows == 1 || hygon) && query_offsets.size() == rows + 1
+        && std::adjacent_find(query_offsets.begin(), query_offsets.end(),
+                              [](size_t left, size_t right) { return right != left + 1; })
+               == query_offsets.end()
+        && (positions->dtype() == DataType::kInt64
+            ? all_past_prefill(reinterpret_cast<const int64_t*>(positions->data()))
+            : all_past_prefill(reinterpret_cast<const int32_t*>(positions->data())));
+    // All ranks use the same paged cache layout in fresh prefill. For
+    // multiple requests each span has its own short prefix.
+    const bool multi_request = query_offsets.size() > 2;
+    const bool shard_candidate = hygon && !c4_sequential &&
+        (multi_request ? rows >= 4096 && rows <= 32768
+                       : c4_query_begin && rows >= 3072 && rows <= 8192 && rows - c4_query_begin >= 512);
+    bool c4_tp_shard = false;
+    if (shard_candidate) {
+        const auto *setting = std::getenv(multi_request ? "INFINILM_DSV4_C4_BATCH_TP_SHARD"
+                                                       : "INFINILM_DSV4_C4_TP_SHARD");
+        const auto fresh_spans = [&](const auto *positions_data) {
+            bool fresh = true;
+            for_each_request(query_offsets, [&](const RequestRows &span) {
+                fresh = fresh && span.count >= 16 && positions_data[span.first] == 0
+                    && positions_data[span.first + span.count - 1] == static_cast<int64_t>(span.count - 1);
+            });
+            return fresh;
+        };
+        c4_tp_shard = (!setting || std::string_view(setting) != "0")
+            && (positions->dtype() == DataType::kInt64
+                ? fresh_spans(reinterpret_cast<const int64_t*>(positions->data()))
+                : fresh_spans(reinterpret_cast<const int32_t*>(positions->data())));
+    }
+    std::optional<C4ScorePlan> c4_score_plan;
+    if (c4_tp_shard && multi_request) {
+        const auto *setting = std::getenv("INFINILM_DSV4_C4_BALANCED_SHARD");
+        if (!setting || std::string_view(setting) != "0") {
+            c4_score_plan = make_c4_score_plan(c4_lengths, rows);
+        }
+    }
+    BatchMetadata batch{input.position_ids.value()->view({positions->numel()}),
             device(metadata.swa_indices), device(metadata.swa_topk_lengths), device(metadata.raw_out_loc),
             device(metadata.page_table), device(metadata.c4_out_loc), device(metadata.c4_positions),
             device(metadata.c4_topk_lengths_raw), device(metadata.c4_sparse_topk_lengths),
             device(c4.sources), device(c4.state_slots), device(metadata.c128_out_loc),
             device(metadata.c128_positions), device(metadata.c128_page_indices),
-            device(metadata.c128_topk_lengths_clamp1), device(c128.sources), device(c128.state_slots),std::move(query_offsets),decode};
+            device(metadata.c128_topk_lengths_clamp1), device(c128.sources), device(c128.state_slots), std::move(query_offsets), packed_decode,
+            c4_sequential, c4_query_begin, c4_tp_shard, std::move(c4_score_plan)};
+    if (hygon && packed_decode && rows >= 2 && rows <= 8) {
+        const auto *setting = std::getenv("INFINILM_DSV4_PACKED_DECODE_MLA");
+        if (!setting || std::string_view(setting) == "1") {
+            const auto tested_context = [rows](const auto *values) {
+                return std::all_of(values, values + rows, [](auto position) { return position < 8192; });
+            };
+            batch.packed_decode_mla = positions->dtype() == DataType::kInt64
+                ? tested_context(reinterpret_cast<const int64_t*>(positions->data()))
+                : tested_context(reinterpret_cast<const int32_t*>(positions->data()));
+        }
+    }
+    return batch;
 }
 
 class Attention final : public weights::ModelWeights {
 public:
     Attention(Runtime &rt, const V4Config &c, const Rank &rank, size_t ratio)
         : ratio_(ratio), heads_(c.heads / rank.tp_size), index_heads_(c.index_heads),
-          eps_(c.rms_eps) {
+          tp_rank_(rank.tp_rank), tp_size_(rank.tp_size), eps_(c.rms_eps) {
         comm_ = rank.comm;
         const auto bf = DataType::kBFloat16;
         const auto rank_id = size_t(rank.tp_rank), ranks = size_t(rank.tp_size);
@@ -248,58 +409,203 @@ public:
         auto q_lora = q_norm_->forward(rt,wq_a_->forward(rt,x));
         auto q_raw = wq_b_->forward(rt,q_lora)->view({rows,heads_,kV4HeadDim});
         const auto eps = static_cast<float>(eps_);
-        auto q = cast(rt, normalize_and_rotate(rt,q_raw,q_ones_,eps,batch.position,frequencies,true),
-                      q_raw->dtype());
-        auto kv = normalize_and_rotate(rt,wkv_->forward(rt,x),kv_norm_fp32_,eps,
-                                       batch.position,frequencies);
-        store_mla_rows(rt,kv,batch.swa_slots,cache.swa,kV4PageSize);
+        auto q = normalize_query_and_rotate(rt, q_raw, q_ones_, eps, batch.position, frequencies);
+        auto key = wkv_->forward(rt, x);
+        store_swa_rows(rt, key, kv_norm_fp32_, batch.position, frequencies,
+                       batch.swa_slots, eps, cache.swa);
         Tensor indices, lengths;
         if (ratio_ == 4) {
-            auto compressed = compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
-                                                  cache.compressor_state,batch.c4_positions,frequencies,batch.query_offsets);
-            // Compressed NoPE values round to BF16 before FP8 cache quantization.
-            store_mla_rows(rt,cast(rt,compressed,DataType::kBFloat16),
-                           batch.c4_slots,cache.compressed,kV4PageSize/4);
+            compressor_->store_paged(rt,x,batch.c4_sources,batch.c4_state_slots,
+                                     cache.compressor_state,batch.c4_positions,frequencies,
+                                     batch.query_offsets,batch.c4_slots,cache.compressed,kV4PageSize/4);
             auto key = index_compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
                                                  cache.indexer_state,batch.c4_positions,frequencies,batch.query_offsets);
             key = cast(rt,key,DataType::kBFloat16);
-            auto query = index_query_->forward(rt,q_lora)->view({rows,index_heads_,128});
-            apply_rotary_tail(rt,query,batch.position,frequencies);
-            auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
-                auto input = part.slice(x);
-                return index_weights_->forward(rt, input);
-            });
-            // A positive scalar common to all candidates does not change top-k.
-            indices = Tensor::empty(rt,{rows,512},DataType::kInt32);
-            submit<infini::ops::DeepseekV4C4Index>(rt,key,batch.c4_slots,query,weights,batch.page_table,
-                                                  batch.c4_lengths,cache.indexer,indices);
+            if (batch.c4_sequential) {
+                indices = Tensor::empty(rt, {rows, C4SequentialIndex::kMaxCandidates}, DataType::kInt32);
+                submit<C4SequentialIndex>(rt, key, batch.c4_slots, batch.page_table,
+                                          batch.c4_lengths, cache.indexer, indices);
+            } else if (batch.c4_tp_shard && tp_size_ == 8 && index_heads_ == 64
+                       && !rt.isGraphRecording()) {
+                indices = batch.c4_score_plan
+                    ? index_balanced(rt, x, q_lora, key, batch, cache.indexer, frequencies)
+                    : index_sharded(rt, x, q_lora, key, batch, cache.indexer, frequencies);
+            } else {
+                indices = Tensor::empty(rt, {rows, C4SequentialIndex::kMaxCandidates}, DataType::kInt32);
+                const auto begin = batch.c4_query_begin;
+                const auto scored_rows = rows - begin;
+                const auto suffix = [&](const Tensor &value) {
+                    return begin ? value->narrow({{0, begin, scored_rows}}) : value;
+                };
+                auto query_input = suffix(q_lora);
+                auto query = index_query_->forward(rt, query_input)->view({scored_rows,index_heads_,128});
+                apply_rotary_tail(rt, query, suffix(batch.position), frequencies);
+                // Keep the original BF16 GEMM geometry. Changing its number
+                // of rows can alter rounding and move nearly tied candidates.
+                auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+                    auto input = part.slice(x);
+                    return index_weights_->forward(rt, input);
+                });
+                // A positive scalar common to all candidates does not change top-k.
+                submit<infini::ops::DeepseekV4C4Index>(rt, key, batch.c4_slots, query, suffix(weights),
+                                                      batch.page_table, batch.c4_lengths,
+                                                      cache.indexer, indices);
+            }
             lengths = batch.c4_sparse_lengths;
         } else if (ratio_ == 128) {
-            auto compressed = compressor_->forward(rt,x,batch.c128_sources,batch.c128_state_slots,
-                                                  cache.compressor_state,batch.c128_positions,frequencies,batch.query_offsets);
-            // Compressed NoPE values round to BF16 before FP8 cache quantization.
-            store_mla_rows(rt,cast(rt,compressed,DataType::kBFloat16),
-                           batch.c128_slots,cache.compressed,kV4PageSize/128);
+            compressor_->store_paged(rt,x,batch.c128_sources,batch.c128_state_slots,
+                                     cache.compressor_state,batch.c128_positions,frequencies,
+                                     batch.query_offsets,batch.c128_slots,cache.compressed,kV4PageSize/128);
             indices = batch.c128_indices;
             lengths = batch.c128_lengths;
         }
-        // Match the request's standalone FlashMLA partitioning and GEMM
-        // shape even when the scheduler packs multiple requests together.
+        const auto attend = [&](const RequestRows &part) {
+            return sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
+                              part.slice(batch.swa_lengths), sink_, part.slice(indices),
+                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)));
+        };
+        Tensor packed_attention;
+        // C4 can repartition the FP32 split-KV reduction when the batch grows.
+        // Packed decode MLA is limited to the tested SWA and C128 geometries.
+        if (batch.packed_decode_mla && q->dtype() == DataType::kBFloat16 && heads_ == 8 &&
+            tp_size_ == 8 && (ratio_ == 0 || ratio_ == 128)) {
+            packed_attention = attend({0, rows});
+        } else if (rt.device().type() == runtime::Device::Type::kHygon && !rt.isGraphRecording()
+            && q->dtype() == DataType::kBFloat16 && heads_ == 8 && tp_size_ == 8
+            && batch.query_offsets.size() > 2 && rows <= 32768) {
+            bool long_requests = true;
+            for_each_request(batch.query_offsets, [&](const RequestRows &part) {
+                // Keep the provider's long-prefill kernel for every query.
+                long_requests = long_requests && part.count >= 4096;
+            });
+            const auto *setting = std::getenv("INFINILM_DSV4_PACKED_PREFILL_MLA");
+            if (long_requests && (!setting || std::string_view(setting) != "0")) {
+                packed_attention = attend({0, rows});
+            }
+        }
+        // RoPE and wo_a keep their request-local projection geometry.
         auto local = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
-            auto attended = sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
-                                       part.slice(batch.swa_lengths), sink_, part.slice(indices),
-                                       part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)));
+            auto attended = packed_attention ? part.slice(packed_attention) : attend(part);
             apply_rotary_tail(rt, attended, part.slice(batch.position), frequencies, true);
             auto flattened = attended->view({part.count, heads_ * kV4HeadDim});
             return wo_a_->forward(rt, flattened);
         });
         auto contribution = static_cast<const nn::BaseLinear&>(*wo_b_).forward(rt,local);
-        return reduce_tp(rt, contribution, comm_, batch.query_offsets);
+        return reduce_tp(rt, contribution, comm_, batch.query_offsets, batch.packed_decode_collectives);
     }
 
 private:
+    Tensor index_balanced(Runtime &rt, const Tensor &x, const Tensor &q_lora, const Tensor &key,
+                          const BatchMetadata &batch, const Tensor &cache,
+                          const Tensor &frequencies) const {
+        constexpr auto top = C4SequentialIndex::kMaxCandidates;
+        const auto &plan = *batch.c4_score_plan;
+        const auto &spans = plan.scored[tp_rank_];
+        const auto count = plan.row_counts[tp_rank_];
+        auto output = Tensor::empty(rt, {x->size(0), top}, DataType::kInt32);
+        const auto empty_key = key->narrow({{0, 0, 0}});
+        const auto empty_slots = batch.c4_slots->narrow({{0, 0, 0}});
+
+        for (size_t i = 0; i < plan.sequential.size(); ++i) {
+            const auto &span = plan.sequential[i];
+            submit<C4SequentialIndex>(rt, i == 0 ? key : empty_key,
+                i == 0 ? batch.c4_slots : empty_slots, span.slice(batch.page_table),
+                span.slice(batch.c4_lengths), cache, span.slice(output));
+        }
+
+        const auto pack = [&](const Tensor &tensor) {
+            auto shape = tensor->shape();
+            shape[0] = count;
+            auto packed = Tensor::empty(rt, shape, tensor->dtype());
+            size_t first = 0;
+            for (const auto &span : spans) {
+                packed->narrow({{0, first, span.count}})->copy_from(rt, span.slice(tensor));
+                first += span.count;
+            }
+            return packed;
+        };
+        auto query_input = q_lora;
+        auto query = pack(index_query_->forward(rt, query_input))->view({count, index_heads_, 128});
+        auto positions = pack(batch.position);
+        apply_rotary_tail(rt, query, positions, frequencies);
+        auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+            auto input = part.slice(x);
+            return index_weights_->forward(rt, input);
+        });
+        auto local = Tensor::empty(rt, {plan.gathered_rows, top}, DataType::kInt32);
+        submit<infini::ops::DeepseekV4C4Index>(rt, empty_key, empty_slots, query, pack(weights),
+            pack(batch.page_table), pack(batch.c4_lengths), cache, local->narrow({{0, 0, count}}));
+        if (count < plan.gathered_rows) {
+            auto padding = local->narrow({{0, count, plan.gathered_rows - count}});
+            rt.setDeviceMemoryAsync(padding->data(), 0, padding->nbytes(), rt.stream());
+        }
+
+        auto gathered = Tensor::empty(rt, {C4ScorePlan::ranks * plan.gathered_rows, top}, DataType::kInt32);
+        engine::distributed::allgather_(rt, gathered, local, comm_);
+        for (size_t rank = 0; rank < C4ScorePlan::ranks; ++rank) {
+            size_t first = rank * plan.gathered_rows;
+            for (const auto &span : plan.scored[rank]) {
+                span.slice(output)->copy_from(rt, gathered->narrow({{0, first, span.count}}));
+                first += span.count;
+            }
+        }
+        return output;
+    }
+
+    Tensor index_sharded(Runtime &rt, const Tensor &x, const Tensor &q_lora, const Tensor &key,
+                         const BatchMetadata &batch, const Tensor &cache,
+                         const Tensor &frequencies) const {
+        constexpr auto top = C4SequentialIndex::kMaxCandidates;
+        const auto rows = x->size(0);
+        const auto prefix_rows = batch.c4_query_begin;
+        const auto scored_rows = rows - prefix_rows;
+        const auto shard_rows = (scored_rows + tp_size_ - 1) / tp_size_;
+        const auto shard_offset = tp_rank_ * shard_rows;
+        const auto first = prefix_rows + shard_offset;
+        const auto count = std::min(shard_rows, rows - first);
+        const auto take = [](const Tensor &tensor, size_t begin, size_t count) {
+            return tensor->narrow({{0, begin, count}});
+        };
+
+        const auto gathered_rows = tp_size_ * shard_rows;
+        auto gathered = Tensor::empty(rt, {prefix_rows + gathered_rows, top}, DataType::kInt32);
+        // The sequential provider writes all keys and can emit the existing
+        // common prefix. For packed requests the gathered rows cover it all.
+        const auto write_rows = std::max<size_t>(prefix_rows, 1);
+        submit<C4SequentialIndex>(rt, key, batch.c4_slots, take(batch.page_table, 0, write_rows),
+                                  take(batch.c4_lengths, 0, write_rows), cache,
+                                  take(gathered, 0, write_rows));
+
+        const bool multi_request = batch.query_offsets.size() > 2;
+        // Retain packed query projection and per-request weight projection
+        // shapes before partitioning the score and Top-512 computation.
+        auto query_input = multi_request ? q_lora : take(q_lora, first, count);
+        auto projected = index_query_->forward(rt, query_input);
+        auto query = (multi_request ? take(projected, first, count) : projected)
+                         ->view({count, index_heads_, 128});
+        apply_rotary_tail(rt, query, take(batch.position, first, count), frequencies);
+        auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+            auto input = part.slice(x);
+            return index_weights_->forward(rt, input);
+        });
+        auto local = Tensor::empty(rt, {shard_rows, top}, DataType::kInt32);
+        submit<infini::ops::DeepseekV4C4Index>(
+            rt, take(key, 0, 0), take(batch.c4_slots, 0, 0), query, take(weights, first, count),
+            take(batch.page_table, first, count), take(batch.c4_lengths, first, count), cache,
+            take(local, 0, count));
+        if (count < shard_rows) {
+            // The collective needs equal counts. Padding never reaches the attention op.
+            auto padding = take(local, count, shard_rows - count);
+            rt.setDeviceMemoryAsync(padding->data(), 0, padding->nbytes(), rt.stream());
+        }
+        engine::distributed::allgather_(rt, take(gathered, prefix_rows, gathered_rows),
+                                       local, comm_);
+        return take(gathered, 0, rows);
+    }
+
     infinicclComm_t comm_;
     size_t ratio_, heads_, index_heads_;
+    size_t tp_rank_, tp_size_;
     double eps_;
     Tensor sink_, q_ones_, kv_norm_fp32_;
     std::shared_ptr<Linear> wq_a_, wkv_, index_query_, index_weights_;
@@ -308,6 +614,14 @@ private:
     std::shared_ptr<RMSNorm> q_norm_, kv_norm_;
     std::shared_ptr<Compressor> compressor_, index_compressor_;
 };
+
+RoutedExperts make_shared_expert_route(Runtime &rt, size_t rows) {
+    auto weights = Tensor::empty(rt, {rows, 1}, DataType::kFloat32);
+    auto indices = Tensor::empty(rt, {rows, 1}, DataType::kInt64);
+    submit<infini::ops::Fill>(rt, weights, 1.0, weights);
+    submit<infini::ops::Fill>(rt, indices, 0.0, indices);
+    return {std::move(weights), std::move(indices)};
+}
 
 class FeedForward final : public weights::ModelWeights {
 public:
@@ -332,9 +646,8 @@ public:
             rt,1,c.hidden,c.intermediate,rank.tp_rank,rank.tp_size,true));
     }
 
-    Tensor forward(Runtime &rt, Tensor x, const Tensor &tokens,
-                   const std::vector<size_t> &query_offsets) const {
-        auto logits = project_requests(rt, query_offsets, [&](const RequestRows &part) {
+    Tensor forward(Runtime &rt, Tensor x, const Tensor &tokens, const BatchMetadata &batch) const {
+        auto logits = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
             auto input = part.slice(x);
             return gate_->forward(rt, input);
         });
@@ -345,16 +658,12 @@ public:
         submit<infini::ops::DeepseekV4Route>(rt,logits,bias_ ? Opt{bias_} : Opt{},
             hash_ ? Opt{tokens} : Opt{},hash_ ? Opt{hash_} : Opt{},1.0,route.weights,route.indices);
         auto routed = run_routed_experts(rt,x,route,*experts_,limit_,scale_);
-        auto ones = shared_one_, zero = shared_zero_;
-        if (x->size(0)!=1) {
-            ones = Tensor::empty(rt,{x->size(0),1},DataType::kFloat32);
-            zero = Tensor::empty(rt,{x->size(0),1},DataType::kInt64);
-            submit<infini::ops::Fill>(rt,ones,1.0,ones);
-            submit<infini::ops::Fill>(rt,zero,0.0,zero);
-        }
-        auto shared = run_routed_experts(rt,x,{ones,zero},*shared_,limit_,std::nullopt);
+        const auto shared_route = batch.shared_expert_route ? *batch.shared_expert_route
+            : x->size(0) == 1 ? RoutedExperts{shared_one_, shared_zero_}
+                              : make_shared_expert_route(rt, x->size(0));
+        auto shared = run_routed_experts(rt, x, shared_route, *shared_, limit_, std::nullopt);
         auto sum = add(rt,routed,shared);
-        return reduce_tp(rt, sum, comm_, query_offsets);
+        return reduce_tp(rt, sum, comm_, batch.query_offsets, batch.packed_decode_collectives);
     }
 
 private:
@@ -415,7 +724,7 @@ public:
         const auto next = run_mhc_post(rt,attended,residual,attention);
         const auto feed_forward = mix(rt,next,ffn_mix_,batch.query_offsets);
         const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt,feed_forward.activation),
-                                           tokens, batch.query_offsets);
+                                           tokens, batch);
         return run_mhc_post(rt,experts,next,feed_forward);
     }
 
@@ -535,6 +844,7 @@ public:
         PagedCacheWriteSet writes;
         auto batch = make_batch(rt, input, cfg_.classic_mtp_target,
                                 input.rollback_v4_cache ? &writes : nullptr);
+        batch.packed_decode_mla = batch.packed_decode_mla && ctx.model_decode_barrier && !cfg_.is_mtp;
         if (input.mtp_draft_cache_only) {
             if (!cfg_.is_mtp || input.return_draft_hidden_states || input.rollback_v4_cache ||
                 ctx.model_decode_barrier || ctx.mtp_graph_barrier) {
@@ -546,9 +856,14 @@ public:
             output.mtp_draft_cache_only_used = true;
             return output;
         }
-        if (ctx.model_decode_barrier && batch.single_decode) {
+        if (ctx.model_decode_barrier && batch.packed_decode) {
+            const auto *packed = std::getenv("INFINILM_DSV4_PACKED_DECODE");
+            batch.packed_decode_collectives = !cfg_.is_mtp && ids->numel() > 1 &&
+                rt.device().type() == runtime::Device::Type::kHygon &&
+                (!packed || std::string_view(packed) != "0");
+            const bool fused_greedy = ctx.model_decode_greedy && ids->numel() == 1;
             return decode(rt, std::move(ids), std::move(batch), *ctx.model_decode_barrier,
-                          ctx.model_decode_greedy);
+                          fused_greedy);
         }
         const auto hc = input.target_hidden_states.value_or(Tensor{});
         auto *mtp_graph_barrier = ctx.mtp_graph_barrier;
@@ -584,7 +899,10 @@ public:
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
                           false, hc, true, scratch_hc);
         }
-        return forward_logits(rt,ids,batch,hc,input.return_draft_hidden_states,input.mtp_last_logits);
+        const bool sampled_logits_only = input.sampled_logits_only && !input.sample_all_positions
+            && !cfg_.is_mtp && !input.return_draft_hidden_states && !input.mtp_scratch_step;
+        return forward_logits(rt, ids, batch, hc, input.return_draft_hidden_states,
+                              input.mtp_last_logits, sampled_logits_only);
     }
 
     bool owns_paged_decode_graph() const override {
@@ -660,22 +978,37 @@ private:
 
     Output forward_logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch,
                           const Tensor &target_hc = {},bool return_hc = false,
-                          bool last_logits = false) const {
+                          bool mtp_last_logits = false, bool sampled_logits_only = false) const {
         auto [hidden,hc] = backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc);
         // A per-token projection retains the reference's M=1 accumulation boundary
         // and leaves full packed HC available to seed or repair Draft.
         const auto requests = batch.query_offsets.size() - 1;
-        const bool select_last = last_logits && requests < ids->numel();
+        const bool select_last = (sampled_logits_only || mtp_last_logits) && requests < ids->numel();
         const auto rows = select_last ? requests : ids->numel();
-        auto output = Tensor::empty(rt,{rows,cfg_.vocab},hidden->dtype());
-        for (size_t out_row=0;out_row<rows;++out_row) {
-            const auto row = select_last ? batch.query_offsets[out_row + 1] - 1 : out_row;
-            auto input = hidden->narrow({{0,row,1}});
-            auto local = head_->forward(rt,input);
-            engine::distributed::allgather_(rt,output->narrow({{0,out_row,1}}),local,comm_);
+        Tensor output;
+        if (batch.packed_decode_collectives) {
+            // Keep the request-local M=1 LM head projection. Gather the
+            // rank-local results together, then restore request-major logits.
+            auto local = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+                auto input = part.slice(hidden);
+                return head_->forward(rt, input);
+            });
+            const auto local_vocab = local->size(1);
+            auto gathered = Tensor::empty(rt, {cfg_.vocab / local_vocab, rows, local_vocab},
+                                          local->dtype());
+            engine::distributed::allgather_(rt, gathered, local, comm_);
+            output = gathered->permute({1, 0, 2})->contiguous(rt)->view({rows, cfg_.vocab});
+        } else {
+            output = Tensor::empty(rt,{rows,cfg_.vocab},hidden->dtype());
+            for (size_t out_row=0;out_row<rows;++out_row) {
+                const auto row = select_last ? batch.query_offsets[out_row + 1] - 1 : out_row;
+                auto input = hidden->narrow({{0,row,1}});
+                auto local = head_->forward(rt,input);
+                engine::distributed::allgather_(rt,output->narrow({{0,out_row,1}}),local,comm_);
+            }
         }
         Output result{output->view({1,rows,cfg_.vocab}),std::move(hc),std::nullopt,{}};
-        result.mtp_last_logits_used = select_last;
+        result.mtp_last_logits_used = mtp_last_logits && select_last;
         return result;
     }
 
@@ -686,17 +1019,20 @@ private:
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
+        // Captured request-local slices use the full vector of row boundaries.
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
+                plan->batch.packed_decode_collectives != batch.packed_decode_collectives ||
+                plan->batch.packed_decode_mla != batch.packed_decode_mla ||
+                plan->batch.c4_sequential != batch.c4_sequential ||
+                plan->batch.c4_query_begin != batch.c4_query_begin ||
+                plan->batch.query_offsets != batch.query_offsets ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
                 return false;
             }
             if (classic_mtp) {
-                // The C++ model slices rows using these offsets while recording;
-                // equal total rows (e.g. [2,4] and [3,3]) do not share a graph.
-                if (plan->batch.query_offsets != batch.query_offsets ||
-                    static_cast<bool>(plan->target_hc) != static_cast<bool>(target_hc)) {
+                if (static_cast<bool>(plan->target_hc) != static_cast<bool>(target_hc)) {
                     return false;
                 }
                 if (target_hc && (plan->target_hc->shape() != target_hc->shape() ||
@@ -737,19 +1073,17 @@ private:
         } else {
             // Drop the least recently used graph before pinning new allocations.
             previous.reset();
-            if (classic_mtp) {
-                // The original id/position inputs and rank HC may be borrowed
-                // from the current call. Only the stable plan buffers go into
-                // the recorder; all other batch tensors were already allocated
-                // by make_batch on this worker.
-                ids = copy_graph_tensor(rt, ids);
-                batch.position = copy_graph_tensor(rt, batch.position);
+            // Keep the recorded pointers independent of caller-owned inputs.
+            ids = copy_graph_tensor(rt, ids);
+            batch.position = copy_graph_tensor(rt, batch.position);
+            // All layers use the same constant shared-expert route. Initialize it before
+            // capture to keep the Hygon Fill provider out of the decode graph.
+            if (!classic_mtp && batch.packed_decode && ids->numel() > 1) {
+                batch.shared_expert_route = make_shared_expert_route(rt, ids->numel());
             }
             DecodePlan candidate{std::move(ids), std::move(batch),
                                  copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc, {}};
-            if (classic_mtp) {
-                barrier.wait();
-            }
+            barrier.wait();
             rt.startGraphRecording(true);
             try {
                 auto recorded = forward_logits(

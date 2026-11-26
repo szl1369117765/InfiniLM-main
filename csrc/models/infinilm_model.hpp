@@ -79,6 +79,8 @@ public:
         std::shared_ptr<const engine::DeepSeekV4HostBatch> deepseek_v4_host_batch;
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
+        // Token-only callers need logits only at the sampled positions.
+        bool sampled_logits_only{false};
     };
 
     struct Output {

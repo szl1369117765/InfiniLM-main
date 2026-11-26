@@ -12,6 +12,11 @@ void apply_rotary_tail(runtime::Runtime &runtime, const runtime::Tensor &input,
                        const runtime::Tensor &positions, const runtime::Tensor &cos_sin,
                        bool inverse = false);
 
+void store_swa_rows(runtime::Runtime &runtime, const runtime::Tensor &key,
+                    const runtime::Tensor &weight, const runtime::Tensor &positions,
+                    const runtime::Tensor &frequencies, const runtime::Tensor &slots,
+                    float epsilon, const runtime::Tensor &pages);
+
 void store_mla_rows(runtime::Runtime &runtime, const runtime::Tensor &kv,
                     const runtime::Tensor &slots, const runtime::Tensor &pages,
                     size_t page_tokens);
