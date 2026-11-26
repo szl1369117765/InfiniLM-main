@@ -122,9 +122,72 @@ class _TargetTransaction:
         if self.batch_draft_seed:
             self._commit_k1_draft_batch(decisions)
         else:
-            for index, (decision, table) in enumerate(zip(decisions, self.tables)):
-                self._commit_owner(decision, table, self.batch.input_offsets[index])
+            retained = (None,) * len(decisions)
+            if (self.transport.batched_target_replay and len(decisions) in (2, 3)
+                    and self.verify_hidden is None and self.scratch_commit is None and not self.proposal_laws):
+                retained = self._batch_retained_target(decisions)
+            if self.transport.batched_draft_repair and retained[0] is not None:
+                self._commit_draft_repair_batch(decisions, retained)
+            else:
+                for index, (decision, table, replay) in enumerate(zip(decisions, self.tables, retained, strict=True)):
+                    self._commit_owner(decision, table, self.batch.input_offsets[index], replay)
         self.committed = True
+
+    def _commit_draft_repair_batch(self, decisions, retained):
+        updates, by_depth = {}, []
+        for intent, table, (tokens, start, hidden) in zip(decisions, self.tables, retained, strict=True):
+            updates[intent.owner] = _DraftState(
+                _slice_hidden(hidden, len(tokens) - 1, 1), intent.next_anchor, intent.retain_length,
+            )
+            if intent.terminal:
+                continue
+            # Keep each owner's q1 writes causal. Each Draft input consumes the
+            # HC of the previous Target token in the retained prefix.
+            for offset, token in enumerate(tokens[1:]):
+                if offset == len(by_depth):
+                    by_depth.append([])
+                by_depth[offset].append(
+                    _DraftSegment((token,), start + offset, table, _slice_hidden(hidden, offset, 1))
+                )
+
+        for segments in by_depth:
+            if len(segments) == 1:
+                (segment,) = segments
+                self.transport._write_draft_cache(segment.tokens, segment.start, segment.table, segment.hidden)
+            else:
+                self.transport._forward_draft_segments(segments, return_hidden=False)
+        self.transport.states.update(updates)
+
+    def _batch_retained_target(self, decisions):
+        # The verify rolled back the full speculative spans. Materialize only
+        # their accepted prefixes, keeping independent pages and owner order.
+        rows, requests, expected = [], [], []
+        offsets, totals, cumulative = [0], [], [0]
+        for index, (intent, request) in enumerate(zip(decisions, self.batch.requests, strict=True)):
+            begin = self.batch.input_offsets[index]
+            span = self.rows[begin:begin + len(intent.materialized_rows)]
+            rows.extend(replace(row.row, flat_index=offsets[-1] + local) for local, row in enumerate(span))
+            expected.extend(row.predicted_token for row in span)
+            requests.append(replace(request, draft_tokens=tuple(row.row.input_token for row in span[1:])))
+            offsets.append(len(rows))
+            totals.append(intent.retain_length)
+            cumulative.append(cumulative[-1] + intent.retain_length)
+        retained = replace(
+            self.batch, requests=tuple(requests), rows=tuple(rows), input_offsets=tuple(offsets),
+            total_kv_lengths=tuple(totals), cu_seqlens=tuple(cumulative),
+        )
+        actual, hidden = self.transport._forward_packed(
+            self.transport.target, retained, self.tables, return_hidden=True,
+        )
+        if actual != tuple(expected):
+            raise RuntimeError(f"MTP packed Target replay disagrees: verify={tuple(expected)}, replay={actual}")
+        rank_count = len(self.transport.states[decisions[0].owner].hidden)
+        if not hidden or len(hidden) != rank_count or any(tensor.shape[0] != len(rows) for tensor in hidden):
+            raise RuntimeError("MTP packed Target replay requires every retained HC row on every rank")
+        return tuple(
+            (retained.input_ids[begin:end], rows[begin].position, _slice_hidden(hidden, begin, end - begin))
+            for begin, end in zip(offsets[:-1], offsets[1:], strict=True)
+        )
 
     def _retained_target(self, intent, table, begin):
         count = len(intent.materialized_rows)
@@ -175,13 +238,13 @@ class _TargetTransaction:
                 self.transport._write_draft_cache(segment.tokens, segment.start, segment.table, segment.hidden)
         self.transport.states.update(updates)
 
-    def _commit_owner(self, intent, table, begin):
+    def _commit_owner(self, intent, table, begin, replay=None):
         if self.scratch_commit is not None:
             start = self.rows[begin].row.position
             tokens = tuple(row.input_token for row in intent.materialized_rows)
             self._commit_scratch(intent, table, start, tokens)
             return
-        tokens, start, hidden = self._retained_target(intent, table, begin)
+        tokens, start, hidden = replay if replay is not None else self._retained_target(intent, table, begin)
         count = len(tokens)
         seed = None
         if not intent.terminal:
@@ -253,7 +316,8 @@ class _V4Transport:
                  direct_k23_commit=False, reuse_seed=False, draft_cache_only=False,
                  terminal_tail_trim=False, cpu_metadata_shadow=False,
                  shared_compression_plan=False, stepwise_direct_commit=False,
-                 batched_draft=False, last_logits=False, k1_graph_seed=False):
+                 batched_draft=False, last_logits=False, k1_graph_seed=False,
+                 batched_target_replay=False, batched_draft_repair=False):
         self.target = target
         self.draft = draft
         self.core = core
@@ -267,6 +331,8 @@ class _V4Transport:
         self.shared_compression_plan = shared_compression_plan
         self.stepwise_direct_commit = stepwise_direct_commit
         self.batched_draft = batched_draft
+        self.batched_target_replay = batched_target_replay
+        self.batched_draft_repair = batched_draft_repair
         self.last_logits = last_logits
         self.k1_graph_seed = k1_graph_seed
         self.states = {}
@@ -915,6 +981,26 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
     direct_k23_commit = _direct_k23_commit_enabled(config, target_engine)
     draft_cache_only = _draft_cache_only_enabled(config, InferEngine)
     batched_draft = _batched_draft_enabled(config)
+    # The protected verify still rolls back in Graph mode. Only the subsequent
+    # materialization of its retained rows is batched, using the eager HC path.
+    if config.enable_graph:
+        replay_requested = (
+            os.getenv("INFINILM_MTP_GRAPH_BATCHED_TARGET_REPLAY") == "1"
+            and config.num_draft_tokens == 3
+            and not graph_direct_k3_commit
+        )
+    else:
+        replay_requested = os.getenv("INFINILM_MTP_BATCHED_TARGET_REPLAY") == "1"
+    batched_target_replay = (
+        replay_requested and config.max_batch_size in (2, 3)
+        and config.nextn_branch_draft_lengths is None
+    )
+    batched_draft_repair = (
+        os.getenv("INFINILM_MTP_GRAPH_BATCHED_DRAFT_REPAIR") == "1"
+        and config.enable_graph and config.num_draft_tokens == 3
+        and config.max_batch_size in (2, 3) and config.nextn_branch_draft_lengths is None
+        and not graph_direct_k3_commit
+    )
     k1_graph_seed = _k1_graph_seed_enabled(config, InferEngine)
     last_logits = os.getenv("INFINILM_MTP_LAST_LOGITS") == "1" and not config.enable_graph
     if last_logits and getattr(InferEngine, "mtp_last_logits_version", 0) != 1:
@@ -926,7 +1012,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         distributed_config=DistConfig(config.tensor_parallel_size),
         cache_config=PagedKVCacheConfig(
             num_blocks=config.num_blocks, block_size=config.block_size,
-            max_batch_size=config.max_batch_size if batched_draft else 1,
+            max_batch_size=config.max_batch_size if batched_draft or batched_draft_repair else 1,
         ),
         enable_graph_compiling=config.enable_graph,
         attention_backend="paged-attn",
@@ -948,12 +1034,13 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
     logger.info(
         "Classic NextN K=%s graph=%s branches=%s branch_execution=%s direct_k1=%s direct_k23=%s "
         "draft_seed=%s draft_cache_only=%s batched_draft=%s k1_graph_seed=%s last_logits=%s terminal_tail_trim=%s "
-        "cpu_metadata_shadow=%s shared_compression_plan=%s stepwise_direct_commit=%s",
+        "cpu_metadata_shadow=%s shared_compression_plan=%s stepwise_direct_commit=%s "
+        "batched_target_replay=%s batched_draft_repair=%s",
         config.num_draft_tokens, config.enable_graph, config.nextn_branch_draft_lengths,
         config.nextn_branch_execution, direct_k1_commit, direct_k23_commit, reuse_seed,
         draft_cache_only, batched_draft, k1_graph_seed, last_logits, terminal_tail_trim,
         cpu_metadata_shadow or shared_compression_plan,
-        shared_compression_plan, stepwise_direct_commit,
+        shared_compression_plan, stepwise_direct_commit, batched_target_replay, batched_draft_repair,
     )
     return _V4Transport(
         target_engine, draft, _core, config.block_size,
@@ -962,5 +1049,6 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         terminal_tail_trim=terminal_tail_trim,
         cpu_metadata_shadow=cpu_metadata_shadow, shared_compression_plan=shared_compression_plan,
         stepwise_direct_commit=stepwise_direct_commit, batched_draft=batched_draft, last_logits=last_logits,
-        k1_graph_seed=k1_graph_seed,
+        k1_graph_seed=k1_graph_seed, batched_target_replay=batched_target_replay,
+        batched_draft_repair=batched_draft_repair,
     )
