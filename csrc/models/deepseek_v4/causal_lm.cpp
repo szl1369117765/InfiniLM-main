@@ -756,7 +756,7 @@ private:
         Tensor sampled_ids;
         bool greedy;
         bool return_hc;
-        std::array<bool, 4> short_kernel_modes;
+        std::array<bool, 5> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
         size_t packed_mhc_calls = 0;
     };
@@ -825,12 +825,13 @@ private:
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
+        const bool m12_hygon = ids->numel() == 12 && rt.device().type() == runtime::Device::Type::kHygon;
         const std::array short_kernel_modes{
             env_enabled("INFINIOPS_V4_C128_POOL_SHORT"),
             env_enabled("INFINI_HYGON_MOE_Q4_GROUP"),
             env_enabled("INFINIOPS_V4_I8_PROJECTION_Q4"),
-            ids->numel() == 12 && rt.device().type() == runtime::Device::Type::kHygon &&
-                env_enabled("INFINI_HYGON_MOE_M12_GROUP"),
+            m12_hygon && env_enabled("INFINI_HYGON_MOE_M12_GROUP"),
+            m12_hygon && env_enabled("INFINIOPS_V4_I8_PROJECTION_M12"),
         };
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
