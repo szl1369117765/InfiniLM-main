@@ -38,6 +38,8 @@ using RowLinear = nn::RowParallelLinear;
 using RMSNorm = layers::RMSNorm;
 using Quant = quantization::CompressedTensors;
 
+constexpr size_t kV4TensorParallelSize = 8;
+
 struct V4Config {
     size_t hidden, vocab, heads, output_groups, q_rank, o_rank, experts, intermediate;
     size_t topk, hash_layers, index_heads, streams, iterations, max_positions;
@@ -65,7 +67,8 @@ struct V4Config {
             json.at("quantization_config").value("quant_method", "") != std::string("compressed-tensors")) {
             throw std::invalid_argument("DeepSeek V4 mainline currently requires the channel INT8 W8A8 checkpoint");
         }
-        if (rank.device.type() != runtime::Device::Type::kHygon || rank.tp_size != 8 || rank.pp_size != 1 ||
+        if (rank.device.type() != runtime::Device::Type::kHygon ||
+            rank.tp_size != kV4TensorParallelSize || rank.pp_size != 1 ||
             rank.tp_rank < 0 || rank.tp_rank >= rank.tp_size || !rank.comm ||
             config.get_dtype() != DataType::kBFloat16 || config.get<size_t>("head_dim") != 512 ||
             config.get<size_t>("qk_rope_head_dim") != 64 || config.get<size_t>("num_key_value_heads") != 1 ||
@@ -225,6 +228,26 @@ std::optional<C4ScorePlan> make_c4_score_plan(const int32_t *lengths, size_t row
     return plan;
 }
 
+// Three short verify spans can contribute up to four rows apiece.
+constexpr size_t kPackedSharedExpertRows = 3 * 4;
+constexpr size_t kC4IndexWidth = 128;
+constexpr size_t kC4IndexTopK = 512;
+constexpr size_t kC4IndexMaxUnscoredPages = kC4IndexTopK / (kV4PageSize / 4);
+
+bool env_enabled(const char *name) {
+    const auto *mode = std::getenv(name);
+    return mode && std::string_view(mode) == "1";
+}
+
+bool packed_shared_constants_enabled() {
+    return env_enabled("INFINILM_MTP_GRAPH_PACKED_SHARED_EXPERT_CONSTANTS");
+}
+
+bool k3_draft_seed_enabled() {
+    const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED");
+    return mode && std::string_view(mode) == "1";
+}
+
 struct BatchMetadata {
     Tensor position, swa_indices, swa_lengths, swa_slots, page_table;
     Tensor c4_slots, c4_positions, c4_lengths, c4_sparse_lengths, c4_sources, c4_state_slots;
@@ -238,6 +261,16 @@ struct BatchMetadata {
     std::optional<RoutedExperts> shared_expert_route{};
     bool packed_decode_collectives{};
     bool packed_decode_mla{};
+    bool packed_shared_constants{};
+    bool short_c4_index{};
+    bool packed_collectives{};
+    bool packed_mhc_pre{};
+    bool c128_no_store{};
+    bool c128_state_only{};
+    bool share_flashmla_schedule{};
+    // Derived from the current execution's stable length buffers by Graph nodes.
+    // Keep these outputs out of tensors(), which enumerates only incoming copies.
+    std::array<Tensor, 3> flashmla_schedules{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -245,6 +278,10 @@ struct BatchMetadata {
             &c128_slots,&c128_positions,&c128_indices,&c128_lengths,&c128_sources,&c128_state_slots};
     }
 };
+
+constexpr size_t flashmla_schedule_index(size_t ratio) {
+    return ratio == 0 ? 0 : ratio == 4 ? 1 : 2;
+}
 
 bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) {
     if (offsets.size() < 2 || offsets.size() > 4 ||
@@ -348,6 +385,16 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
             c4_score_plan = make_c4_score_plan(c4_lengths, rows);
         }
     }
+    bool c128_no_store = false;
+    if (classic_mtp_target && input.mtp_graph_direct_commit && query_offsets.size() == 2 &&
+        short_verify_layout(query_offsets, positions->numel()) &&
+        rt.device().type() == runtime::Device::Type::kHygon &&
+        env_enabled("INFINILM_MTP_GRAPH_K3_C128_STATE_ONLY") &&
+        env_enabled("INFINIOPS_V4_C128_POOL_SHORT")) {
+        const auto *slots = reinterpret_cast<const int32_t *>(metadata.c128_out_loc->data());
+        c128_no_store = std::all_of(slots, slots + metadata.c128_out_loc->numel(),
+                                    [](int32_t slot) { return slot == -1; });
+    }
     BatchMetadata batch{input.position_ids.value()->view({positions->numel()}),
             device(metadata.swa_indices), device(metadata.swa_topk_lengths), device(metadata.raw_out_loc),
             device(metadata.page_table), device(metadata.c4_out_loc), device(metadata.c4_positions),
@@ -367,6 +414,7 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
                 : tested_context(reinterpret_cast<const int32_t*>(positions->data()));
         }
     }
+    batch.c128_no_store = c128_no_store;
     return batch;
 }
 
@@ -403,6 +451,13 @@ public:
         kv_norm_fp32_ = cast(rt,kv_norm_->weight(),DataType::kFloat32);
     }
 
+    void write_swa(Runtime &rt, const Tensor &x, const BatchMetadata &batch,
+                   const LayerPagedCache &cache, const Tensor &frequencies) const {
+        auto key = wkv_->forward(rt, x);
+        store_swa_rows(rt,key,kv_norm_fp32_,batch.position,frequencies,
+                       batch.swa_slots,static_cast<float>(eps_),cache.swa);
+    }
+
     Tensor forward(Runtime &rt, Tensor x, const BatchMetadata &batch, const LayerPagedCache &cache,
                    const Tensor &frequencies) const {
         const auto rows = x->size(0);
@@ -410,9 +465,7 @@ public:
         auto q_raw = wq_b_->forward(rt,q_lora)->view({rows,heads_,kV4HeadDim});
         const auto eps = static_cast<float>(eps_);
         auto q = normalize_query_and_rotate(rt, q_raw, q_ones_, eps, batch.position, frequencies);
-        auto key = wkv_->forward(rt, x);
-        store_swa_rows(rt, key, kv_norm_fp32_, batch.position, frequencies,
-                       batch.swa_slots, eps, cache.swa);
+        write_swa(rt,x,batch,cache,frequencies);
         Tensor indices, lengths;
         if (ratio_ == 4) {
             compressor_->store_paged(rt,x,batch.c4_sources,batch.c4_state_slots,
@@ -421,7 +474,14 @@ public:
             auto key = index_compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
                                                  cache.indexer_state,batch.c4_positions,frequencies,batch.query_offsets);
             key = cast(rt,key,DataType::kBFloat16);
-            if (batch.c4_sequential) {
+            if (batch.short_c4_index) {
+                // This table is too short for scoring. The key still updates the cache.
+                auto query = key->view({rows, 1, kC4IndexWidth});
+                auto weights = key->view({key->numel()})->narrow({{0, 0, rows}})->view({rows, 1});
+                indices = Tensor::empty(rt,{rows,kC4IndexTopK},DataType::kInt32);
+                submit<infini::ops::DeepseekV4C4Index>(rt,key,batch.c4_slots,query,weights,batch.page_table,
+                                                      batch.c4_lengths,cache.indexer,indices);
+            } else if (batch.c4_sequential) {
                 indices = Tensor::empty(rt, {rows, C4SequentialIndex::kMaxCandidates}, DataType::kInt32);
                 submit<C4SequentialIndex>(rt, key, batch.c4_slots, batch.page_table,
                                           batch.c4_lengths, cache.indexer, indices);
@@ -453,16 +513,22 @@ public:
             }
             lengths = batch.c4_sparse_lengths;
         } else if (ratio_ == 128) {
-            compressor_->store_paged(rt,x,batch.c128_sources,batch.c128_state_slots,
-                                     cache.compressor_state,batch.c128_positions,frequencies,
-                                     batch.query_offsets,batch.c128_slots,cache.compressed,kV4PageSize/128);
+            if (batch.c128_state_only) {
+                compressor_->update_state(rt, x, batch.c128_state_slots, cache.compressor_state,
+                                          batch.query_offsets);
+            } else {
+                compressor_->store_paged(rt,x,batch.c128_sources,batch.c128_state_slots,
+                                         cache.compressor_state,batch.c128_positions,frequencies,
+                                         batch.query_offsets,batch.c128_slots,cache.compressed,kV4PageSize/128);
+            }
             indices = batch.c128_indices;
             lengths = batch.c128_lengths;
         }
         const auto attend = [&](const RequestRows &part) {
             return sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
                               part.slice(batch.swa_lengths), sink_, part.slice(indices),
-                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)));
+                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)),
+                              batch.flashmla_schedules[flashmla_schedule_index(ratio_)]);
         };
         Tensor packed_attention;
         // C4 can repartition the FP32 split-KV reduction when the batch grows.
@@ -491,7 +557,8 @@ public:
             return wo_a_->forward(rt, flattened);
         });
         auto contribution = static_cast<const nn::BaseLinear&>(*wo_b_).forward(rt,local);
-        return reduce_tp(rt, contribution, comm_, batch.query_offsets, batch.packed_decode_collectives);
+        return reduce_tp(rt, contribution, comm_, batch.query_offsets,
+                         batch.packed_decode_collectives || batch.packed_collectives);
     }
 
 private:
@@ -642,6 +709,17 @@ public:
         const int64_t zero=0;
         rt.memcpyH2D(shared_one_->data(),&one,sizeof(one),false);
         rt.memcpyH2D(shared_zero_->data(),&zero,sizeof(zero),false);
+        if ((c.classic_mtp_target && !c.is_mtp && packed_shared_constants_enabled())
+            || (c.is_mtp && k3_draft_seed_enabled())) {
+            const Shape shape{kPackedSharedExpertRows, 1};
+            std::array<float, kPackedSharedExpertRows> ones;
+            ones.fill(1.f);
+            const std::array<int64_t, kPackedSharedExpertRows> zeros{};
+            packed_shared_ones_ = Tensor::empty(rt, shape, DataType::kFloat32);
+            packed_shared_zeros_ = Tensor::empty(rt, shape, DataType::kInt64);
+            rt.memcpyH2D(packed_shared_ones_->data(), ones.data(), sizeof(ones), false);
+            rt.memcpyH2D(packed_shared_zeros_->data(), zeros.data(), sizeof(zeros), false);
+        }
         shared_ = bind_child("shared_experts",std::make_shared<W8A8ExpertWeights>(
             rt,1,c.hidden,c.intermediate,rank.tp_rank,rank.tp_size,true));
     }
@@ -658,12 +736,20 @@ public:
         submit<infini::ops::DeepseekV4Route>(rt,logits,bias_ ? Opt{bias_} : Opt{},
             hash_ ? Opt{tokens} : Opt{},hash_ ? Opt{hash_} : Opt{},1.0,route.weights,route.indices);
         auto routed = run_routed_experts(rt,x,route,*experts_,limit_,scale_);
-        const auto shared_route = batch.shared_expert_route ? *batch.shared_expert_route
-            : x->size(0) == 1 ? RoutedExperts{shared_one_, shared_zero_}
+        auto shared_route = batch.shared_expert_route ? *batch.shared_expert_route
+            : batch.packed_shared_constants || x->size(0) == 1 ? RoutedExperts{shared_one_, shared_zero_}
                               : make_shared_expert_route(rt, x->size(0));
+        if (batch.packed_shared_constants) {
+            const auto rows = x->size(0);
+            // The shared expert always consumes weight 1 and expert ID 0.
+            auto ones = packed_shared_ones_->narrow({{0, 0, rows}});
+            auto zero = packed_shared_zeros_->narrow({{0, 0, rows}});
+            shared_route = {std::move(ones), std::move(zero)};
+        }
         auto shared = run_routed_experts(rt, x, shared_route, *shared_, limit_, std::nullopt);
         auto sum = add(rt,routed,shared);
-        return reduce_tp(rt, sum, comm_, batch.query_offsets, batch.packed_decode_collectives);
+        return reduce_tp(rt, sum, comm_, batch.query_offsets,
+                         batch.packed_decode_collectives || batch.packed_collectives);
     }
 
 private:
@@ -671,23 +757,38 @@ private:
     double scale_, limit_;
     infinicclComm_t comm_;
     Tensor hash_, bias_, shared_one_, shared_zero_;
+    Tensor packed_shared_ones_, packed_shared_zeros_;
     std::shared_ptr<Linear> gate_;
     std::shared_ptr<W8A8ExpertWeights> experts_, shared_;
 };
 
 HyperConnectionMix run_mhc(Runtime &rt, const Tensor &x, const MixWeights &w,
                            double norm_eps, double mix_eps, size_t iterations,
-                           const std::vector<size_t> &query_offsets) {
+                           const BatchMetadata &batch, size_t *packed_mhc_calls) {
     const auto rows = x->size(0), streams = x->size(1);
     HyperConnectionMix out{Tensor::empty(rt, {rows, x->size(2)}, x->dtype()),
                            Tensor::empty(rt, {rows, streams}, DataType::kFloat32),
                            Tensor::empty(rt, {rows, streams, streams}, DataType::kFloat32)};
-    // The Hygon operator selects a projection/reduction from its row count.
-    for_each_request(query_offsets, [&](const RequestRows &part) {
+    const auto submit_mix = [&](const Tensor &input, const Tensor &activation,
+                                const Tensor &post, const Tensor &combination) {
         submit<infini::ops::DeepseekV4MhcPre>(
-            rt, part.slice(x), w.projection, w.scale, w.base, norm_eps, mix_eps,
-            static_cast<int64_t>(iterations), part.slice(out.activation),
-            part.slice(out.post), part.slice(out.combination));
+            rt, input, w.projection, w.scale, w.base, norm_eps, mix_eps,
+            static_cast<int64_t>(iterations), activation, post, combination);
+    };
+    // Flash BF16 q2–q4 and packed M6–M12 use the same per-row reduction.
+    // A contiguous row preserves the alignment of every owner slice.
+    if (batch.packed_mhc_pre && rt.device().type() == runtime::Device::Type::kHygon &&
+        x->ndim() == 3 && x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
+        rows >= 6 && rows <= 12 && streams == 4 && x->size(2) == 4096) {
+        submit_mix(x, out.activation, out.post, out.combination);
+        if (packed_mhc_calls) {
+            ++*packed_mhc_calls;
+        }
+        return out;
+    }
+    for_each_request(batch.query_offsets, [&](const RequestRows &part) {
+        submit_mix(part.slice(x), part.slice(out.activation),
+                   part.slice(out.post), part.slice(out.combination));
     });
     return out;
 }
@@ -718,20 +819,25 @@ public:
     }
 
     Tensor forward(Runtime &rt, const Tensor &residual, const Tensor &tokens,
-                   const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies) const {
-        const auto attention = mix(rt,residual,attn_mix_,batch.query_offsets);
-        const auto attended = attn_->forward(rt,attn_norm_->forward(rt,attention.activation),batch,cache,frequencies);
+                   const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies,
+                   size_t *packed_mhc_calls, bool cache_write_only) const {
+        const auto attention = mix(rt,residual,attn_mix_,batch,packed_mhc_calls);
+        const auto normalized = attn_norm_->forward(rt,attention.activation);
+        if (cache_write_only) {
+            attn_->write_swa(rt,normalized,batch,cache,frequencies);
+            return {};
+        }
+        const auto attended = attn_->forward(rt,normalized,batch,cache,frequencies);
         const auto next = run_mhc_post(rt,attended,residual,attention);
-        const auto feed_forward = mix(rt,next,ffn_mix_,batch.query_offsets);
-        const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt,feed_forward.activation),
-                                           tokens, batch);
+        const auto feed_forward = mix(rt,next,ffn_mix_,batch,packed_mhc_calls);
+        const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt,feed_forward.activation), tokens, batch);
         return run_mhc_post(rt,experts,next,feed_forward);
     }
 
 private:
     HyperConnectionMix mix(Runtime &rt, const Tensor &x, const MixWeights &w,
-                           const std::vector<size_t> &query_offsets) const {
-        return run_mhc(rt, x, w, norm_eps_, mix_eps_, iterations_, query_offsets);
+                           const BatchMetadata &batch, size_t *packed_mhc_calls) const {
+        return run_mhc(rt, x, w, norm_eps_, mix_eps_, iterations_, batch, packed_mhc_calls);
     }
     double norm_eps_, mix_eps_;
     size_t iterations_;
@@ -766,8 +872,23 @@ public:
     std::pair<Tensor,Tensor> forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
                    const std::vector<LayerPagedCache> &caches,
                    const Tensor &swa_rope, const Tensor &compressed_rope,
-                   const Tensor &target_hc, bool return_hc, bool cache_only = false) const {
+                   const Tensor &target_hc, bool return_hc, bool cache_only = false,
+                   size_t *packed_mhc_calls = nullptr, bool eager_cache_write_only = false) const {
         const auto rows = tokens->numel();
+        const bool cache_write_only = eager_cache_write_only ||
+            (cache_only && batch.query_offsets.size() != 2);
+        if (cache_write_only) {
+            constexpr std::array<size_t, 2> eager_offsets{0, 1};
+            constexpr std::array<size_t, 4> packed_offsets{0, 1, 2, 3};
+            const auto &offsets = batch.query_offsets;
+            const bool layout_ok = eager_cache_write_only
+                ? rows == 1 && std::equal(offsets.begin(), offsets.end(), eager_offsets.begin(), eager_offsets.end())
+                : rows == 3 && std::equal(offsets.begin(), offsets.end(), packed_offsets.begin(), packed_offsets.end());
+            if (!cache_only || !is_mtp_ || layers_.size() != 1 || caches.size() != 1 ||
+                caches.front().compression_ratio != 0 || !layout_ok) {
+                throw std::invalid_argument("Classic NextN output-free repair requires one SWA layer and a supported q1 layout");
+            }
+        }
         const Shape hc_shape{rows,streams_,hidden_};
         if (is_mtp_ && (!target_hc || target_hc->shape() != hc_shape ||
                         target_hc->dtype() != DataType::kBFloat16 || target_hc->device() != rt.device())) {
@@ -792,7 +913,8 @@ public:
         }
         for (size_t i=0;i<layers_.size();++i) {
             residual = layers_[i]->forward(rt,residual,tokens,batch,caches[i],
-                                           caches[i].compression_ratio ? compressed_rope : swa_rope);
+                                           caches[i].compression_ratio ? compressed_rope : swa_rope,
+                                           packed_mhc_calls,cache_write_only);
         }
         if (cache_only) {
             return {};
@@ -803,7 +925,7 @@ public:
             hc_output->copy_from(rt,residual);
         }
         auto normalized = norm_->forward(rt,run_mhc(
-            rt,residual,head_,rms_eps_,hc_eps_,0,batch.query_offsets).activation);
+            rt,residual,head_,rms_eps_,hc_eps_,0,batch,packed_mhc_calls).activation);
         return {std::move(normalized),std::move(hc_output)};
     }
 
@@ -831,6 +953,9 @@ public:
         reuse_snapshot_buffer_ = reuse && std::string_view(reuse) == "1";
         const auto *k1_seed = std::getenv("INFINILM_MTP_K1_GRAPH_SEED");
         k1_graph_seed_ = cfg_.is_mtp && k1_seed && std::string_view(k1_seed) == "1";
+        packed_shared_constants_prepared_ =
+            cfg_.classic_mtp_target && !cfg_.is_mtp && packed_shared_constants_enabled();
+        draft_seed_constants_prepared_ = cfg_.is_mtp && k3_draft_seed_enabled();
         backbone_ = bind_child("model",std::make_shared<Backbone>(rt,cfg_,rank));
         head_ = bind_child("lm_head",std::make_shared<ColumnLinear>(
             rt,cfg_.hidden,cfg_.vocab,false,DataType::kBFloat16,rank.tp_rank,rank.tp_size));
@@ -845,13 +970,43 @@ public:
         auto batch = make_batch(rt, input, cfg_.classic_mtp_target,
                                 input.rollback_v4_cache ? &writes : nullptr);
         batch.packed_decode_mla = batch.packed_decode_mla && ctx.model_decode_barrier && !cfg_.is_mtp;
+        if (input.mtp_eager_packed_direct_commit) {
+            if (!cfg_.classic_mtp_target || cfg_.is_mtp || input.target_hidden_states
+                || !input.return_draft_hidden_states || !input.sample_all_positions
+                || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_draft_cache_only
+                || input.mtp_last_logits || input.mtp_graph_direct_commit || input.mtp_graph_draft_seed
+                || ctx.model_decode_barrier || ctx.mtp_graph_barrier || ctx.mtp_snapshot_barrier
+                || batch.query_offsets.size() != 4 || !short_verify_layout(batch.query_offsets, ids->numel())) {
+                throw std::invalid_argument("Packed eager direct MTP requires complete three-owner Target queries");
+            }
+            const auto &modes = input.mtp_eager_target_modes;
+            batch.packed_collectives = modes.packed_collectives;
+            batch.packed_mhc_pre = modes.packed_mhc_pre;
+            const auto table_width = batch.page_table->size(1);
+            batch.short_c4_index = modes.short_c4_index
+                && rt.device().type() == runtime::Device::Type::kHygon
+                && table_width > 0 && table_width <= kC4IndexMaxUnscoredPages;
+            size_t packed_mhc_calls = 0;
+            auto output = forward_logits(rt, ids, batch, {}, true, false,
+                                         modes.packed_mhc_pre ? &packed_mhc_calls : nullptr);
+            const auto &prepared = input.deepseek_v4_host_batch;
+            output.mtp_eager_target_receipt = EagerPackedTargetModes{
+                batch.packed_collectives,
+                prepared && bool(prepared->plans()),
+                packed_mhc_calls == cfg_.ratios.size() * 2 + 1,
+                batch.short_c4_index
+                    && std::find(cfg_.ratios.begin(), cfg_.ratios.end(), 4) != cfg_.ratios.end(),
+            };
+            return output;
+        }
         if (input.mtp_draft_cache_only) {
             if (!cfg_.is_mtp || input.return_draft_hidden_states || input.rollback_v4_cache ||
                 ctx.model_decode_barrier || ctx.mtp_graph_barrier) {
                 throw std::invalid_argument("Classic NextN cache-only is an eager Draft write");
             }
             backbone_->forward(rt, ids, batch, caches_, swa_rope_, compressed_rope_,
-                               input.target_hidden_states.value_or(Tensor{}), false, true);
+                               input.target_hidden_states.value_or(Tensor{}), false, true,
+                               nullptr, input.mtp_eager_c3_draft_repair_cache_only);
             Output output{};
             output.mtp_draft_cache_only_used = true;
             return output;
@@ -867,9 +1022,16 @@ public:
         }
         const auto hc = input.target_hidden_states.value_or(Tensor{});
         auto *mtp_graph_barrier = ctx.mtp_graph_barrier;
+        const bool short_verify = short_verify_layout(batch.query_offsets, ids->numel());
+        const bool packed_target = cfg_.classic_mtp_target && !cfg_.is_mtp && !hc &&
+            (batch.query_offsets.size() == 2 || batch.query_offsets.size() == 4) && short_verify;
+        const bool direct_hc = input.mtp_graph_direct_commit && packed_target &&
+            input.return_draft_hidden_states && !input.rollback_v4_cache;
         const bool short_target = !cfg_.is_mtp && !hc &&
-            (input.mtp_scratch_step || (input.rollback_v4_cache &&
-                short_verify_layout(batch.query_offsets, ids->numel())));
+            (input.mtp_scratch_step || direct_hc || (input.rollback_v4_cache && short_verify));
+        const bool draft_seed_graph = input.mtp_graph_draft_seed && cfg_.is_mtp && hc &&
+            input.return_draft_hidden_states && !input.sample_all_positions && !input.rollback_v4_cache &&
+            batch.query_offsets.size() == 2 && short_verify;
         // The K1 proposal already wrote its anchor. Repair and the next seed
         // form one two-row Draft span with only the last prediction sampled.
         const bool short_draft = cfg_.is_mtp && hc && !input.rollback_v4_cache &&
@@ -878,9 +1040,43 @@ public:
                                   batch.query_offsets.front() == 0 && batch.query_offsets.back() == 2));
         const bool scratch_hc = input.mtp_scratch_step && input.return_draft_hidden_states &&
             short_target && !input.rollback_v4_cache;
+        const bool owned_hc = scratch_hc || direct_hc || draft_seed_graph;
         // Eligibility must agree across ranks before any capture or collective.
-        const bool capture_mtp = mtp_graph_barrier && mtp_graph_barrier->all(
-            (!input.return_draft_hidden_states || scratch_hc) && (short_target || short_draft));
+        const bool local_capture =
+            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph);
+        bool capture_mtp = false;
+        if (mtp_graph_barrier && input.mtp_graph_direct_commit && batch.query_offsets.size() == 2) {
+            // Choose the same C128 graph on every rank, together with Graph eligibility.
+            const unsigned common = mtp_graph_barrier->common_decode_slots(
+                (local_capture ? 1u : 0u) | (direct_hc && batch.c128_no_store ? 2u : 0u));
+            capture_mtp = (common & 1u) != 0;
+            batch.c128_state_only = capture_mtp && (common & 2u) != 0;
+        } else if (mtp_graph_barrier) {
+            capture_mtp = mtp_graph_barrier->all(local_capture);
+        }
+        // Both arms share the same immutable routes. No multi-row Fill is recorded.
+        batch.packed_shared_constants = capture_mtp && packed_target &&
+            (input.rollback_v4_cache || direct_hc) &&
+            packed_shared_constants_prepared_ && packed_shared_constants_enabled();
+        if (capture_mtp && draft_seed_graph && draft_seed_constants_prepared_) {
+            const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED_CONSTANTS");
+            // The existing plan key compares this bit before replaying a graph.
+            batch.packed_shared_constants = mode && std::string_view(mode) == "1";
+        }
+        if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
+            throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
+        }
+        batch.packed_collectives = capture_mtp && direct_hc && batch.query_offsets.size() == 4 &&
+            env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_TARGET_COLLECTIVES");
+        constexpr std::array<size_t, 4> c3_q4_offsets{0, 4, 8, 12};
+        batch.packed_mhc_pre = capture_mtp && direct_hc &&
+            rt.device().type() == runtime::Device::Type::kHygon &&
+            env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_MHC_PRE") &&
+            std::equal(batch.query_offsets.begin(), batch.query_offsets.end(),
+                       c3_q4_offsets.begin(), c3_q4_offsets.end());
+        if (input.mtp_graph_draft_seed && !capture_mtp) {
+            throw std::runtime_error("Classic NextN Graph Draft seed requires a device Graph with owned Draft HC");
+        }
         if (input.rollback_v4_cache) {
             if (!ctx.mtp_snapshot_barrier)
                 throw std::invalid_argument("Classic NextN verify requires a snapshot rendezvous");
@@ -896,13 +1092,21 @@ public:
             return output;
         }
         if (capture_mtp) {
+            const auto table_width = batch.page_table->size(1);
+            batch.short_c4_index = direct_hc && batch.query_offsets.size() == 2 &&
+                rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 &&
+                table_width <= kC4IndexMaxUnscoredPages &&
+                env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
+            batch.share_flashmla_schedule = input.mtp_share_flashmla_schedule && direct_hc &&
+                batch.query_offsets.size() == 2 && ids->numel() == 4 &&
+                rt.device().type() == runtime::Device::Type::kHygon;
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
-                          false, hc, true, scratch_hc);
+                          draft_seed_graph, hc, true, owned_hc, direct_hc, draft_seed_graph);
         }
         const bool sampled_logits_only = input.sampled_logits_only && !input.sample_all_positions
             && !cfg_.is_mtp && !input.return_draft_hidden_states && !input.mtp_scratch_step;
         return forward_logits(rt, ids, batch, hc, input.return_draft_hidden_states,
-                              input.mtp_last_logits, sampled_logits_only);
+                              input.mtp_last_logits, nullptr, sampled_logits_only);
     }
 
     bool owns_paged_decode_graph() const override {
@@ -926,6 +1130,8 @@ public:
         cache::validate_backend_cache_config(requested,backend);
         decode_plans_ = {};
         mtp_decode_plans_ = {};
+        c128_state_only_decode_plans_ = {};
+        draft_seed_decode_plans_ = {};
         snapshot_backup_.reset();
         if (!requested) {
             caches_.clear();
@@ -964,7 +1170,10 @@ private:
         Tensor sampled_ids;
         bool greedy;
         bool return_hc;
+        std::array<bool, 5> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
+        size_t packed_mhc_calls = 0;
+        size_t flashmla_schedules_prepared = 0;
     };
 
     static Tensor copy_graph_tensor(Runtime &rt, const Tensor &source) {
@@ -976,14 +1185,41 @@ private:
         return stable;
     }
 
+    Tensor gather_packed_logits(Runtime &rt, const Tensor &hidden) const {
+        const auto rows = hidden->size(0);
+        const auto local_vocab = cfg_.vocab / kV4TensorParallelSize;
+        auto local = Tensor::empty(rt, {rows, local_vocab}, hidden->dtype());
+        const auto copy_logits = [&](const Tensor &source, const Tensor &destination) {
+            execution::submit<infini::ops::Copy>(
+                rt, execution::RecordingPolicy::DeviceOnly,
+                infini::ops::Copy::DefaultConfig(rt.device().type()), source, false, destination);
+        };
+        for (size_t row = 0; row < rows; ++row) {
+            auto input = hidden->narrow({{0, row, 1}});
+            copy_logits(head_->forward(rt, input), local->narrow({{0, row, 1}}));
+        }
+
+        // AllGather writes [rank, row, local_vocab]. Restore the row-major token order.
+        auto gathered = Tensor::empty(rt, {kV4TensorParallelSize, rows, local_vocab}, local->dtype());
+        engine::distributed::allgather_(rt, gathered, local, comm_);
+        auto output = Tensor::empty(rt, {rows, kV4TensorParallelSize, local_vocab}, local->dtype());
+        copy_logits(gathered->permute({1, 0, 2}), output);
+        return output->view({1, rows, cfg_.vocab});
+    }
+
     Output forward_logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch,
                           const Tensor &target_hc = {},bool return_hc = false,
-                          bool mtp_last_logits = false, bool sampled_logits_only = false) const {
-        auto [hidden,hc] = backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc);
+                          bool last_logits = false, size_t *packed_mhc_calls = nullptr,
+                          bool sampled_logits_only = false) const {
+        auto [hidden,hc] = backbone_->forward(
+            rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc,false,packed_mhc_calls);
         // A per-token projection retains the reference's M=1 accumulation boundary
         // and leaves full packed HC available to seed or repair Draft.
+        if (batch.packed_collectives && !last_logits) {
+            return Output{gather_packed_logits(rt, hidden), std::move(hc), std::nullopt, {}};
+        }
         const auto requests = batch.query_offsets.size() - 1;
-        const bool select_last = (sampled_logits_only || mtp_last_logits) && requests < ids->numel();
+        const bool select_last = (sampled_logits_only || last_logits) && requests < ids->numel();
         const auto rows = select_last ? requests : ids->numel();
         Tensor output;
         if (batch.packed_decode_collectives) {
@@ -1008,17 +1244,27 @@ private:
             }
         }
         Output result{output->view({1,rows,cfg_.vocab}),std::move(hc),std::nullopt,{}};
-        result.mtp_last_logits_used = mtp_last_logits && select_last;
+        result.mtp_last_logits_used = last_logits && select_last;
         return result;
     }
 
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
                   bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
-                  bool return_hc = false) const {
-        auto &plans = classic_mtp ? mtp_decode_plans_ : decode_plans_;
+                  bool return_hc = false, bool packed_direct = false, bool draft_seed_graph = false) const {
+        auto &plans = batch.c128_state_only ? c128_state_only_decode_plans_
+            : (draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
+                                : (classic_mtp ? mtp_decode_plans_ : decode_plans_));
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
+        const bool m12_hygon = ids->numel() == 12 && rt.device().type() == runtime::Device::Type::kHygon;
+        const std::array short_kernel_modes{
+            env_enabled("INFINIOPS_V4_C128_POOL_SHORT"),
+            env_enabled("INFINI_HYGON_MOE_Q4_GROUP"),
+            env_enabled("INFINIOPS_V4_I8_PROJECTION_Q4"),
+            m12_hygon && env_enabled("INFINI_HYGON_MOE_M12_GROUP"),
+            m12_hygon && env_enabled("INFINIOPS_V4_I8_PROJECTION_M12"),
+        };
         // Captured request-local slices use the full vector of row boundaries.
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
@@ -1027,6 +1273,12 @@ private:
                 plan->batch.c4_sequential != batch.c4_sequential ||
                 plan->batch.c4_query_begin != batch.c4_query_begin ||
                 plan->batch.query_offsets != batch.query_offsets ||
+                plan->batch.packed_shared_constants != batch.packed_shared_constants ||
+                plan->batch.short_c4_index != batch.short_c4_index ||
+                plan->batch.packed_collectives != batch.packed_collectives ||
+                plan->batch.packed_mhc_pre != batch.packed_mhc_pre ||
+                plan->batch.share_flashmla_schedule != batch.share_flashmla_schedule ||
+                plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
                 return false;
@@ -1067,9 +1319,7 @@ private:
             if (target_hc) {
                 recent->target_hc->copy_from(rt, target_hc);
             }
-            if (classic_mtp) {
-                barrier.wait();
-            }
+            barrier.wait();
         } else {
             // Drop the least recently used graph before pinning new allocations.
             previous.reset();
@@ -1082,12 +1332,31 @@ private:
                 batch.shared_expert_route = make_shared_expert_route(rt, ids->numel());
             }
             DecodePlan candidate{std::move(ids), std::move(batch),
-                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc, {}};
+                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc,
+                                 short_kernel_modes, {}};
             barrier.wait();
             rt.startGraphRecording(true);
             try {
+                if (candidate.batch.share_flashmla_schedule) {
+                    auto &stable = candidate.batch;
+                    const auto swa_width = stable.swa_indices->size(1);
+                    for (const auto ratio : cfg_.ratios) {
+                        auto &schedule = stable.flashmla_schedules[flashmla_schedule_index(ratio)];
+                        if (schedule) {
+                            continue;
+                        }
+                        const auto extra_lengths = ratio == 4 ? stable.c4_sparse_lengths
+                            : ratio == 128 ? stable.c128_lengths : Tensor{};
+                        const auto extra_width = ratio == 4 ? kC4IndexTopK
+                            : ratio == 128 ? stable.c128_indices->size(1) : 0;
+                        schedule = prepare_sparse_mla_schedule(
+                            rt, stable.swa_lengths, swa_width, extra_lengths, extra_width);
+                        ++candidate.flashmla_schedules_prepared;
+                    }
+                }
                 auto recorded = forward_logits(
-                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc);
+                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph,
+                    &candidate.packed_mhc_calls);
                 candidate.logits = std::move(recorded.logits);
                 candidate.hidden_states = std::move(recorded.hidden_states);
                 if (greedy && sampling_rank_) {
@@ -1110,12 +1379,25 @@ private:
             previous = std::move(recent);
             recent = std::move(candidate);
         }
+        auto report = recent->graph->execution_report();
+        if (packed_direct && !barrier.all(report.device_graph_segments == 1 && report.host_segments == 0)) {
+            throw std::runtime_error("Packed direct MTP requires one device Graph on every TP rank");
+        }
         recent->graph->run();
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
-        return {recent->logits, std::move(hidden_states), recent->graph->execution_report(),
-                recent->sampled_ids};
+        if (classic_mtp && env_enabled("INFINILM_MTP_GRAPH_PLAN_RECEIPT")) {
+            report.mtp_graph_plan = common_slots ? "hit" : "capture";
+            if (packed_direct) {
+                report.mtp_packed_mhc_calls = recent->packed_mhc_calls;
+            }
+            report.mtp_c128_state_only = recent->batch.c128_state_only;
+            report.mtp_flashmla_schedules_prepared = recent->flashmla_schedules_prepared;
+        }
+        Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
+        output.mtp_last_logits_used = draft_seed_graph;
+        return output;
     }
 
     V4Config cfg_;
@@ -1125,6 +1407,8 @@ private:
     const bool sampling_rank_;
     std::vector<LayerPagedCache> caches_;
     bool reuse_snapshot_buffer_ = false;
+    bool packed_shared_constants_prepared_ = false;
+    bool draft_seed_constants_prepared_ = false;
     bool k1_graph_seed_ = false;
     // The rank worker serializes verify calls; rollback synchronizes before
     // the next request can reuse or resize this device buffer.
@@ -1134,6 +1418,10 @@ private:
     // The two most recent shapes cover both sides of adjacent page boundaries.
     mutable std::array<std::optional<DecodePlan>, 2> decode_plans_;
     mutable std::array<std::optional<DecodePlan>, 2> mtp_decode_plans_;
+    // State-only and publishing graphs have different operator lists.
+    mutable std::array<std::optional<DecodePlan>, 2> c128_state_only_decode_plans_;
+    // q2, q3 and q4 repair plans do not evict the proposal plans or one another.
+    mutable std::array<std::array<std::optional<DecodePlan>, 2>, 3> draft_seed_decode_plans_;
 };
 
 } // namespace

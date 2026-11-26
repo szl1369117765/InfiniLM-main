@@ -60,11 +60,25 @@ void store_mla_rows(runtime::Runtime &runtime, const runtime::Tensor &kv,
                           static_cast<int64_t>(page_tokens), pages);
 }
 
+runtime::Tensor prepare_sparse_mla_schedule(runtime::Runtime &runtime,
+                                            const runtime::Tensor &swa_lengths, size_t swa_width,
+                                            const runtime::Tensor &extra_lengths, size_t extra_width) {
+    using Op = infini::ops::DeepseekV4PrepareSparseMlaSchedule;
+    using Opt = std::optional<runtime::Tensor>;
+    auto schedule = runtime::Tensor::empty(runtime, {Op::kScheduleBytes}, runtime::DataType::kUInt8);
+    execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
+                          Op::DefaultConfig(runtime.device().type()), swa_lengths,
+                          extra_lengths ? Opt{extra_lengths} : Opt{}, static_cast<int64_t>(swa_width),
+                          static_cast<int64_t>(extra_width), schedule);
+    return schedule;
+}
+
 runtime::Tensor sparse_mla(runtime::Runtime &runtime, const runtime::Tensor &query,
                            const LayerPagedCache &cache, const runtime::Tensor &swa_indices,
                            const runtime::Tensor &swa_lengths, const runtime::Tensor &sink,
                            const runtime::Tensor &compressed_indices,
-                           const runtime::Tensor &compressed_lengths, double scale) {
+                           const runtime::Tensor &compressed_lengths, double scale,
+                           const runtime::Tensor &schedule) {
     const auto ratio = cache.compression_ratio;
     if (!query || (ratio != 0 && ratio != 4 && ratio != 128)
         || static_cast<bool>(ratio) != static_cast<bool>(cache.compressed)
@@ -72,15 +86,25 @@ runtime::Tensor sparse_mla(runtime::Runtime &runtime, const runtime::Tensor &que
         || static_cast<bool>(ratio) != static_cast<bool>(compressed_lengths)) {
         throw std::invalid_argument("DeepSeek V4 compressed cache and sparse metadata disagree");
     }
-    using Op = infini::ops::DeepseekV4SparseMla;
     using Opt = std::optional<runtime::Tensor>;
     auto output = runtime::Tensor::empty(runtime, query->shape(), query->dtype());
-    execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
-                          Op::DefaultConfig(runtime.device().type()), query, cache.swa,
-                          swa_indices, swa_lengths, sink, ratio ? Opt{cache.compressed} : Opt{},
-                          ratio ? Opt{compressed_indices} : Opt{},
-                          ratio ? Opt{compressed_lengths} : Opt{},
-                          static_cast<int64_t>(ratio ? kV4PageSize / ratio : 0), scale, output);
+    const auto extra = ratio ? Opt{cache.compressed} : Opt{};
+    const auto extra_indices = ratio ? Opt{compressed_indices} : Opt{};
+    const auto extra_lengths = ratio ? Opt{compressed_lengths} : Opt{};
+    const auto extra_page_size = static_cast<int64_t>(ratio ? kV4PageSize / ratio : 0);
+    if (schedule) {
+        using Op = infini::ops::DeepseekV4SparseMlaWithSchedule;
+        execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
+                              Op::DefaultConfig(runtime.device().type()), query, cache.swa,
+                              swa_indices, swa_lengths, sink, extra, extra_indices, extra_lengths,
+                              extra_page_size, scale, schedule, output);
+    } else {
+        using Op = infini::ops::DeepseekV4SparseMla;
+        execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
+                              Op::DefaultConfig(runtime.device().type()), query, cache.swa,
+                              swa_indices, swa_lengths, sink, extra, extra_indices, extra_lengths,
+                              extra_page_size, scale, output);
+    }
     return output;
 }
 

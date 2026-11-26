@@ -1,5 +1,6 @@
 """Eager classic DeepSeek V4 NextN execution."""
 
+import os
 from dataclasses import replace
 
 from ..sampling_params import validate_stop_strings, validate_stop_token_ids
@@ -191,8 +192,11 @@ class DeepSeekV4MTPRunner:
             # reserved until the transport has resolved the full transaction.
             reservation.mark_submitted()
             tables = tuple(tuple(candidate["block_table"]) for candidate in candidates)
+            keep_final_graph = self.num_draft_tokens == 3 and getattr(
+                self.transport, "graph_batched_draft_proposal", False
+            )
             batched = (
-                getattr(self.transport, "batched_draft", False)
+                (getattr(self.transport, "batched_draft", False) or keep_final_graph)
                 and not self.branch_draft_lengths
                 and (self.num_draft_tokens == 1 or len(candidates) > 1)
                 and all(not candidate["req"].sampling_params.do_sample for candidate in candidates)
@@ -200,7 +204,15 @@ class DeepSeekV4MTPRunner:
             if batched:
                 proposals = [self._proposal_request(candidate) for candidate in candidates]
                 counts = tuple(candidate["draft_count"] for candidate in candidates)
-                chains = self.transport.propose_batched(proposals, tables, counts)
+                proposal_options = {"keep_final_graph": True} if keep_final_graph else {}
+                if keep_final_graph and os.getenv("INFINILM_MTP_GRAPH_C3_BATCH_FINAL_DRAFT") == "1":
+                    # Recheck the live lease at the last hop, after earlier Draft writes.
+                    proposal_options["permit_final_batch"] = lambda: (
+                        self.transport.graph_packed_direct_enabled() and reservation.permits_packed_direct_target(tables)
+                    )
+                chains = self.transport.propose_batched(
+                    proposals, tables, counts, **proposal_options,
+                )
                 requests = [replace(request, draft_tokens=chain)
                             for request, chain in zip(proposals, chains, strict=True)]
             else:
@@ -232,9 +244,26 @@ class DeepSeekV4MTPRunner:
                     transaction.commit(winner)
             else:
                 batch = GreedyVerifyBatch.pack(requests, self.max_context)
+                graph_direct_selector = {
+                    1: "graph_single_direct_enabled", 3: "graph_packed_direct_enabled",
+                }.get(len(candidates), "")
+                direct_option = None
+                if self.num_draft_tokens == 3:
+                    if getattr(self.transport, graph_direct_selector, lambda: False)():
+                        direct_option = "graph_packed_direct_commit"
+                    elif len(candidates) == 3 and getattr(self.transport, "eager_packed_direct_enabled", lambda: False)():
+                        direct_option = "eager_packed_direct_commit"
+                direct_options = (
+                    {direct_option: True}
+                    if direct_option is not None
+                    and all(not item["req"].sampling_params.do_sample for item in candidates)
+                    and reservation.permits_packed_direct_target(tables)
+                    else {}
+                )
                 with self.transport.target_transaction(
                     batch, tables[0] if len(candidates) == 1 else tables,
                     **({"batch_draft_seed": True} if batched and self.num_draft_tokens == 1 else {}),
+                    **direct_options,
                 ) as transaction:
                     intents = (
                         transaction.resolve_stochastic()

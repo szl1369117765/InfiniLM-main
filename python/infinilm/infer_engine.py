@@ -365,11 +365,17 @@ class InferEngine(_infinilm.InferEngine):
         return_draft_hidden_states=False,
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
+        target_hidden_segments_by_rank=None,
         mtp_draft_cache_only=False,
+        mtp_eager_c3_draft_repair_cache_only=False,
         mtp_cpu_metadata_shadow=False,
         mtp_shared_compression_plan=False,
         mtp_scratch_step=False,
         mtp_last_logits=False,
+        mtp_graph_direct_commit=False,
+        mtp_eager_packed_direct_commit=False,
+        mtp_graph_fresh_prefill=False,
+        mtp_graph_draft_seed=False,
     ):
         def unwrap_tensor(tensor):
             return (
@@ -416,12 +422,35 @@ class InferEngine(_infinilm.InferEngine):
                     else None
                 ),
             }
+        if target_hidden_segments_by_rank is not None:
+            mtp_arguments["target_hidden_segments_by_rank"] = tuple(
+                tuple(unwrap_tensor(tensor) for tensor in rank_segments)
+                for rank_segments in target_hidden_segments_by_rank
+            )
         if mtp_draft_cache_only is not False:
             if mtp_draft_cache_only is not True:
                 raise ValueError("mtp_draft_cache_only must be a bool")
             if getattr(self, "mtp_draft_cache_only_version", 0) != 1:
                 raise RuntimeError("Classic NextN Draft cache-only requires the native output policy")
             mtp_arguments["mtp_draft_cache_only"] = True
+        if type(mtp_eager_c3_draft_repair_cache_only) is not bool:
+            raise ValueError("mtp_eager_c3_draft_repair_cache_only must be a bool")
+        if mtp_eager_c3_draft_repair_cache_only:
+            if not mtp_draft_cache_only or getattr(self, "mtp_eager_c3_draft_repair_cache_only_version", 0) != 1:
+                raise RuntimeError("Eager C3 repair requires native output-free Draft cache support")
+            mtp_arguments["mtp_eager_c3_draft_repair_cache_only"] = True
+        if type(mtp_graph_direct_commit) is not bool:
+            raise ValueError("mtp_graph_direct_commit must be a bool")
+        if mtp_graph_direct_commit:
+            if getattr(self, "mtp_graph_packed_direct_commit_version", 0) != 1:
+                raise RuntimeError("Classic NextN packed direct commit requires native Graph support")
+            mtp_arguments["mtp_graph_direct_commit"] = True
+        if type(mtp_eager_packed_direct_commit) is not bool:
+            raise ValueError("mtp_eager_packed_direct_commit must be a bool")
+        if mtp_eager_packed_direct_commit:
+            if getattr(self, "mtp_eager_packed_direct_commit_version", 0) != 1:
+                raise RuntimeError("Classic NextN packed eager direct commit requires native eager support")
+            mtp_arguments["mtp_eager_packed_direct_commit"] = True
         for key, enabled in (
             ("mtp_cpu_metadata_shadow", mtp_cpu_metadata_shadow),
             ("mtp_shared_compression_plan", mtp_shared_compression_plan),
@@ -444,6 +473,18 @@ class InferEngine(_infinilm.InferEngine):
             if getattr(self, "mtp_last_logits_version", 0) != 1:
                 raise RuntimeError("Classic NextN last logits require native head selection support")
             mtp_arguments["mtp_last_logits"] = True
+        if mtp_graph_fresh_prefill is not False:
+            if mtp_graph_fresh_prefill is not True:
+                raise ValueError("mtp_graph_fresh_prefill must be a bool")
+            if getattr(self, "mtp_graph_fresh_prefill_version", 0) != 1:
+                raise RuntimeError("Classic NextN Graph prefill requires native support")
+            mtp_arguments["mtp_graph_fresh_prefill"] = True
+        if type(mtp_graph_draft_seed) is not bool:
+            raise ValueError("mtp_graph_draft_seed must be a bool")
+        if mtp_graph_draft_seed:
+            if getattr(self, "mtp_graph_draft_seed_version", 0) != 1:
+                raise RuntimeError("Classic NextN Graph Draft seed requires native owned Draft HC")
+            mtp_arguments["mtp_graph_draft_seed"] = True
 
         return super().Input(
             input_ids,
@@ -604,11 +645,17 @@ class InferEngine(_infinilm.InferEngine):
         return_draft_hidden_states=False,
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
+        target_hidden_segments_by_rank=None,
         mtp_draft_cache_only=False,
+        mtp_eager_c3_draft_repair_cache_only=False,
         mtp_cpu_metadata_shadow=False,
         mtp_shared_compression_plan=False,
         mtp_scratch_step=False,
         mtp_last_logits=False,
+        mtp_graph_direct_commit=False,
+        mtp_eager_packed_direct_commit=False,
+        mtp_graph_fresh_prefill=False,
+        mtp_graph_draft_seed=False,
     ):
         try:
             output = super().forward(
@@ -635,17 +682,23 @@ class InferEngine(_infinilm.InferEngine):
                     return_draft_hidden_states=return_draft_hidden_states,
                     rollback_v4_cache=rollback_v4_cache,
                     target_hidden_states_by_rank=target_hidden_states_by_rank,
+                    target_hidden_segments_by_rank=target_hidden_segments_by_rank,
                     mtp_draft_cache_only=mtp_draft_cache_only,
+                    mtp_eager_c3_draft_repair_cache_only=mtp_eager_c3_draft_repair_cache_only,
                     mtp_cpu_metadata_shadow=mtp_cpu_metadata_shadow,
                     mtp_shared_compression_plan=mtp_shared_compression_plan,
                     mtp_scratch_step=mtp_scratch_step,
                     mtp_last_logits=mtp_last_logits,
+                    mtp_graph_direct_commit=mtp_graph_direct_commit,
+                    mtp_eager_packed_direct_commit=mtp_eager_packed_direct_commit,
+                    mtp_graph_fresh_prefill=mtp_graph_fresh_prefill,
+                    mtp_graph_draft_seed=mtp_graph_draft_seed,
                 )
             )
             metadata_evidence = {}
-            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan:
+            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan or mtp_graph_direct_commit:
                 metadata_evidence["mtp_cpu_metadata_shadow_used"] = output.mtp_cpu_metadata_shadow_used
-                if mtp_shared_compression_plan:
+                if mtp_shared_compression_plan or mtp_graph_direct_commit:
                     metadata_evidence["mtp_shared_compression_plan_used"] = output.mtp_shared_compression_plan_used
             if mtp_draft_cache_only:
                 if not output.mtp_draft_cache_only_used or any(
@@ -671,7 +724,7 @@ class InferEngine(_infinilm.InferEngine):
                 result["hidden_states_by_rank"] = tuple(
                     infinicore.Tensor(tensor) for tensor in output.hidden_states_by_rank
                 )
-            if mtp_last_logits:
+            if mtp_last_logits or mtp_graph_draft_seed:
                 result["mtp_last_logits_used"] = output.mtp_last_logits_used
             return result
         except BaseException as e:

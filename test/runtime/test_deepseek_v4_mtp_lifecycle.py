@@ -2,8 +2,9 @@
 
 import ast
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import importlib
+import os
 import queue
 import sys
 import threading
@@ -100,6 +101,48 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
         self.transport = NativeTransport()
         self.tokenizer = SimpleNamespace(decode=lambda tokens: str(tokens[-1]))
         self.engine = self.make_engine()
+
+    def test_packed_direct_target_requires_exclusive_unpublished_pages(self):
+        scheduler_module = importlib.import_module("infinilm.llm.scheduler")
+        manager = scheduler_module.BlockManager(num_blocks=8, block_size=256)
+        pages = manager.allocate_private_blocks(4)
+        requests = [
+            SimpleNamespace(
+                request_id=str(index), _paged_completion_state="active", num_local_cached_tokens=255,
+                block_table=[page], get_total_length=lambda: 256, is_aborted=lambda: False,
+            )
+            for index, page in enumerate(pages[:3])
+        ]
+        scheduler = SimpleNamespace(
+            _scheduler_thread_id=threading.get_ident(),
+            _active_requests={req.request_id: req for req in requests},
+            cache_manager=manager, enable_prefix_caching=False,
+        )
+        ops = scheduler_module.SpeculativeCacheOps(scheduler)
+        reservation = scheduler_module._SpeculativeCacheReservation(ops)
+        ops._pending = reservation
+        tables = ((pages[0], pages[3]), (pages[1],), (pages[2],))
+        reservation.rows = [
+            (req, 256, tuple(req.block_table), table, 3)
+            for req, table in zip(requests, tables, strict=True)
+        ]
+        self.assertFalse(reservation.permits_packed_direct_target(tables))
+        reservation.mark_submitted()
+        self.assertTrue(reservation.permits_packed_direct_target(tables))
+        self.assertFalse(reservation.permits_packed_direct_target(tables[::-1]))
+        self.assertFalse(manager.has_private_unpublished_pages((pages[0], pages[3], pages[3])))
+        with patch.object(scheduler, "enable_prefix_caching", True):
+            self.assertFalse(reservation.permits_packed_direct_target(tables))
+        for field, value in (("ref_count", 2), ("hash", b"published")):
+            with patch.object(manager.blocks[pages[3]], field, value):
+                self.assertFalse(reservation.permits_packed_direct_target(tables))
+        for wrong_boundary in (0, 254, 256):
+            with patch.object(requests[1], "num_local_cached_tokens", wrong_boundary):
+                self.assertFalse(reservation.permits_packed_direct_target(tables))
+        with patch.object(requests[1], "is_aborted", return_value=True):
+            self.assertFalse(reservation.permits_packed_direct_target(tables))
+        reservation.mark_completed()
+        self.assertFalse(reservation.permits_packed_direct_target(tables))
 
     def make_engine(self, max_batch_size=1, num_draft_tokens=1, branch_lengths=None):
         runner = self.runner(
@@ -588,6 +631,19 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
                 self.assert_usable_pages(4)
 
     def test_async_abort_during_packed_cross_page_commit_retires_only_that_owner(self):
+        self.assert_async_abort_during_packed_cross_page_commit(direct=None)
+
+    def test_async_abort_during_direct_packed_cross_page_commit_retires_only_that_owner(self):
+        self.assert_async_abort_during_packed_cross_page_commit(direct="graph_packed_direct_commit")
+
+    def test_async_abort_during_eager_packed_commit_uses_direct_only_with_a_lease(self):
+        for leased in (True, False):
+            with self.subTest(leased=leased):
+                self.assert_async_abort_during_packed_cross_page_commit(
+                    direct="eager_packed_direct_commit", leased=leased,
+                )
+
+    def assert_async_abort_during_packed_cross_page_commit(self, *, direct, leased=True):
         self.engine = self.make_engine(max_batch_size=3, num_draft_tokens=3)
         self.engine._async_abort_owner = True
         canceled = self.llm.InferenceRequest(
@@ -601,14 +657,21 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
         original = tuple(canceled.block_table)
         self.assertEqual(len(original), 1)
         cache_ops = self.engine.scheduler.speculative_cache_ops
+        calls = []
 
         def propose_many(owner, anchor, position, table, count, stop_ids):
             return tuple(range(anchor + 1, anchor + count + 1))
 
         @contextmanager
-        def target_transaction(batch, tables):
+        def target_transaction(batch, tables, **options):
+            calls.append(options)
+            self.assertEqual(options, {direct: True} if direct and leased else {})
             self.assertEqual(batch.input_offsets, (0, 4, 8, 12))
             self.assertEqual([len(table) for table in tables], [2, 1, 1])
+            self.assertEqual(
+                tuple(req.num_local_cached_tokens for req in (canceled, *peers)),
+                batch.past_kv_lengths,
+            )
             rows = tuple(self.verify_row(row, row.input_token + 1) for row in batch.rows)
 
             def commit(intents):
@@ -619,12 +682,30 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
 
             yield SimpleNamespace(rows=rows, commit=commit)
 
+        eager = direct == "eager_packed_direct_commit"
+        graph = direct == "graph_packed_direct_commit"
+        availability = self.native_transport._V4Transport(
+            None, None, None, 256, graph_packed_direct_available=graph, eager_packed_direct_available=eager,
+        )
+        if eager:
+            availability.set_eager_packed_direct_commit(True)
+        scheduler_module = importlib.import_module("infinilm.llm.scheduler")
+        lease = nullcontext() if leased else patch.object(
+            scheduler_module._SpeculativeCacheReservation, "permits_packed_direct_target", return_value=False,
+        )
         with (
+            patch.dict(os.environ, {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": str(int(graph))}),
+            patch.object(self.transport, "graph_packed_direct_enabled",
+                         availability.graph_packed_direct_enabled, create=True),
+            patch.object(self.transport, "eager_packed_direct_enabled",
+                         availability.eager_packed_direct_enabled, create=True),
             patch.object(self.transport, "propose_many", propose_many, create=True),
             patch.object(self.transport, "target_transaction", target_transaction, create=True),
+            lease,
         ):
             self.assertTrue(self.engine.step())
 
+        self.assertEqual(len(calls), 1)
         self.assertEqual(tuple(canceled.block_table), original)
         self.assertIsNone(cache_ops._pending)
         self.assertEqual(self.outputs(canceled), [(71, False, None), (-1, True, self.reason.CANCELED)])

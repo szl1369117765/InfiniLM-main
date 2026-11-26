@@ -57,6 +57,13 @@ runtime::Tensor Compressor::project_and_pool(runtime::Runtime &runtime,
     return output;
 }
 
+void Compressor::update_state(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                              const runtime::Tensor &state_slots, const runtime::Tensor &state,
+                              const std::vector<size_t> &query_offsets) const {
+    auto sources = runtime::Tensor::empty(runtime, {0, 128}, runtime::DataType::kInt32);
+    project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets);
+}
+
 runtime::Tensor Compressor::forward(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                                     const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                                     const runtime::Tensor &state, const runtime::Tensor &positions,

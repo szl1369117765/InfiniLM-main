@@ -22,6 +22,10 @@ public:
                      const runtime::Tensor &cos_sin, const std::vector<size_t> &query_offsets,
                      const runtime::Tensor &slots, const runtime::Tensor &pages,
                      size_t page_tokens) const;
+    // C128 short verification with no compressed cache row to publish.
+    void update_state(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                      const runtime::Tensor &state_slots, const runtime::Tensor &state,
+                      const std::vector<size_t> &query_offsets) const;
 
     std::vector<std::shared_ptr<weights::ModelWeights>> loading_children() const override;
 

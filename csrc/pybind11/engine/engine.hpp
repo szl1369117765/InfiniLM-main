@@ -70,13 +70,19 @@ inline void bind_infer_engine(py::module &m) {
     py::class_<InferEngine, std::shared_ptr<InferEngine>> infer_engine(
         m, "InferEngine", py::release_gil_before_calling_cpp_dtor());
     infer_engine.def_property_readonly("deepseek_v4_raw_ring_rows", &InferEngine::deepseek_v4_raw_ring_rows);
+    infer_engine.def_property_readonly("mtp_graph_packed_direct_commit_version", [](const InferEngine &) { return 1; });
+    infer_engine.def_property_readonly("mtp_eager_packed_direct_commit_version", [](const InferEngine &) { return 1; });
     infer_engine.attr("mtp_draft_cache_only_version") = 1;
+    infer_engine.attr("mtp_c3_draft_repair_cache_only_version") = 1;
+    infer_engine.attr("mtp_eager_c3_draft_repair_cache_only_version") = 1;
     infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
     infer_engine.attr("mtp_shared_compression_plan_version") = 1;
     infer_engine.attr("mtp_scratch_step_version") = 1;
     infer_engine.attr("mtp_scratch_hc_version") = 1;
     infer_engine.attr("mtp_last_logits_version") = 1;
     infer_engine.attr("mtp_k1_graph_seed_version") = 1;
+    infer_engine.attr("mtp_graph_fresh_prefill_version") = 1;
+    infer_engine.attr("mtp_graph_draft_seed_version") = 1;
 
     infer_engine
         .def(py::init([](
@@ -247,11 +253,17 @@ inline void bind_infer_engine(py::module &m) {
                     "return_draft_hidden_states",
                     "rollback_v4_cache",
                     "target_hidden_states_by_rank",
+                    "target_hidden_segments_by_rank",
                     "mtp_draft_cache_only",
+                    "mtp_eager_c3_draft_repair_cache_only",
                     "mtp_cpu_metadata_shadow",
                     "mtp_shared_compression_plan",
                     "mtp_scratch_step",
                     "mtp_last_logits",
+                    "mtp_graph_direct_commit",
+                    "mtp_eager_packed_direct_commit",
+                    "mtp_graph_fresh_prefill",
+                    "mtp_graph_draft_seed",
                 };
 
                 for (auto &item : kwargs) {
@@ -287,6 +299,8 @@ inline void bind_infer_engine(py::module &m) {
                         input.rollback_v4_cache = py::cast<bool>(item.second);
                     } else if (key == "mtp_draft_cache_only") {
                         input.mtp_draft_cache_only = py::cast<bool>(item.second);
+                    } else if (key == "mtp_eager_c3_draft_repair_cache_only") {
+                        input.mtp_eager_c3_draft_repair_cache_only = py::cast<bool>(item.second);
                     } else if (key == "mtp_cpu_metadata_shadow" || key == "mtp_shared_compression_plan") {
                         if (!py::isinstance<py::bool_>(item.second)) {
                             throw py::value_error(key + " must be a bool");
@@ -304,9 +318,32 @@ inline void bind_infer_engine(py::module &m) {
                             throw py::value_error("mtp_last_logits must be a bool");
                         }
                         input.mtp_last_logits = py::cast<bool>(item.second);
+                    } else if (key == "mtp_graph_direct_commit") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_graph_direct_commit must be a bool");
+                        }
+                        input.mtp_graph_direct_commit = py::cast<bool>(item.second);
+                    } else if (key == "mtp_eager_packed_direct_commit") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_eager_packed_direct_commit must be a bool");
+                        }
+                        input.mtp_eager_packed_direct_commit = py::cast<bool>(item.second);
+                    } else if (key == "mtp_graph_fresh_prefill") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_graph_fresh_prefill must be a bool");
+                        }
+                        input.mtp_graph_fresh_prefill = py::cast<bool>(item.second);
+                    } else if (key == "mtp_graph_draft_seed") {
+                        if (!py::isinstance<py::bool_>(item.second)) {
+                            throw py::value_error("mtp_graph_draft_seed must be a bool");
+                        }
+                        input.mtp_graph_draft_seed = py::cast<bool>(item.second);
                     } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
+                    } else if (key == "target_hidden_segments_by_rank" && !item.second.is_none()) {
+                        input.target_hidden_segments_by_rank =
+                            py::cast<std::vector<std::vector<infinilm::runtime::Tensor>>>(item.second);
                     }
                 }
 
@@ -377,6 +414,37 @@ inline void bind_infer_engine(py::module &m) {
             result["host_segments"] = host_segments;
             result["operator_count"] = graph ? graph->operator_count : 0;
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
+            if (graph && graph->mtp_graph_plan) {
+                result["mtp_graph_plan"] = graph->mtp_graph_plan;
+                result["mtp_c128_state_only"] = graph->mtp_c128_state_only;
+                result["mtp_flashmla_schedules_prepared"] = graph->mtp_flashmla_schedules_prepared;
+            }
+            if (const auto &receipt = output.mtp_eager_target_receipt) {
+                result["mtp_eager_packed_direct_commit"] = true;
+                result["mtp_eager_packed_target_collectives_used"] = receipt->packed_collectives;
+                result["mtp_eager_shared_target_plan_used"] = receipt->shared_plan;
+                result["mtp_eager_packed_mhc_pre_used"] = receipt->packed_mhc_pre;
+                result["mtp_eager_short_c4_index_used"] = receipt->short_c4_index;
+            }
+            if (!output.mtp_graph_direct_rank_reports.empty()) {
+                py::list rank_reports;
+                for (size_t rank = 0; rank < output.mtp_graph_direct_rank_reports.size(); ++rank) {
+                    const auto &report = output.mtp_graph_direct_rank_reports[rank];
+                    py::dict entry;
+                    entry["rank"] = rank;
+                    entry["device_graph_segments"] = report.device_graph_segments;
+                    entry["host_segments"] = report.host_segments;
+                    entry["operator_count"] = report.operator_count;
+                    if (report.mtp_graph_plan) {
+                        entry["mtp_graph_plan"] = report.mtp_graph_plan;
+                        entry["mtp_packed_mhc_calls"] = report.mtp_packed_mhc_calls;
+                        entry["mtp_c128_state_only"] = report.mtp_c128_state_only;
+                        entry["mtp_flashmla_schedules_prepared"] = report.mtp_flashmla_schedules_prepared;
+                    }
+                    rank_reports.append(std::move(entry));
+                }
+                result["mtp_graph_direct_rank_reports"] = std::move(rank_reports);
+            }
             return result;
         });
 }

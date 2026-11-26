@@ -103,13 +103,24 @@ public:
         bool return_draft_hidden_states{false};
         bool rollback_v4_cache{false};
         std::optional<std::vector<infinilm::runtime::Tensor>> target_hidden_states_by_rank;
+        std::optional<std::vector<std::vector<infinilm::runtime::Tensor>>> target_hidden_segments_by_rank;
+        // Populated by InferEngine for a single worker, in packed request order.
+        std::vector<infinilm::runtime::Tensor> target_hidden_segments;
         bool mtp_draft_cache_only{false};
+        bool mtp_eager_c3_draft_repair_cache_only{false};
         bool mtp_cpu_metadata_shadow{false};
         bool mtp_shared_compression_plan{false};
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
         // Token-only callers need logits only at the sampled positions.
         bool sampled_logits_only{false};
+        bool mtp_graph_direct_commit{false};
+        bool mtp_share_flashmla_schedule{false};
+        bool mtp_graph_fresh_prefill{false};
+        bool mtp_graph_draft_seed{false};
+        bool mtp_eager_packed_direct_commit{false};
+        // Resolved once by InferEngine for the whole dispatch, not a public input.
+        InfinilmModel::EagerPackedTargetModes mtp_eager_target_modes{};
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,
@@ -132,6 +143,8 @@ public:
         bool mtp_cpu_metadata_shadow_used{false};
         bool mtp_shared_compression_plan_used{false};
         bool mtp_last_logits_used{false};
+        std::vector<infinilm::execution::graph::Graph::ExecutionReport> mtp_graph_direct_rank_reports;
+        std::optional<InfinilmModel::EagerPackedTargetModes> mtp_eager_target_receipt{};
     };
 
     RankWorker(std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,

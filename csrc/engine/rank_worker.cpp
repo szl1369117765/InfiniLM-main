@@ -6,6 +6,7 @@
 #include "compiler/paged_compiler.hpp"
 #include "compiler/paged_decode_bucket.hpp"
 #include "compiler/static_batching_compiler.hpp"
+#include "deepseek_v4_metadata.hpp"
 #include "nsa_run_failure.hpp"
 #include "nsa_video_input.hpp"
 #include "request_sampling.hpp"
@@ -808,6 +809,7 @@ void RankWorker::thread_loop() {
                         infinilm::runtime::Tensor model_sampled_ids;
                         bool draft_cache_only_used = false;
                         bool last_logits_used = false;
+                        std::optional<InfinilmModel::EagerPackedTargetModes> eager_target_receipt;
                         const auto parameter_greedy = [&] {
                             if (local_args.sampling_rows) {
                                 return std::all_of(local_args.sampling_rows->begin(), local_args.sampling_rows->end(),
@@ -824,12 +826,14 @@ void RankWorker::thread_loop() {
                             throw std::invalid_argument("V4 MTP requires a single pipeline stage");
                         }
                         const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states ||
-                            local_args.rollback_v4_cache || local_args.mtp_scratch_step;
+                            local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
+                            local_args.mtp_graph_direct_commit || local_args.mtp_eager_packed_direct_commit;
                         const bool graph_enabled = enable_graph_compiling_ && rank_info_.pp_size == 1;
                         // For a one-row Draft proposal, the last token is all
                         // positions. Draft prefill/repair still request all rows.
                         const bool mtp_graph_candidate = graph_enabled && !local_args.mtp_draft_cache_only &&
                             (local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
+                            local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed ||
                             (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions &&
                              !local_args.return_draft_hidden_states));
                         std::shared_ptr<const nsa::Proof> nsa_proof;
@@ -858,8 +862,15 @@ void RankWorker::thread_loop() {
                                 }
                             }
                             size_t logical_kv_upper_bound = 0;
-                            if (local_v4_host_batch && (finite_paged_decode_profile_ || graph_enabled)) {
-                                throw std::logic_error("V4 host batch cannot use Graph or worker-side page-table rewriting");
+                            if (local_args.mtp_eager_packed_direct_commit
+                                && (enable_graph_compiling_ || finite_paged_decode_profile_)) {
+                                throw std::logic_error("Packed eager direct MTP excludes Graph and worker-side page-table rewriting");
+                            }
+                            if (local_v4_host_batch &&
+                                (finite_paged_decode_profile_ ||
+                                 (graph_enabled && (!local_args.mtp_graph_direct_commit ||
+                                                    !local_v4_host_batch->plans())))) {
+                                throw std::logic_error("V4 host batch requires a validated direct Graph or eager metadata");
                             }
                             if (finite_paged_decode_profile_
                                 && !local_args.sample_all_positions
@@ -1048,8 +1059,18 @@ void RankWorker::thread_loop() {
                                 model_sampled_ids = std::move(model_output.model_sampled_ids);
                                 draft_cache_only_used = model_output.mtp_draft_cache_only_used;
                                 last_logits_used = model_output.mtp_last_logits_used;
+                                eager_target_receipt = model_output.mtp_eager_target_receipt;
                             }
 
+                            if (local_args.mtp_graph_direct_commit
+                                && (!graph_execution || graph_execution->device_graph_segments != 1
+                                    || graph_execution->host_segments != 0 || !hidden_states
+                                    || hidden_states->ndim() != 3
+                                    || hidden_states->size(0) != (*local_args.input_ids)->numel())) {
+                                runtime_->syncStream();
+                                throw std::runtime_error(
+                                    "Packed direct MTP requires one device Graph and full HC on every TP rank");
+                            }
                             if (local_args.mtp_draft_cache_only) {
                                 if (!draft_cache_only_used || logits || hidden_states || model_sampled_ids ||
                                     graph_execution) {
@@ -1058,7 +1079,7 @@ void RankWorker::thread_loop() {
                                 if (rank_info_.tp_rank == 0 && !local_args.random_values) {
                                     const size_t n_out = local_args.sample_all_positions
                                                            ? local_args.input_ids.value()->numel()
-                                                           : 1;
+                                                           : effective_args.input_offsets.value()->size(0) - 1;
                                     for (size_t i = 0; i < n_out; ++i) {
                                         (void)std::uniform_real_distribution<float>(0, 1)(rng_);
                                     }
@@ -1134,7 +1155,11 @@ void RankWorker::thread_loop() {
                                 if (model_sampled_ids) {
                                     // Preserve the legacy RNG sequence across greedy and stochastic requests.
                                     if (!local_args.random_values) {
-                                        (void)std::uniform_real_distribution<float>(0, 1)(rng_);
+                                        const auto draws = local_args.mtp_graph_draft_seed
+                                            ? local_args.input_ids.value()->numel() : 1;
+                                        for (size_t i = 0; i < draws; ++i) {
+                                            (void)std::uniform_real_distribution<float>(0, 1)(rng_);
+                                        }
                                     }
                                 } else if (batch_greedy) {
                                     float random_val = 0.0f;
@@ -1191,13 +1216,18 @@ void RankWorker::thread_loop() {
                                 auto out{Output{output_ids, logits, hidden_states,
                                                 std::move(graph_execution), eager_reason}};
                                 out.mtp_last_logits_used = last_logits_used;
+                                out.mtp_eager_target_receipt = eager_target_receipt;
 
                                 output_ = std::move(out);
                             }
                             if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
                                 runtime_->syncStream();
-                                output_ = Output{{}, {}, std::move(hidden_states), {}, eager_reason};
+                                const bool return_graph = local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed
+                                    || local_args.mtp_eager_packed_direct_commit;
+                                output_ = Output{{}, {}, std::move(hidden_states),
+                                                 return_graph ? std::move(graph_execution) : std::nullopt, eager_reason};
                                 output_.mtp_last_logits_used = last_logits_used;
+                                output_.mtp_eager_target_receipt = eager_target_receipt;
                             } else if (local_args.mtp_scratch_step && rank_info_.tp_rank != 0) {
                                 // Scratch is reused or released after this packed step.
                                 runtime_->syncStream();
