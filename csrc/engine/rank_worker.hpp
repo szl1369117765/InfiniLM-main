@@ -108,6 +108,7 @@ public:
         bool mtp_shared_compression_plan{false};
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
+        bool mtp_graph_direct_commit{false};
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,
@@ -130,6 +131,7 @@ public:
         bool mtp_cpu_metadata_shadow_used{false};
         bool mtp_shared_compression_plan_used{false};
         bool mtp_last_logits_used{false};
+        std::vector<infinilm::execution::graph::Graph::ExecutionReport> mtp_graph_direct_rank_reports;
     };
 
     RankWorker(std::shared_ptr<infinilm::global_state::InfinilmConfig> infinilm_config,

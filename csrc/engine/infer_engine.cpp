@@ -10,13 +10,96 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 
 namespace infinilm::engine {
 namespace {
+
+void validate_packed_direct_metadata(const RankWorker::Input &input,
+                                     const cache::PagedKVCacheConfig &cache, size_t vocab_size,
+                                     size_t owners) {
+    using namespace infinilm::runtime;
+    const auto cpu_tensor = [](const std::optional<Tensor> &value, DataType type, size_t dimensions) {
+        return value && *value && (*value)->device().type() == Device::Type::kCpu
+            && (*value)->dtype() == type && (*value)->is_contiguous() && (*value)->ndim() == dimensions;
+    };
+    const auto &ids = input.input_ids;
+    const auto &offsets = input.input_offsets;
+    const auto &positions = input.position_ids;
+    const auto &past = input.past_sequence_lengths;
+    const auto &total = input.total_sequence_lengths;
+    const auto &cu = input.cu_seqlens;
+    const auto &tables = input.block_tables;
+    const auto &slots = input.slot_mapping;
+    if (!cpu_tensor(ids, DataType::kInt64, 2) || (*ids)->size(0) != 1
+        || !cpu_tensor(offsets, DataType::kInt32, 1) || (*offsets)->numel() != owners + 1
+        || !cpu_tensor(positions, DataType::kInt64, 1)
+        || !cpu_tensor(past, DataType::kInt32, 1) || (*past)->numel() != owners
+        || !cpu_tensor(total, DataType::kInt32, 1) || (*total)->numel() != owners
+        || !cpu_tensor(cu, DataType::kInt32, 1) || (*cu)->numel() != owners + 1
+        || !cpu_tensor(tables, DataType::kInt32, 2) || (*tables)->size(0) != owners
+        || !cpu_tensor(slots, DataType::kInt64, 1)) {
+        throw std::invalid_argument("Direct MTP requires contiguous CPU metadata for each owner");
+    }
+    const auto rows = (*ids)->numel();
+    const auto *token = reinterpret_cast<const int64_t *>((*ids)->data());
+    const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
+    const auto *lengths = reinterpret_cast<const int32_t *>((*cu)->data());
+    const auto *starts = reinterpret_cast<const int32_t *>((*past)->data());
+    const auto *ends = reinterpret_cast<const int32_t *>((*total)->data());
+    const auto *pages = reinterpret_cast<const int32_t *>((*tables)->data());
+    const auto *pos = reinterpret_cast<const int64_t *>((*positions)->data());
+    const auto *slot = reinterpret_cast<const int64_t *>((*slots)->data());
+    const auto width = (*tables)->size(1);
+    const auto page_size = static_cast<int64_t>(cache.block_size());
+    if (rows < 2 * owners || rows > 4 * owners || (*positions)->numel() != rows || (*slots)->numel() != rows
+        || bounds[0] != 0 || bounds[owners] != static_cast<int32_t>(rows) || lengths[0] != 0) {
+        throw std::invalid_argument("Packed direct MTP offsets must cover all query rows");
+    }
+
+    // The scheduler proves lease ownership. Validate the effective physical page layout
+    // here before submitting the irreversible write to any rank.
+    std::unordered_set<int32_t> owner_pages;
+    for (size_t owner = 0; owner < owners; ++owner) {
+        const int64_t begin = bounds[owner], end = bounds[owner + 1], start = starts[owner];
+        if (begin < 0 || end > static_cast<int64_t>(rows) || end - begin < 2 || end - begin > 4
+            || start <= 0 || ends[owner] != start + end - begin
+            || lengths[owner + 1] != int64_t{lengths[owner]} + ends[owner]) {
+            throw std::invalid_argument("Packed direct MTP requires contiguous q2-q4 for each owner");
+        }
+        const auto used = static_cast<size_t>((int64_t{ends[owner]} - 1) / page_size + 1);
+        if (used > width) {
+            throw std::invalid_argument("Packed direct MTP page table is shorter than the query");
+        }
+        const auto *table = pages + owner * width;
+        for (size_t column = 0; column < width; ++column) {
+            const auto page = table[column];
+            if (column < used) {
+                if (page < 0 || static_cast<size_t>(page) >= cache.num_blocks()
+                    || !owner_pages.insert(page).second) {
+                    throw std::invalid_argument("Packed direct MTP requires exclusive effective pages");
+                }
+            } else if (page != -1) {
+                throw std::invalid_argument("Packed direct MTP requires -1 page padding");
+            }
+        }
+        for (int64_t row = begin; row < end; ++row) {
+            const auto position = start + row - begin;
+            if (pos[row] != position
+                || slot[row] != int64_t{table[position / page_size]} * page_size + position % page_size) {
+                throw std::invalid_argument("Packed direct MTP position and slot disagree with the owner table");
+            }
+            if (token[row] < 0 || static_cast<size_t>(token[row]) >= vocab_size) {
+                throw std::invalid_argument("Packed direct MTP input token is outside the vocabulary");
+            }
+        }
+    }
+}
 
 // Checked value issuer only: no identities/leases/requests stored globally.
 // Unique across live engines/resets in this native process; never wraps.
@@ -458,6 +541,7 @@ InferEngine::Input::to_model_input(
     input.mtp_draft_cache_only = mtp_draft_cache_only;
     input.mtp_scratch_step = mtp_scratch_step;
     input.mtp_last_logits = mtp_last_logits;
+    input.mtp_graph_direct_commit = mtp_graph_direct_commit;
 
     auto &attn_metadata = forward_context.attn_metadata;
     attn_metadata = {
@@ -551,6 +635,26 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
     }
     const auto &rank_hidden = input.target_hidden_states_by_rank;
+    if (input.mtp_graph_direct_commit) {
+        const auto *paged = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config_.get());
+        const auto &dist = communication_group_.get_dist_config();
+        const auto owners = paged ? paged->max_batch_size() : 0;
+        const auto *enabled = std::getenv(owners == 1
+            ? "INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT" : "INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT");
+        const auto [c4_ring, c128_ring] = deepseek_v4_raw_ring_rows();
+        if (!enabled || std::string_view(enabled) != "1" || !enable_graph_compiling_
+            || !classic_mtp_target_ || nsa_pool_epoch_ || dist.pp_size != 1
+            || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1 || !paged
+            || (owners != 1 && owners != 3) || paged->block_size() != models::deepseek_v4::kV4PageSize
+            || c4_ring != 16 || c128_ring != 256
+            || rank_hidden || input.target_hidden_states || !input.return_draft_hidden_states
+            || !input.sample_all_positions || input.top_k != 1 || input.sampling_rows || input.random_values
+            || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_last_logits
+            || input.mtp_draft_cache_only || input.mtp_cpu_metadata_shadow || input.mtp_shared_compression_plan) {
+            throw std::invalid_argument("Packed direct MTP requires plain TP8 greedy Target Graph verification");
+        }
+        validate_packed_direct_metadata(input, *paged, model_config_->get<size_t>("vocab_size"), owners);
+    }
     bool last_logits_expected = false;
     if (input.mtp_last_logits) {
         using namespace infinilm::runtime;
@@ -749,12 +853,16 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     };
     output.output_ids = completed_view(output.output_ids);
     output.logits = completed_view(output.logits);
-    const bool owns_scratch_hc = input.mtp_scratch_step && input.return_draft_hidden_states;
-    if (!owns_scratch_hc) {
+    const bool owns_graph_hc =
+        (input.mtp_scratch_step || input.mtp_graph_direct_commit) && input.return_draft_hidden_states;
+    if (!owns_graph_hc) {
         output.hidden_states = completed_view(output.hidden_states);
     }
     if (input.return_draft_hidden_states) {
         output.hidden_states_by_rank.reserve(workers_.size());
+        if (input.mtp_graph_direct_commit) {
+            output.mtp_graph_direct_rank_reports.reserve(workers_.size());
+        }
         for (const auto &worker : workers_) {
             auto rank_output = worker->get_output();
             auto hidden = std::move(rank_output.hidden_states);
@@ -766,8 +874,11 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
                     || hidden->ndim() != 3 || hidden->size(0) != (*input.input_ids)->numel())) {
                 throw std::runtime_error("Classic NextN last logits receipt or HC rows differ across ranks");
             }
+            if (input.mtp_graph_direct_commit) {
+                output.mtp_graph_direct_rank_reports.push_back(std::move(rank_output.graph_execution).value());
+            }
             output.hidden_states_by_rank.push_back(
-                owns_scratch_hc ? std::move(hidden) : completed_view(std::move(hidden)));
+                owns_graph_hc ? std::move(hidden) : completed_view(std::move(hidden)));
         }
     }
     return output;
