@@ -72,6 +72,7 @@ inline void bind_infer_engine(py::module &m) {
     infer_engine.def_property_readonly("deepseek_v4_raw_ring_rows", &InferEngine::deepseek_v4_raw_ring_rows);
     infer_engine.def_property_readonly("mtp_graph_packed_direct_commit_version", [](const InferEngine &) { return 1; });
     infer_engine.attr("mtp_draft_cache_only_version") = 1;
+    infer_engine.attr("mtp_c3_draft_repair_cache_only_version") = 1;
     infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
     infer_engine.attr("mtp_shared_compression_plan_version") = 1;
     infer_engine.attr("mtp_scratch_step_version") = 1;

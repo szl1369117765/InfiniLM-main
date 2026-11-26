@@ -657,6 +657,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
     const auto &rank_hidden = input.target_hidden_states_by_rank;
     const auto &rank_segments = input.target_hidden_segments_by_rank;
+    const bool c3_draft_repair_cache_only = input.mtp_draft_cache_only && rank_segments.has_value();
     if (input.mtp_graph_direct_commit) {
         const auto &dist = communication_group_.get_dist_config();
         const auto owners = paged ? paged->max_batch_size() : 0;
@@ -690,12 +691,21 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             || !ids || !*ids || (*ids)->ndim() != 2 || (*ids)->size(0) != 1
             || !cpu_vector(offsets, DataType::kInt32) || (*offsets)->numel() < 3
             || input.sample_all_positions || input.top_k != 1 || input.sampling_rows || input.random_values
-            || input.rollback_v4_cache || input.mtp_draft_cache_only || input.mtp_scratch_step || input.mtp_last_logits
+            || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_last_logits
             || input.mtp_graph_direct_commit || input.mtp_graph_fresh_prefill || input.mtp_graph_draft_seed) {
             throw std::invalid_argument("Segmented rank-local HC requires packed greedy Classic V4 Draft");
         }
         const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
         const auto segments = (*offsets)->numel() - 1;
+        if (c3_draft_repair_cache_only &&
+            (!enable_graph_compiling_ || workers_.size() != 8
+             || communication_group_.get_dist_config().moe_ep_size != 1
+             || !paged || paged->max_batch_size() != 3
+             || paged->block_size() != models::deepseek_v4::kV4PageSize
+             || input.return_draft_hidden_states || segments != 3
+             || bounds[0] != 0 || bounds[1] != 1 || bounds[2] != 2 || bounds[3] != 3)) {
+            throw std::invalid_argument("Classic NextN output-free C3 repair requires prepared TP8 Draft and three q1 spans");
+        }
         if (bounds[0] != 0 || bounds[segments] <= 0 || size_t(bounds[segments]) != (*ids)->numel()) {
             throw std::invalid_argument("Packed Draft offsets must cover all input tokens");
         }
@@ -820,7 +830,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         last_logits_expected = rows > requests;
     }
-    if (input.mtp_draft_cache_only) {
+    if (input.mtp_draft_cache_only && !c3_draft_repair_cache_only) {
         if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp" ||
             communication_group_.get_dist_config().pp_size != 1 ||
             (enable_graph_compiling_ && !input.mtp_graph_fresh_prefill) ||
@@ -974,6 +984,13 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
 
     auto output = workers_[0]->get_output();
+    if (c3_draft_repair_cache_only) {
+        for (const auto &worker : workers_) {
+            if (!worker->get_output().mtp_draft_cache_only_used) {
+                throw std::runtime_error("Classic NextN output-free C3 repair did not complete on every Draft rank");
+            }
+        }
+    }
     output.mtp_cpu_metadata_shadow_used = bool(v4_host_batch);
     output.mtp_shared_compression_plan_used = v4_host_batch && bool(v4_host_batch->plans());
     // Completed worker output remains a mutable borrowed view, not a snapshot.
