@@ -172,6 +172,12 @@ struct BatchMetadata {
     bool short_c4_index{};
     bool packed_collectives{};
     bool packed_mhc_pre{};
+    bool c128_no_store{};
+    bool c128_state_only{};
+    bool share_flashmla_schedule{};
+    // Derived from the current execution's stable length buffers by Graph nodes.
+    // Keep these outputs out of tensors(), which enumerates only incoming copies.
+    std::array<Tensor, 3> flashmla_schedules{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -179,6 +185,10 @@ struct BatchMetadata {
             &c128_slots,&c128_positions,&c128_indices,&c128_lengths,&c128_sources,&c128_state_slots};
     }
 };
+
+constexpr size_t flashmla_schedule_index(size_t ratio) {
+    return ratio == 0 ? 0 : ratio == 4 ? 1 : 2;
+}
 
 bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) {
     if (offsets.size() < 2 || offsets.size() > 4 ||
@@ -232,13 +242,25 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
           : *reinterpret_cast<const int32_t*>(positions->data())>0);
     const auto *row_offsets = reinterpret_cast<const int32_t*>(offsets->data());
     std::vector<size_t> query_offsets(row_offsets, row_offsets + offsets->numel());
-    return {input.position_ids.value()->view({positions->numel()}),
+    bool c128_no_store = false;
+    if (classic_mtp_target && input.mtp_graph_direct_commit && query_offsets.size() == 2 &&
+        short_verify_layout(query_offsets, positions->numel()) &&
+        rt.device().type() == runtime::Device::Type::kHygon &&
+        env_enabled("INFINILM_MTP_GRAPH_K3_C128_STATE_ONLY") &&
+        env_enabled("INFINIOPS_V4_C128_POOL_SHORT")) {
+        const auto *slots = reinterpret_cast<const int32_t *>(metadata.c128_out_loc->data());
+        c128_no_store = std::all_of(slots, slots + metadata.c128_out_loc->numel(),
+                                    [](int32_t slot) { return slot == -1; });
+    }
+    BatchMetadata batch{input.position_ids.value()->view({positions->numel()}),
             device(metadata.swa_indices), device(metadata.swa_topk_lengths), device(metadata.raw_out_loc),
             device(metadata.page_table), device(metadata.c4_out_loc), device(metadata.c4_positions),
             device(metadata.c4_topk_lengths_raw), device(metadata.c4_sparse_topk_lengths),
             device(c4.sources), device(c4.state_slots), device(metadata.c128_out_loc),
             device(metadata.c128_positions), device(metadata.c128_page_indices),
             device(metadata.c128_topk_lengths_clamp1), device(c128.sources), device(c128.state_slots),std::move(query_offsets),decode};
+    batch.c128_no_store = c128_no_store;
+    return batch;
 }
 
 class Attention final : public weights::ModelWeights {
@@ -318,11 +340,17 @@ public:
                                                   batch.c4_lengths,cache.indexer,indices);
             lengths = batch.c4_sparse_lengths;
         } else if (ratio_ == 128) {
-            auto compressed = compressor_->forward(rt,x,batch.c128_sources,batch.c128_state_slots,
-                                                  cache.compressor_state,batch.c128_positions,frequencies,batch.query_offsets);
-            // Compressed NoPE values round to BF16 before FP8 cache quantization.
-            store_mla_rows(rt,cast(rt,compressed,DataType::kBFloat16),
-                           batch.c128_slots,cache.compressed,kV4PageSize/128);
+            if (batch.c128_state_only) {
+                compressor_->update_state(rt, x, batch.c128_state_slots, cache.compressor_state,
+                                          batch.query_offsets);
+            } else {
+                auto compressed = compressor_->forward(rt,x,batch.c128_sources,batch.c128_state_slots,
+                                                       cache.compressor_state,batch.c128_positions,
+                                                       frequencies,batch.query_offsets);
+                // Compressed NoPE values round to BF16 before FP8 cache quantization.
+                store_mla_rows(rt,cast(rt,compressed,DataType::kBFloat16),
+                               batch.c128_slots,cache.compressed,kV4PageSize/128);
+            }
             indices = batch.c128_indices;
             lengths = batch.c128_lengths;
         }
@@ -331,7 +359,8 @@ public:
         auto local = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
             auto attended = sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
                                        part.slice(batch.swa_lengths), sink_, part.slice(indices),
-                                       part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)));
+                                       part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)),
+                                       batch.flashmla_schedules[flashmla_schedule_index(ratio_)]);
             apply_rotary_tail(rt, attended, part.slice(batch.position), frequencies, true);
             auto flattened = attended->view({part.count, heads_ * kV4HeadDim});
             return wo_a_->forward(rt, flattened);
@@ -663,8 +692,18 @@ public:
             short_target && !input.rollback_v4_cache;
         const bool owned_hc = scratch_hc || direct_hc || draft_seed_graph;
         // Eligibility must agree across ranks before any capture or collective.
-        const bool capture_mtp = mtp_graph_barrier && mtp_graph_barrier->all(
-            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph));
+        const bool local_capture =
+            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph);
+        bool capture_mtp = false;
+        if (mtp_graph_barrier && input.mtp_graph_direct_commit && batch.query_offsets.size() == 2) {
+            // Choose the same C128 graph on every rank, together with Graph eligibility.
+            const unsigned common = mtp_graph_barrier->common_decode_slots(
+                (local_capture ? 1u : 0u) | (direct_hc && batch.c128_no_store ? 2u : 0u));
+            capture_mtp = (common & 1u) != 0;
+            batch.c128_state_only = capture_mtp && (common & 2u) != 0;
+        } else if (mtp_graph_barrier) {
+            capture_mtp = mtp_graph_barrier->all(local_capture);
+        }
         // Both arms share the same immutable routes. No multi-row Fill is recorded.
         batch.packed_shared_constants = capture_mtp && packed_target &&
             (input.rollback_v4_cache || direct_hc) &&
@@ -708,6 +747,9 @@ public:
                 rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 &&
                 table_width <= kC4IndexMaxUnscoredPages &&
                 env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
+            batch.share_flashmla_schedule = input.mtp_share_flashmla_schedule && direct_hc &&
+                batch.query_offsets.size() == 2 && ids->numel() == 4 &&
+                rt.device().type() == runtime::Device::Type::kHygon;
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
                           draft_seed_graph, hc, true, owned_hc, direct_hc, draft_seed_graph);
         }
@@ -735,6 +777,7 @@ public:
         cache::validate_backend_cache_config(requested,backend);
         decode_plans_ = {};
         mtp_decode_plans_ = {};
+        c128_state_only_decode_plans_ = {};
         draft_seed_decode_plans_ = {};
         snapshot_backup_.reset();
         if (!requested) {
@@ -777,6 +820,7 @@ private:
         std::array<bool, 5> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
         size_t packed_mhc_calls = 0;
+        size_t flashmla_schedules_prepared = 0;
     };
 
     static Tensor copy_graph_tensor(Runtime &rt, const Tensor &source) {
@@ -838,8 +882,9 @@ private:
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
                   bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
                   bool return_hc = false, bool packed_direct = false, bool draft_seed_graph = false) const {
-        auto &plans = draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
-            : (classic_mtp ? mtp_decode_plans_ : decode_plans_);
+        auto &plans = batch.c128_state_only ? c128_state_only_decode_plans_
+            : (draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
+                                : (classic_mtp ? mtp_decode_plans_ : decode_plans_));
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
@@ -857,6 +902,7 @@ private:
                 plan->batch.short_c4_index != batch.short_c4_index ||
                 plan->batch.packed_collectives != batch.packed_collectives ||
                 plan->batch.packed_mhc_pre != batch.packed_mhc_pre ||
+                plan->batch.share_flashmla_schedule != batch.share_flashmla_schedule ||
                 plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
@@ -923,6 +969,23 @@ private:
             }
             rt.startGraphRecording(true);
             try {
+                if (candidate.batch.share_flashmla_schedule) {
+                    auto &stable = candidate.batch;
+                    const auto swa_width = stable.swa_indices->size(1);
+                    for (const auto ratio : cfg_.ratios) {
+                        auto &schedule = stable.flashmla_schedules[flashmla_schedule_index(ratio)];
+                        if (schedule) {
+                            continue;
+                        }
+                        const auto extra_lengths = ratio == 4 ? stable.c4_sparse_lengths
+                            : ratio == 128 ? stable.c128_lengths : Tensor{};
+                        const auto extra_width = ratio == 4 ? kC4IndexTopK
+                            : ratio == 128 ? stable.c128_indices->size(1) : 0;
+                        schedule = prepare_sparse_mla_schedule(
+                            rt, stable.swa_lengths, swa_width, extra_lengths, extra_width);
+                        ++candidate.flashmla_schedules_prepared;
+                    }
+                }
                 auto recorded = forward_logits(
                     rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph,
                     &candidate.packed_mhc_calls);
@@ -961,6 +1024,8 @@ private:
             if (packed_direct) {
                 report.mtp_packed_mhc_calls = recent->packed_mhc_calls;
             }
+            report.mtp_c128_state_only = recent->batch.c128_state_only;
+            report.mtp_flashmla_schedules_prepared = recent->flashmla_schedules_prepared;
         }
         Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
         output.mtp_last_logits_used = draft_seed_graph;
@@ -985,6 +1050,8 @@ private:
     // The two most recent shapes cover both sides of adjacent page boundaries.
     mutable std::array<std::optional<DecodePlan>, 2> decode_plans_;
     mutable std::array<std::optional<DecodePlan>, 2> mtp_decode_plans_;
+    // State-only and publishing graphs have different operator lists.
+    mutable std::array<std::optional<DecodePlan>, 2> c128_state_only_decode_plans_;
     // q2, q3 and q4 repair plans do not evict the proposal plans or one another.
     mutable std::array<std::array<std::optional<DecodePlan>, 2>, 3> draft_seed_decode_plans_;
 };

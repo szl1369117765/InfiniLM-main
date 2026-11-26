@@ -556,6 +556,7 @@ InferEngine::Input::to_model_input(
     input.mtp_scratch_step = mtp_scratch_step;
     input.mtp_last_logits = mtp_last_logits;
     input.mtp_graph_direct_commit = mtp_graph_direct_commit;
+    input.mtp_share_flashmla_schedule = mtp_share_flashmla_schedule;
     input.mtp_graph_draft_seed = mtp_graph_draft_seed;
 
     auto &attn_metadata = forward_context.attn_metadata;
@@ -622,6 +623,15 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
                 frozen_dispatch->block_tables = v4_host_batch->tables();
                 frozen_dispatch->slot_mapping = v4_host_batch->slots();
             }
+        }
+    }
+    if (original.mtp_graph_direct_commit && paged && paged->max_batch_size() == 1) {
+        const auto *mode = std::getenv("INFINILM_MTP_GRAPH_C1_FLASHMLA_SHARED_SCHEDULE");
+        if (mode && std::string_view(mode) == "1") {
+            if (!frozen_dispatch) {
+                frozen_dispatch.emplace(original);
+            }
+            frozen_dispatch->mtp_share_flashmla_schedule = true;
         }
     }
     const auto &input = frozen_dispatch ? *frozen_dispatch : original;
