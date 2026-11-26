@@ -13,6 +13,7 @@
 #include "layers/embedding/embedding.hpp"
 #include "models/models_registry.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -170,6 +171,7 @@ struct BatchMetadata {
     bool packed_shared_constants{};
     bool short_c4_index{};
     bool packed_collectives{};
+    bool packed_mhc_pre{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -421,17 +423,30 @@ private:
 
 HyperConnectionMix run_mhc(Runtime &rt, const Tensor &x, const MixWeights &w,
                            double norm_eps, double mix_eps, size_t iterations,
-                           const std::vector<size_t> &query_offsets) {
+                           const BatchMetadata &batch, size_t *packed_mhc_calls) {
     const auto rows = x->size(0), streams = x->size(1);
     HyperConnectionMix out{Tensor::empty(rt, {rows, x->size(2)}, x->dtype()),
                            Tensor::empty(rt, {rows, streams}, DataType::kFloat32),
                            Tensor::empty(rt, {rows, streams, streams}, DataType::kFloat32)};
-    // The Hygon operator selects a projection/reduction from its row count.
-    for_each_request(query_offsets, [&](const RequestRows &part) {
+    const auto submit_mix = [&](const Tensor &input, const Tensor &activation,
+                                const Tensor &post, const Tensor &combination) {
         submit<infini::ops::DeepseekV4MhcPre>(
-            rt, part.slice(x), w.projection, w.scale, w.base, norm_eps, mix_eps,
-            static_cast<int64_t>(iterations), part.slice(out.activation),
-            part.slice(out.post), part.slice(out.combination));
+            rt, input, w.projection, w.scale, w.base, norm_eps, mix_eps,
+            static_cast<int64_t>(iterations), activation, post, combination);
+    };
+    // For the Flash BF16 layout, q4 and M12 select the same per-row
+    // reduction and keep every row aligned at its original stride.
+    if (batch.packed_mhc_pre && rows == 12 && streams == 4 &&
+        x->size(2) == 4096 && x->dtype() == DataType::kBFloat16 && x->is_contiguous()) {
+        submit_mix(x, out.activation, out.post, out.combination);
+        if (packed_mhc_calls) {
+            ++*packed_mhc_calls;
+        }
+        return out;
+    }
+    for_each_request(batch.query_offsets, [&](const RequestRows &part) {
+        submit_mix(part.slice(x), part.slice(out.activation),
+                   part.slice(out.post), part.slice(out.combination));
     });
     return out;
 }
@@ -462,19 +477,20 @@ public:
     }
 
     Tensor forward(Runtime &rt, const Tensor &residual, const Tensor &tokens,
-                   const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies) const {
-        const auto attention = mix(rt,residual,attn_mix_,batch.query_offsets);
+                   const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies,
+                   size_t *packed_mhc_calls) const {
+        const auto attention = mix(rt,residual,attn_mix_,batch,packed_mhc_calls);
         const auto attended = attn_->forward(rt,attn_norm_->forward(rt,attention.activation),batch,cache,frequencies);
         const auto next = run_mhc_post(rt,attended,residual,attention);
-        const auto feed_forward = mix(rt,next,ffn_mix_,batch.query_offsets);
+        const auto feed_forward = mix(rt,next,ffn_mix_,batch,packed_mhc_calls);
         const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt,feed_forward.activation), tokens, batch);
         return run_mhc_post(rt,experts,next,feed_forward);
     }
 
 private:
     HyperConnectionMix mix(Runtime &rt, const Tensor &x, const MixWeights &w,
-                           const std::vector<size_t> &query_offsets) const {
-        return run_mhc(rt, x, w, norm_eps_, mix_eps_, iterations_, query_offsets);
+                           const BatchMetadata &batch, size_t *packed_mhc_calls) const {
+        return run_mhc(rt, x, w, norm_eps_, mix_eps_, iterations_, batch, packed_mhc_calls);
     }
     double norm_eps_, mix_eps_;
     size_t iterations_;
@@ -509,7 +525,8 @@ public:
     std::pair<Tensor,Tensor> forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
                    const std::vector<LayerPagedCache> &caches,
                    const Tensor &swa_rope, const Tensor &compressed_rope,
-                   const Tensor &target_hc, bool return_hc, bool cache_only = false) const {
+                   const Tensor &target_hc, bool return_hc, bool cache_only = false,
+                   size_t *packed_mhc_calls = nullptr) const {
         const auto rows = tokens->numel();
         const Shape hc_shape{rows,streams_,hidden_};
         if (is_mtp_ && (!target_hc || target_hc->shape() != hc_shape ||
@@ -535,7 +552,8 @@ public:
         }
         for (size_t i=0;i<layers_.size();++i) {
             residual = layers_[i]->forward(rt,residual,tokens,batch,caches[i],
-                                           caches[i].compression_ratio ? compressed_rope : swa_rope);
+                                           caches[i].compression_ratio ? compressed_rope : swa_rope,
+                                           packed_mhc_calls);
         }
         if (cache_only) {
             return {};
@@ -546,7 +564,7 @@ public:
             hc_output->copy_from(rt,residual);
         }
         auto normalized = norm_->forward(rt,run_mhc(
-            rt,residual,head_,rms_eps_,hc_eps_,0,batch.query_offsets).activation);
+            rt,residual,head_,rms_eps_,hc_eps_,0,batch,packed_mhc_calls).activation);
         return {std::move(normalized),std::move(hc_output)};
     }
 
@@ -643,6 +661,12 @@ public:
         }
         batch.packed_collectives = capture_mtp && direct_hc && batch.query_offsets.size() == 4 &&
             env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_TARGET_COLLECTIVES");
+        constexpr std::array<size_t, 4> c3_q4_offsets{0, 4, 8, 12};
+        batch.packed_mhc_pre = capture_mtp && direct_hc &&
+            rt.device().type() == runtime::Device::Type::kHygon &&
+            env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_MHC_PRE") &&
+            std::equal(batch.query_offsets.begin(), batch.query_offsets.end(),
+                       c3_q4_offsets.begin(), c3_q4_offsets.end());
         if (input.mtp_graph_draft_seed && !capture_mtp) {
             throw std::runtime_error("Classic NextN Graph Draft seed requires a device Graph with owned Draft HC");
         }
@@ -734,6 +758,7 @@ private:
         bool return_hc;
         std::array<bool, 3> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
+        size_t packed_mhc_calls = 0;
     };
 
     static Tensor copy_graph_tensor(Runtime &rt, const Tensor &source) {
@@ -769,8 +794,9 @@ private:
 
     Output forward_logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch,
                           const Tensor &target_hc = {},bool return_hc = false,
-                          bool last_logits = false) const {
-        auto [hidden,hc] = backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc);
+                          bool last_logits = false, size_t *packed_mhc_calls = nullptr) const {
+        auto [hidden,hc] = backbone_->forward(
+            rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc,false,packed_mhc_calls);
         // A per-token projection retains the reference's M=1 accumulation boundary
         // and leaves full packed HC available to seed or repair Draft.
         if (batch.packed_collectives && !last_logits) {
@@ -809,6 +835,7 @@ private:
                 plan->batch.packed_shared_constants != batch.packed_shared_constants ||
                 plan->batch.short_c4_index != batch.short_c4_index ||
                 plan->batch.packed_collectives != batch.packed_collectives ||
+                plan->batch.packed_mhc_pre != batch.packed_mhc_pre ||
                 plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
@@ -876,7 +903,8 @@ private:
             rt.startGraphRecording(true);
             try {
                 auto recorded = forward_logits(
-                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph);
+                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph,
+                    &candidate.packed_mhc_calls);
                 candidate.logits = std::move(recorded.logits);
                 candidate.hidden_states = std::move(recorded.hidden_states);
                 if (greedy && sampling_rank_) {
@@ -909,6 +937,9 @@ private:
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
         if (classic_mtp && env_enabled("INFINILM_MTP_GRAPH_PLAN_RECEIPT")) {
             report.mtp_graph_plan = common_slots ? "hit" : "capture";
+            if (packed_direct) {
+                report.mtp_packed_mhc_calls = recent->packed_mhc_calls;
+            }
         }
         Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
         output.mtp_last_logits_used = draft_seed_graph;

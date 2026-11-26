@@ -415,6 +415,7 @@ inline void bind_infer_engine(py::module &m) {
                     entry["operator_count"] = report.operator_count;
                     if (report.mtp_graph_plan) {
                         entry["mtp_graph_plan"] = report.mtp_graph_plan;
+                        entry["mtp_packed_mhc_calls"] = report.mtp_packed_mhc_calls;
                     }
                     rank_reports.append(std::move(entry));
                 }

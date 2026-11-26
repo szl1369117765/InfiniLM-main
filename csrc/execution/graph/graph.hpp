@@ -65,6 +65,7 @@ public:
         bool capture_attempted = false;
         std::string fallback_reason;
         const char *mtp_graph_plan = nullptr;
+        size_t mtp_packed_mhc_calls = 0;
     };
 
     Graph();
