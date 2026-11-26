@@ -104,6 +104,7 @@ public:
         bool rollback_v4_cache{false};
         std::optional<std::vector<infinilm::runtime::Tensor>> target_hidden_states_by_rank;
         bool mtp_draft_cache_only{false};
+        bool mtp_eager_c3_draft_repair_cache_only{false};
         bool mtp_cpu_metadata_shadow{false};
         bool mtp_shared_compression_plan{false};
         bool mtp_scratch_step{false};

@@ -52,7 +52,7 @@ class _TargetTransaction:
     def __init__(self, transport, batch, tables, tokens, verify_hidden=None,
                  proposal_laws=(), logits=None, *, omit_terminal=False, early_rejection=False,
                  scratch_commit=None, batch_draft_seed=False, k1_graph_seed=False,
-                 graph_k3_draft_seed=False):
+                 graph_k3_draft_seed=False, eager_c3_repair_cache_only=False):
         self.transport = transport
         self.batch = batch
         self.tables = tables
@@ -71,6 +71,7 @@ class _TargetTransaction:
         self.batch_draft_seed = batch_draft_seed
         self.k1_graph_seed = k1_graph_seed
         self.graph_k3_draft_seed = graph_k3_draft_seed
+        self.eager_c3_repair_cache_only = eager_c3_repair_cache_only
         self._resolved = None
         self.committed = False
 
@@ -270,6 +271,7 @@ class _TargetTransaction:
                     self.transport._write_draft_cache(
                         tokens[offset:offset + 1], start + offset - 1, table,
                         _slice_hidden(hidden, offset - 1, 1),
+                        **({"eager_c3_repair": True} if self.eager_c3_repair_cache_only else {}),
                     )
         self.transport.states[intent.owner] = _DraftState(
             _slice_hidden(hidden, count - 1, 1), intent.next_anchor, intent.retain_length, seed=seed,
@@ -416,11 +418,15 @@ class _V4Transport:
     def _forward(self, engine, tokens, start, table, *, draft_hidden=None,
                  return_hidden=True, rollback=False, sample_all_positions=True,
                  return_logits=False, cache_only=False, graph_fresh_prefill=False,
-                 graph_draft_seed=False):
+                 graph_draft_seed=False, eager_c3_repair=False):
         if cache_only and (
             engine is not self.draft or not draft_hidden or return_hidden or rollback or return_logits
         ):
             raise ValueError("Classic NextN cache-only is limited to an output-free Draft cache write")
+        if eager_c3_repair and (
+            not cache_only or len(tokens) != 1 or not sample_all_positions or graph_fresh_prefill or graph_draft_seed
+        ):
+            raise ValueError("Eager C3 cache-only repair requires one Draft row")
         end = start + len(tokens)
         if graph_draft_seed:
             # The reservation also holds pages written by rejected proposals.
@@ -448,6 +454,7 @@ class _V4Transport:
             rollback_v4_cache=rollback,
             target_hidden_states_by_rank=draft_hidden,
             **({"mtp_draft_cache_only": True} if cache_only else {}),
+            **({"mtp_eager_c3_draft_repair_cache_only": True} if eager_c3_repair else {}),
             **({"mtp_last_logits": True} if last_logits else {}),
             **({"mtp_graph_fresh_prefill": True} if graph_fresh_prefill else {}),
             **({"mtp_graph_draft_seed": True} if graph_draft_seed else {}),
@@ -468,7 +475,7 @@ class _V4Transport:
             raise RuntimeError("Classic NextN Draft seed did not select the last logits row")
         if cache_only:
             if result.get("mtp_draft_cache_only_used") is not True or any(
-                result.get(key) is not None for key in ("output_ids", "logits", "hidden_states")
+                result.get(key) is not None for key in ("output_ids", "logits", "hidden_states", "hidden_states_by_rank")
             ):
                 raise RuntimeError("Classic NextN Draft cache-only did not return a completed cache write")
             return
@@ -477,10 +484,11 @@ class _V4Transport:
             return decoded
         return (*decoded, host_logit_rows(result["logits"], len(tokens), engine.hf_config["vocab_size"]))
 
-    def _write_draft_cache(self, tokens, start, table, hidden, *, graph_fresh_prefill=False):
+    def _write_draft_cache(self, tokens, start, table, hidden, *, graph_fresh_prefill=False, eager_c3_repair=False):
         self._forward(
             self.draft, tokens, start, table, draft_hidden=hidden, return_hidden=False,
-            **({"cache_only": True} if self.draft_cache_only or graph_fresh_prefill else {}),
+            **({"cache_only": True} if self.draft_cache_only or graph_fresh_prefill or eager_c3_repair else {}),
+            **({"eager_c3_repair": True} if eager_c3_repair else {}),
             **({"graph_fresh_prefill": True} if graph_fresh_prefill else {}),
         )
 
@@ -778,6 +786,12 @@ class _V4Transport:
                 direct_option = "eager_direct_commit"
             if direct_option is not None:
                 direct_tables = self._packed_direct_tables(batch, tables)
+        eager_c3_repair_cache_only = (
+            direct_option == "eager_direct_commit" and direct_tables is not None
+            and os.getenv("INFINILM_MTP_EAGER_C3_DRAFT_REPAIR_CACHE_ONLY") == "1"
+        )
+        if eager_c3_repair_cache_only and getattr(self.draft, "mtp_eager_c3_draft_repair_cache_only_version", 0) != 1:
+            raise RuntimeError("Eager C3 repair requires native output-free Draft cache support")
         if direct_tables is not None:
             result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, **{direct_option: True})
             verify_hidden = result[1]
@@ -814,6 +828,7 @@ class _V4Transport:
                 len(request.draft_tokens) == 1 for request in batch.requests
             ),
             graph_k3_draft_seed=self.graph_k3_draft_seed and len(tables) == 1 and direct_tables is not None,
+            eager_c3_repair_cache_only=eager_c3_repair_cache_only,
         )
         with self._publishing(transaction):
             yield transaction

@@ -366,6 +366,7 @@ class InferEngine(_infinilm.InferEngine):
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
         mtp_draft_cache_only=False,
+        mtp_eager_c3_draft_repair_cache_only=False,
         mtp_cpu_metadata_shadow=False,
         mtp_shared_compression_plan=False,
         mtp_scratch_step=False,
@@ -426,6 +427,12 @@ class InferEngine(_infinilm.InferEngine):
             if getattr(self, "mtp_draft_cache_only_version", 0) != 1:
                 raise RuntimeError("Classic NextN Draft cache-only requires the native output policy")
             mtp_arguments["mtp_draft_cache_only"] = True
+        if type(mtp_eager_c3_draft_repair_cache_only) is not bool:
+            raise ValueError("mtp_eager_c3_draft_repair_cache_only must be a bool")
+        if mtp_eager_c3_draft_repair_cache_only:
+            if not mtp_draft_cache_only or getattr(self, "mtp_eager_c3_draft_repair_cache_only_version", 0) != 1:
+                raise RuntimeError("Eager C3 repair requires native output-free Draft cache support")
+            mtp_arguments["mtp_eager_c3_draft_repair_cache_only"] = True
         if type(mtp_graph_direct_commit) is not bool:
             raise ValueError("mtp_graph_direct_commit must be a bool")
         if mtp_graph_direct_commit:
@@ -636,6 +643,7 @@ class InferEngine(_infinilm.InferEngine):
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
         mtp_draft_cache_only=False,
+        mtp_eager_c3_draft_repair_cache_only=False,
         mtp_cpu_metadata_shadow=False,
         mtp_shared_compression_plan=False,
         mtp_scratch_step=False,
@@ -671,6 +679,7 @@ class InferEngine(_infinilm.InferEngine):
                     rollback_v4_cache=rollback_v4_cache,
                     target_hidden_states_by_rank=target_hidden_states_by_rank,
                     mtp_draft_cache_only=mtp_draft_cache_only,
+                    mtp_eager_c3_draft_repair_cache_only=mtp_eager_c3_draft_repair_cache_only,
                     mtp_cpu_metadata_shadow=mtp_cpu_metadata_shadow,
                     mtp_shared_compression_plan=mtp_shared_compression_plan,
                     mtp_scratch_step=mtp_scratch_step,

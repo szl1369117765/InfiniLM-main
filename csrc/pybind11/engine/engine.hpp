@@ -73,6 +73,7 @@ inline void bind_infer_engine(py::module &m) {
     infer_engine.def_property_readonly("mtp_graph_packed_direct_commit_version", [](const InferEngine &) { return 1; });
     infer_engine.def_property_readonly("mtp_eager_packed_direct_commit_version", [](const InferEngine &) { return 1; });
     infer_engine.attr("mtp_draft_cache_only_version") = 1;
+    infer_engine.attr("mtp_eager_c3_draft_repair_cache_only_version") = 1;
     infer_engine.attr("mtp_cpu_metadata_shadow_version") = 1;
     infer_engine.attr("mtp_shared_compression_plan_version") = 1;
     infer_engine.attr("mtp_scratch_step_version") = 1;
@@ -252,6 +253,7 @@ inline void bind_infer_engine(py::module &m) {
                     "rollback_v4_cache",
                     "target_hidden_states_by_rank",
                     "mtp_draft_cache_only",
+                    "mtp_eager_c3_draft_repair_cache_only",
                     "mtp_cpu_metadata_shadow",
                     "mtp_shared_compression_plan",
                     "mtp_scratch_step",
@@ -295,6 +297,8 @@ inline void bind_infer_engine(py::module &m) {
                         input.rollback_v4_cache = py::cast<bool>(item.second);
                     } else if (key == "mtp_draft_cache_only") {
                         input.mtp_draft_cache_only = py::cast<bool>(item.second);
+                    } else if (key == "mtp_eager_c3_draft_repair_cache_only") {
+                        input.mtp_eager_c3_draft_repair_cache_only = py::cast<bool>(item.second);
                     } else if (key == "mtp_cpu_metadata_shadow" || key == "mtp_shared_compression_plan") {
                         if (!py::isinstance<py::bool_>(item.second)) {
                             throw py::value_error(key + " must be a bool");

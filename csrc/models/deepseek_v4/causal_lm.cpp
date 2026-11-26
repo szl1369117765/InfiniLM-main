@@ -273,6 +273,13 @@ public:
         kv_norm_fp32_ = cast(rt,kv_norm_->weight(),DataType::kFloat32);
     }
 
+    void write_swa(Runtime &rt, const Tensor &x, const BatchMetadata &batch,
+                   const LayerPagedCache &cache, const Tensor &frequencies) const {
+        auto kv = normalize_and_rotate(rt,wkv_->forward(rt,x),kv_norm_fp32_,static_cast<float>(eps_),
+                                       batch.position,frequencies);
+        store_mla_rows(rt,kv,batch.swa_slots,cache.swa,kV4PageSize);
+    }
+
     Tensor forward(Runtime &rt, Tensor x, const BatchMetadata &batch, const LayerPagedCache &cache,
                    const Tensor &frequencies) const {
         const auto rows = x->size(0);
@@ -281,9 +288,7 @@ public:
         const auto eps = static_cast<float>(eps_);
         auto q = cast(rt, normalize_and_rotate(rt,q_raw,q_ones_,eps,batch.position,frequencies,true),
                       q_raw->dtype());
-        auto kv = normalize_and_rotate(rt,wkv_->forward(rt,x),kv_norm_fp32_,eps,
-                                       batch.position,frequencies);
-        store_mla_rows(rt,kv,batch.swa_slots,cache.swa,kV4PageSize);
+        write_swa(rt,x,batch,cache,frequencies);
         Tensor indices, lengths;
         if (ratio_ == 4) {
             auto compressed = compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
@@ -477,9 +482,14 @@ public:
 
     Tensor forward(Runtime &rt, const Tensor &residual, const Tensor &tokens,
                    const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies,
-                   size_t *packed_mhc_calls) const {
+                   size_t *packed_mhc_calls, bool cache_write_only) const {
         const auto attention = mix(rt,residual,attn_mix_,batch.query_offsets,packed_mhc_calls);
-        const auto attended = attn_->forward(rt,attn_norm_->forward(rt,attention.activation),batch,cache,frequencies);
+        const auto normalized = attn_norm_->forward(rt,attention.activation);
+        if (cache_write_only) {
+            attn_->write_swa(rt,normalized,batch,cache,frequencies);
+            return {};
+        }
+        const auto attended = attn_->forward(rt,normalized,batch,cache,frequencies);
         const auto next = run_mhc_post(rt,attended,residual,attention);
         const auto feed_forward = mix(rt,next,ffn_mix_,batch.query_offsets,packed_mhc_calls);
         const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt,feed_forward.activation), tokens, batch);
@@ -525,8 +535,13 @@ public:
                    const std::vector<LayerPagedCache> &caches,
                    const Tensor &swa_rope, const Tensor &compressed_rope,
                    const Tensor &target_hc, bool return_hc, bool cache_only = false,
-                   size_t *packed_mhc_calls = nullptr) const {
+                   size_t *packed_mhc_calls = nullptr, bool cache_write_only = false) const {
         const auto rows = tokens->numel();
+        if (cache_write_only &&
+            (!cache_only || !is_mtp_ || rows != 1 || layers_.size() != 1 || caches.size() != 1
+             || caches.front().compression_ratio != 0)) {
+            throw std::invalid_argument("Eager C3 cache-only repair requires one q1 SWA layer");
+        }
         const Shape hc_shape{rows,streams_,hidden_};
         if (is_mtp_ && (!target_hc || target_hc->shape() != hc_shape ||
                         target_hc->dtype() != DataType::kBFloat16 || target_hc->device() != rt.device())) {
@@ -552,7 +567,7 @@ public:
         for (size_t i=0;i<layers_.size();++i) {
             residual = layers_[i]->forward(rt,residual,tokens,batch,caches[i],
                                            caches[i].compression_ratio ? compressed_rope : swa_rope,
-                                           packed_mhc_calls);
+                                           packed_mhc_calls,cache_write_only);
         }
         if (cache_only) {
             return {};
@@ -641,7 +656,8 @@ public:
                 throw std::invalid_argument("Classic NextN cache-only is an eager Draft write");
             }
             backbone_->forward(rt, ids, batch, caches_, swa_rope_, compressed_rope_,
-                               input.target_hidden_states.value_or(Tensor{}), false, true);
+                               input.target_hidden_states.value_or(Tensor{}), false, true,
+                               nullptr, input.mtp_eager_c3_draft_repair_cache_only);
             Output output{};
             output.mtp_draft_cache_only_used = true;
             return output;

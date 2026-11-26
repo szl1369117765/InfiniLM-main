@@ -539,6 +539,7 @@ InferEngine::Input::to_model_input(
     input.return_draft_hidden_states = return_draft_hidden_states;
     input.rollback_v4_cache = rollback_v4_cache;
     input.mtp_draft_cache_only = mtp_draft_cache_only;
+    input.mtp_eager_c3_draft_repair_cache_only = mtp_eager_c3_draft_repair_cache_only;
     input.mtp_scratch_step = mtp_scratch_step;
     input.mtp_last_logits = mtp_last_logits;
     input.mtp_graph_direct_commit = mtp_graph_direct_commit;
@@ -802,6 +803,16 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         last_logits_expected = rows > requests;
     }
+    if (input.mtp_eager_c3_draft_repair_cache_only &&
+        (!input.mtp_draft_cache_only || enable_graph_compiling_ || nsa_pool_epoch_
+         || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1 || workers_.size() != 8
+         || !paged || paged->block_size() != models::deepseek_v4::kV4PageSize
+         || input.target_hidden_states || !input.sample_all_positions || input.top_k != 1
+         || input.sampling_rows || input.random_values || input.mtp_scratch_step || input.mtp_last_logits
+         || input.mtp_graph_direct_commit || input.mtp_eager_packed_direct_commit
+         || input.mtp_graph_fresh_prefill || input.mtp_graph_draft_seed)) {
+        throw std::invalid_argument("Eager C3 cache-only repair requires a plain TP8 greedy Draft write");
+    }
     if (input.mtp_draft_cache_only) {
         if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp" ||
             communication_group_.get_dist_config().pp_size != 1 ||
@@ -819,7 +830,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
         if (bounds[0] != 0 || bounds[1] <= 0 ||
-            static_cast<size_t>(bounds[1]) != (*input.input_ids)->numel()) {
+            static_cast<size_t>(bounds[1]) != (*input.input_ids)->numel()
+            || (input.mtp_eager_c3_draft_repair_cache_only && bounds[1] != 1)) {
             throw std::invalid_argument("Classic NextN cache-only offsets must cover all input tokens");
         }
     }
@@ -951,6 +963,13 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     }
 
     auto output = workers_[0]->get_output();
+    if (input.mtp_eager_c3_draft_repair_cache_only) {
+        for (const auto &worker : workers_) {
+            if (!worker->get_output().mtp_draft_cache_only_used) {
+                throw std::runtime_error("Eager C3 cache-only repair did not complete on every Draft rank");
+            }
+        }
+    }
     output.mtp_cpu_metadata_shadow_used = bool(v4_host_batch);
     output.mtp_shared_compression_plan_used = v4_host_batch && bool(v4_host_batch->plans());
     // Completed worker output remains a mutable borrowed view, not a snapshot.

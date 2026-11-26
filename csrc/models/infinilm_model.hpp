@@ -87,6 +87,7 @@ public:
         bool return_draft_hidden_states{false};
         bool rollback_v4_cache{false};
         bool mtp_draft_cache_only{false};
+        bool mtp_eager_c3_draft_repair_cache_only{false};
         std::shared_ptr<const engine::DeepSeekV4HostBatch> deepseek_v4_host_batch;
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};

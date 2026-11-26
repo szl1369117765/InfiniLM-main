@@ -183,6 +183,71 @@ class DirectCommitTest(unittest.TestCase):
         for owner, row in (("a", 3), ("b", 4), ("c", 8)):
             self.assert_hidden_row(port.states[owner].hidden, "verify", row)
 
+    def test_eager_c3_cache_only_uses_the_same_single_row_metadata_and_hc(self):
+        calls = []
+        for enabled in (False, True):
+            port, target, draft, batch, tables = self.packed_direct_step(
+                enabled=True, eager=True, eager_selected=True,
+            )
+            port.shared_compression_plan = True
+            draft.mtp_eager_c3_draft_repair_cache_only_version = 1
+            if enabled:
+                draft.responses[0] = cache_write_receipt()
+            with patch.dict(os.environ, {"INFINILM_MTP_EAGER_C3_DRAFT_REPAIR_CACHE_ONLY": str(int(enabled))}):
+                with port.target_transaction(batch, tables, eager_packed_direct_commit=True) as tx:
+                    tx.commit(batch.resolve(tx.rows))
+            self.assertEqual(len(target.calls), 1)
+            self.assertEqual(len(draft.calls), 1)
+            self.assert_hidden_row(port.states["c"].hidden, "verify", 8)
+            calls.append(draft.calls[0])
+        before, after = calls
+        for key in ("input_ids", "input_offsets", "position_ids", "past_kv_lengths", "total_kv_lengths",
+                    "cu_seqlens", "block_tables", "slot_mapping"):
+            self.assertEqual(before[key].values, after[key].values, key)
+        self.assertEqual(after["input_offsets"].values, [0, 1])
+        self.assertEqual(after["position_ids"].values, [255])
+        self.assert_hidden_row(before["target_hidden_states_by_rank"], "verify", 7)
+        self.assert_hidden_row(after["target_hidden_states_by_rank"], "verify", 7)
+        for key in ("sample_all_positions", "top_k", "return_draft_hidden_states", "mtp_shared_compression_plan"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertNotIn("mtp_eager_c3_draft_repair_cache_only", before)
+        self.assertTrue(after["mtp_eager_c3_draft_repair_cache_only"])
+        self.assertTrue(after["mtp_draft_cache_only"])
+
+    def test_eager_c3_cache_only_switch_does_not_affect_protected_or_short_cohorts(self):
+        for owner_count, selected in ((3, False), (2, True)):
+            with self.subTest(owner_count=owner_count, selected=selected):
+                port, target, draft, batch, tables = self.packed_direct_step(
+                    enabled=False, eager=True, eager_selected=selected, owner_count=owner_count,
+                )
+                with patch.dict(os.environ, {"INFINILM_MTP_EAGER_C3_DRAFT_REPAIR_CACHE_ONLY": "1"}):
+                    with port.target_transaction(batch, tables, eager_packed_direct_commit=True) as tx:
+                        tx.commit(batch.resolve(tx.rows))
+                self.assertTrue(target.calls[0]["rollback_v4_cache"])
+                self.assertTrue(all("mtp_eager_c3_draft_repair_cache_only" not in call for call in draft.calls))
+
+    def test_eager_c3_cache_only_requires_abi_before_writes_and_checks_native_receipt(self):
+        cases = (
+            (False, cache_write_receipt(), "native output-free", 0),
+            (True, output([29]), "completed cache write", 1),
+            (True, {**cache_write_receipt(), "hidden_states_by_rank": (Tensor([]),)}, "completed cache write", 1),
+        )
+        for abi, receipt, message, expected_writes in cases:
+            with self.subTest(abi=abi, receipt=receipt):
+                port, target, draft, batch, tables = self.packed_direct_step(
+                    enabled=True, eager=True, eager_selected=True,
+                )
+                if abi:
+                    draft.mtp_eager_c3_draft_repair_cache_only_version = 1
+                draft.responses[0] = receipt
+                with patch.dict(os.environ, {"INFINILM_MTP_EAGER_C3_DRAFT_REPAIR_CACHE_ONLY": "1"}):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        with port.target_transaction(batch, tables, eager_packed_direct_commit=True) as tx:
+                            tx.commit(batch.resolve(tx.rows))
+                self.assertEqual(len(target.calls), expected_writes)
+                self.assertEqual(len(draft.calls), expected_writes)
+                self.assertEqual(port.states["c"].position, 255)
+
     def test_packed_eager_direct_leaves_arm_off_and_short_cohorts_protected(self):
         for owner_count, selected in ((3, False), (2, True)):
             with self.subTest(owner_count=owner_count, selected=selected):
