@@ -161,6 +161,7 @@ class _TargetTransaction:
                     _DraftSegment((token,), start + offset, table, _slice_hidden(hidden, offset, 1))
                 )
 
+        cache_only = worker_join and os.getenv("INFINILM_MTP_GRAPH_C3_DRAFT_REPAIR_CACHE_ONLY") == "1"
         for segments in by_depth:
             if len(segments) == 1:
                 (segment,) = segments
@@ -168,6 +169,7 @@ class _TargetTransaction:
             else:
                 self.transport._forward_draft_segments(
                     segments, return_hidden=False, worker_join=worker_join,
+                    cache_only=cache_only and len(segments) == 3,
                 )
         self.transport.states.update(updates)
 
@@ -406,6 +408,13 @@ class _V4Transport:
             raise RuntimeError("MTP native forward returned invalid token IDs")
         return tokens, result.get("hidden_states_by_rank")
 
+    @staticmethod
+    def _check_draft_cache_write(result):
+        if result.get("mtp_draft_cache_only_used") is not True or any(
+            result.get(key) is not None for key in ("output_ids", "logits", "hidden_states", "hidden_states_by_rank")
+        ):
+            raise RuntimeError("Classic NextN Draft cache-only did not return a completed cache write")
+
     def _slots(self, table, start, end):
         if start < 0 or start >= end or end > self.page_size * len(table):
             raise ValueError("MTP token span exceeds the scheduler's page table")
@@ -473,10 +482,7 @@ class _V4Transport:
         if (last_logits or graph_draft_seed) and result.get("mtp_last_logits_used") is not True:
             raise RuntimeError("Classic NextN Draft seed did not select the last logits row")
         if cache_only:
-            if result.get("mtp_draft_cache_only_used") is not True or any(
-                result.get(key) is not None for key in ("output_ids", "logits", "hidden_states")
-            ):
-                raise RuntimeError("Classic NextN Draft cache-only did not return a completed cache write")
+            self._check_draft_cache_write(result)
             return
         decoded = self._decode(result, len(tokens) if sample_all_positions else 1)
         if not return_logits:
@@ -507,7 +513,12 @@ class _V4Transport:
             core.set_device(previous)
         return hidden
 
-    def _forward_draft_segments(self, segments, *, return_hidden, worker_join=False):
+    def _forward_draft_segments(self, segments, *, return_hidden, worker_join=False, cache_only=False):
+        if cache_only:
+            if not worker_join or return_hidden or len(segments) != 3 or any(len(part.tokens) != 1 for part in segments):
+                raise ValueError("C3 Draft repair cache-only requires three worker-local one-row spans")
+            if getattr(self.draft, "mtp_c3_draft_repair_cache_only_version", 0) != 1:
+                raise RuntimeError("C3 Draft repair cache-only requires native support")
         if len(segments) == 1:
             (segment,) = segments
             return self._forward(
@@ -552,8 +563,12 @@ class _V4Transport:
             top_k=1,
             return_draft_hidden_states=return_hidden,
             **hidden_input,
+            **({"mtp_draft_cache_only": True} if cache_only else {}),
             **self._host_metadata_options(),
         )
+        if cache_only:
+            self._check_draft_cache_write(result)
+            return
         return self._decode(result, len(segments))
 
     def _forward_packed(self, engine, batch, tables, *, return_hidden=False, rollback=False,

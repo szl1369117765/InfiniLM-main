@@ -1073,7 +1073,7 @@ void RankWorker::thread_loop() {
                                 if (rank_info_.tp_rank == 0 && !local_args.random_values) {
                                     const size_t n_out = local_args.sample_all_positions
                                                            ? local_args.input_ids.value()->numel()
-                                                           : 1;
+                                                           : effective_args.input_offsets.value()->size(0) - 1;
                                     for (size_t i = 0; i < n_out; ++i) {
                                         (void)std::uniform_real_distribution<float>(0, 1)(rng_);
                                     }
