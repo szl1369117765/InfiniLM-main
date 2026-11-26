@@ -1,5 +1,6 @@
 """Eager classic DeepSeek V4 NextN execution."""
 
+import os
 from dataclasses import replace
 
 from ..sampling_params import validate_stop_strings, validate_stop_token_ids
@@ -203,8 +204,14 @@ class DeepSeekV4MTPRunner:
             if batched:
                 proposals = [self._proposal_request(candidate) for candidate in candidates]
                 counts = tuple(candidate["draft_count"] for candidate in candidates)
+                proposal_options = {"keep_final_graph": True} if keep_final_graph else {}
+                if keep_final_graph and os.getenv("INFINILM_MTP_GRAPH_C3_BATCH_FINAL_DRAFT") == "1":
+                    # Recheck the live lease at the last hop, after earlier Draft writes.
+                    proposal_options["permit_final_batch"] = lambda: (
+                        self.transport.graph_packed_direct_enabled() and reservation.permits_packed_direct_target(tables)
+                    )
                 chains = self.transport.propose_batched(
-                    proposals, tables, counts, **({"keep_final_graph": True} if keep_final_graph else {}),
+                    proposals, tables, counts, **proposal_options,
                 )
                 requests = [replace(request, draft_tokens=chain)
                             for request, chain in zip(proposals, chains, strict=True)]

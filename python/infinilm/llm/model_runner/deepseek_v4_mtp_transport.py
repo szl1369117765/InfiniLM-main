@@ -687,7 +687,7 @@ class _V4Transport:
             return seed
         return None
 
-    def propose_batched(self, requests, tables, counts, *, keep_final_graph=False):
+    def propose_batched(self, requests, tables, counts, *, keep_final_graph=False, permit_final_batch=None):
         states, chains, hidden = [], [], []
         for request, table, count in zip(requests, tables, counts, strict=True):
             state = self._ready_state(request.owner, request.anchor, request.start)
@@ -696,13 +696,19 @@ class _V4Transport:
             chains.append([seed.token] if seed is not None else [])
             hidden.append(seed.hidden if seed is not None else state.hidden)
         for depth in range(max(counts)):
+            batch_final = (
+                keep_final_graph and permit_final_batch is not None and counts == (3, 3, 3) and depth == 2
+                and all(len(chain) == depth and chain[-1] not in request.eos_token_ids
+                        for chain, request in zip(chains, requests, strict=True))
+                and permit_final_batch()
+            )
             active, segments = [], []
             for index, (request, table, count) in enumerate(zip(requests, tables, counts, strict=True)):
                 chain = chains[index]
                 token = chain[-1] if chain else request.anchor
                 if len(chain) == depth < count and (not chain or token not in request.eos_token_ids):
                     segment = _DraftSegment((token,), request.start - 1 + depth, table, hidden[index])
-                    if keep_final_graph and depth + 1 == count:
+                    if keep_final_graph and not batch_final and depth + 1 == count:
                         # Keep the span eligible for the Draft q1 Graph.
                         (last,), _ = self._forward_draft_segments((segment,), return_hidden=False)
                         chain.append(last)
