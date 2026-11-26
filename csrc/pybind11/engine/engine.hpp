@@ -342,8 +342,7 @@ inline void bind_infer_engine(py::module &m) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
                     } else if (key == "target_hidden_segments_by_rank" && !item.second.is_none()) {
-                        input.target_hidden_segments_by_rank =
-                            py::cast<std::vector<std::vector<infinilm::runtime::Tensor>>>(item.second);
+                        input.target_hidden_segments_by_rank = py::cast<std::vector<std::vector<infinilm::runtime::Tensor>>>(item.second);
                     }
                 }
 

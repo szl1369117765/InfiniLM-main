@@ -67,20 +67,7 @@ struct V4Config {
             json.at("quantization_config").value("quant_method", "") != std::string("compressed-tensors")) {
             throw std::invalid_argument("DeepSeek V4 mainline currently requires the channel INT8 W8A8 checkpoint");
         }
-        if (rank.device.type() != runtime::Device::Type::kHygon ||
-            rank.tp_size != kV4TensorParallelSize || rank.pp_size != 1 ||
-            rank.tp_rank < 0 || rank.tp_rank >= rank.tp_size || !rank.comm ||
-            config.get_dtype() != DataType::kBFloat16 || config.get<size_t>("head_dim") != 512 ||
-            config.get<size_t>("qk_rope_head_dim") != 64 || config.get<size_t>("num_key_value_heads") != 1 ||
-            config.get<size_t>("n_shared_experts") != 1 || config.get<size_t>("index_head_dim") != 128 ||
-            config.get<size_t>("index_topk") != 512 || config.get<size_t>("sliding_window") != 128 ||
-            config.get<std::string>("scoring_func") != "sqrtsoftplus" ||
-            !config.get_or<bool>("norm_topk_prob", true) ||
-            !heads || heads % 8 || output_groups != 8 || !intermediate || intermediate % 8 ||
-            !hidden || !vocab || !q_rank || !o_rank || !experts || !topk || topk > experts ||
-            !index_heads || streams != 4 || !iterations || !max_positions || !layers || ratios.size() < layers ||
-            (is_mtp && (layers != 1 || hash_layers != 0 || ratios != std::vector<size_t>{0})) ||
-            hash_layers > layers || !std::isfinite(swiglu_limit) || swiglu_limit <= 0) {
+        if (rank.device.type() != runtime::Device::Type::kHygon || rank.tp_size != kV4TensorParallelSize || rank.pp_size != 1 || rank.tp_rank < 0 || rank.tp_rank >= rank.tp_size || !rank.comm || config.get_dtype() != DataType::kBFloat16 || config.get<size_t>("head_dim") != 512 || config.get<size_t>("qk_rope_head_dim") != 64 || config.get<size_t>("num_key_value_heads") != 1 || config.get<size_t>("n_shared_experts") != 1 || config.get<size_t>("index_head_dim") != 128 || config.get<size_t>("index_topk") != 512 || config.get<size_t>("sliding_window") != 128 || config.get<std::string>("scoring_func") != "sqrtsoftplus" || !config.get_or<bool>("norm_topk_prob", true) || !heads || heads % 8 || output_groups != 8 || !intermediate || intermediate % 8 || !hidden || !vocab || !q_rank || !o_rank || !experts || !topk || topk > experts || !index_heads || streams != 4 || !iterations || !max_positions || !layers || ratios.size() < layers || (is_mtp && (layers != 1 || hash_layers != 0 || ratios != std::vector<size_t>{0})) || hash_layers > layers || !std::isfinite(swiglu_limit) || swiglu_limit <= 0) {
             throw std::invalid_argument("Unsupported DeepSeek V4 Flash W8A8 configuration");
         }
         ratios.resize(layers);
@@ -280,7 +267,8 @@ struct BatchMetadata {
 };
 
 constexpr size_t flashmla_schedule_index(size_t ratio) {
-    return ratio == 0 ? 0 : ratio == 4 ? 1 : 2;
+    return ratio == 0 ? 0 : ratio == 4 ? 1
+                                       : 2;
 }
 
 bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) {
@@ -386,11 +374,7 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
         }
     }
     bool c128_no_store = false;
-    if (classic_mtp_target && input.mtp_graph_direct_commit && query_offsets.size() == 2 &&
-        short_verify_layout(query_offsets, positions->numel()) &&
-        rt.device().type() == runtime::Device::Type::kHygon &&
-        env_enabled("INFINILM_MTP_GRAPH_K3_C128_STATE_ONLY") &&
-        env_enabled("INFINIOPS_V4_C128_POOL_SHORT")) {
+    if (classic_mtp_target && input.mtp_graph_direct_commit && query_offsets.size() == 2 && short_verify_layout(query_offsets, positions->numel()) && rt.device().type() == runtime::Device::Type::kHygon && env_enabled("INFINILM_MTP_GRAPH_K3_C128_STATE_ONLY") && env_enabled("INFINIOPS_V4_C128_POOL_SHORT")) {
         const auto *slots = reinterpret_cast<const int32_t *>(metadata.c128_out_loc->data());
         c128_no_store = std::all_of(slots, slots + metadata.c128_out_loc->numel(),
                                     [](int32_t slot) { return slot == -1; });
@@ -777,9 +761,7 @@ HyperConnectionMix run_mhc(Runtime &rt, const Tensor &x, const MixWeights &w,
     };
     // Flash BF16 q2–q4 and packed M6–M12 use the same per-row reduction.
     // A contiguous row preserves the alignment of every owner slice.
-    if (batch.packed_mhc_pre && rt.device().type() == runtime::Device::Type::kHygon &&
-        x->ndim() == 3 && x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
-        rows >= 6 && rows <= 12 && streams == 4 && x->size(2) == 4096) {
+    if (batch.packed_mhc_pre && rt.device().type() == runtime::Device::Type::kHygon && x->ndim() == 3 && x->dtype() == DataType::kBFloat16 && x->is_contiguous() && rows >= 6 && rows <= 12 && streams == 4 && x->size(2) == 4096) {
         submit_mix(x, out.activation, out.post, out.combination);
         if (packed_mhc_calls) {
             ++*packed_mhc_calls;
@@ -821,16 +803,16 @@ public:
     Tensor forward(Runtime &rt, const Tensor &residual, const Tensor &tokens,
                    const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies,
                    size_t *packed_mhc_calls, bool cache_write_only) const {
-        const auto attention = mix(rt,residual,attn_mix_,batch,packed_mhc_calls);
-        const auto normalized = attn_norm_->forward(rt,attention.activation);
+        const auto attention = mix(rt, residual, attn_mix_, batch, packed_mhc_calls);
+        const auto normalized = attn_norm_->forward(rt, attention.activation);
         if (cache_write_only) {
-            attn_->write_swa(rt,normalized,batch,cache,frequencies);
+            attn_->write_swa(rt, normalized, batch, cache, frequencies);
             return {};
         }
-        const auto attended = attn_->forward(rt,normalized,batch,cache,frequencies);
+        const auto attended = attn_->forward(rt, normalized, batch, cache, frequencies);
         const auto next = run_mhc_post(rt,attended,residual,attention);
-        const auto feed_forward = mix(rt,next,ffn_mix_,batch,packed_mhc_calls);
-        const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt,feed_forward.activation), tokens, batch);
+        const auto feed_forward = mix(rt, next, ffn_mix_, batch, packed_mhc_calls);
+        const auto experts = ffn_->forward(rt, ffn_norm_->forward(rt, feed_forward.activation), tokens, batch);
         return run_mhc_post(rt,experts,next,feed_forward);
     }
 
@@ -869,23 +851,21 @@ public:
         }
     }
 
-    std::pair<Tensor,Tensor> forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
-                   const std::vector<LayerPagedCache> &caches,
-                   const Tensor &swa_rope, const Tensor &compressed_rope,
-                   const Tensor &target_hc, bool return_hc, bool cache_only = false,
-                   size_t *packed_mhc_calls = nullptr, bool eager_cache_write_only = false) const {
+    std::pair<Tensor, Tensor> forward(Runtime &rt, Tensor tokens, const BatchMetadata &batch,
+                                      const std::vector<LayerPagedCache> &caches,
+                                      const Tensor &swa_rope, const Tensor &compressed_rope,
+                                      const Tensor &target_hc, bool return_hc, bool cache_only = false,
+                                      size_t *packed_mhc_calls = nullptr, bool eager_cache_write_only = false) const {
         const auto rows = tokens->numel();
-        const bool cache_write_only = eager_cache_write_only ||
-            (cache_only && batch.query_offsets.size() != 2);
+        const bool cache_write_only = eager_cache_write_only || (cache_only && batch.query_offsets.size() != 2);
         if (cache_write_only) {
             constexpr std::array<size_t, 2> eager_offsets{0, 1};
             constexpr std::array<size_t, 4> packed_offsets{0, 1, 2, 3};
             const auto &offsets = batch.query_offsets;
             const bool layout_ok = eager_cache_write_only
-                ? rows == 1 && std::equal(offsets.begin(), offsets.end(), eager_offsets.begin(), eager_offsets.end())
-                : rows == 3 && std::equal(offsets.begin(), offsets.end(), packed_offsets.begin(), packed_offsets.end());
-            if (!cache_only || !is_mtp_ || layers_.size() != 1 || caches.size() != 1 ||
-                caches.front().compression_ratio != 0 || !layout_ok) {
+                                     ? rows == 1 && std::equal(offsets.begin(), offsets.end(), eager_offsets.begin(), eager_offsets.end())
+                                     : rows == 3 && std::equal(offsets.begin(), offsets.end(), packed_offsets.begin(), packed_offsets.end());
+            if (!cache_only || !is_mtp_ || layers_.size() != 1 || caches.size() != 1 || caches.front().compression_ratio != 0 || !layout_ok) {
                 throw std::invalid_argument("Classic NextN output-free repair requires one SWA layer and a supported q1 layout");
             }
         }
@@ -912,9 +892,9 @@ public:
             residual = expand(embedded);
         }
         for (size_t i=0;i<layers_.size();++i) {
-            residual = layers_[i]->forward(rt,residual,tokens,batch,caches[i],
+            residual = layers_[i]->forward(rt, residual, tokens, batch, caches[i],
                                            caches[i].compression_ratio ? compressed_rope : swa_rope,
-                                           packed_mhc_calls,cache_write_only);
+                                           packed_mhc_calls, cache_write_only);
         }
         if (cache_only) {
             return {};
@@ -924,8 +904,9 @@ public:
             hc_output = Tensor::empty(rt,hc_shape,DataType::kBFloat16);
             hc_output->copy_from(rt,residual);
         }
-        auto normalized = norm_->forward(rt,run_mhc(
-            rt,residual,head_,rms_eps_,hc_eps_,0,batch,packed_mhc_calls).activation);
+        auto normalized = norm_->forward(rt, run_mhc(
+                                                 rt, residual, head_, rms_eps_, hc_eps_, 0, batch, packed_mhc_calls)
+                                                 .activation);
         return {std::move(normalized),std::move(hc_output)};
     }
 
@@ -953,8 +934,7 @@ public:
         reuse_snapshot_buffer_ = reuse && std::string_view(reuse) == "1";
         const auto *k1_seed = std::getenv("INFINILM_MTP_K1_GRAPH_SEED");
         k1_graph_seed_ = cfg_.is_mtp && k1_seed && std::string_view(k1_seed) == "1";
-        packed_shared_constants_prepared_ =
-            cfg_.classic_mtp_target && !cfg_.is_mtp && packed_shared_constants_enabled();
+        packed_shared_constants_prepared_ = cfg_.classic_mtp_target && !cfg_.is_mtp && packed_shared_constants_enabled();
         draft_seed_constants_prepared_ = cfg_.is_mtp && k3_draft_seed_enabled();
         backbone_ = bind_child("model",std::make_shared<Backbone>(rt,cfg_,rank));
         head_ = bind_child("lm_head",std::make_shared<ColumnLinear>(
@@ -984,8 +964,8 @@ public:
             batch.packed_mhc_pre = modes.packed_mhc_pre;
             const auto table_width = batch.page_table->size(1);
             batch.short_c4_index = modes.short_c4_index
-                && rt.device().type() == runtime::Device::Type::kHygon
-                && table_width > 0 && table_width <= kC4IndexMaxUnscoredPages;
+                                && rt.device().type() == runtime::Device::Type::kHygon
+                                && table_width > 0 && table_width <= kC4IndexMaxUnscoredPages;
             size_t packed_mhc_calls = 0;
             auto output = forward_logits(rt, ids, batch, {}, true, false,
                                          modes.packed_mhc_pre ? &packed_mhc_calls : nullptr);
@@ -1023,15 +1003,10 @@ public:
         const auto hc = input.target_hidden_states.value_or(Tensor{});
         auto *mtp_graph_barrier = ctx.mtp_graph_barrier;
         const bool short_verify = short_verify_layout(batch.query_offsets, ids->numel());
-        const bool packed_target = cfg_.classic_mtp_target && !cfg_.is_mtp && !hc &&
-            (batch.query_offsets.size() == 2 || batch.query_offsets.size() == 4) && short_verify;
-        const bool direct_hc = input.mtp_graph_direct_commit && packed_target &&
-            input.return_draft_hidden_states && !input.rollback_v4_cache;
-        const bool short_target = !cfg_.is_mtp && !hc &&
-            (input.mtp_scratch_step || direct_hc || (input.rollback_v4_cache && short_verify));
-        const bool draft_seed_graph = input.mtp_graph_draft_seed && cfg_.is_mtp && hc &&
-            input.return_draft_hidden_states && !input.sample_all_positions && !input.rollback_v4_cache &&
-            batch.query_offsets.size() == 2 && short_verify;
+        const bool packed_target = cfg_.classic_mtp_target && !cfg_.is_mtp && !hc && (batch.query_offsets.size() == 2 || batch.query_offsets.size() == 4) && short_verify;
+        const bool direct_hc = input.mtp_graph_direct_commit && packed_target && input.return_draft_hidden_states && !input.rollback_v4_cache;
+        const bool short_target = !cfg_.is_mtp && !hc && (input.mtp_scratch_step || direct_hc || (input.rollback_v4_cache && short_verify));
+        const bool draft_seed_graph = input.mtp_graph_draft_seed && cfg_.is_mtp && hc && input.return_draft_hidden_states && !input.sample_all_positions && !input.rollback_v4_cache && batch.query_offsets.size() == 2 && short_verify;
         // The K1 proposal already wrote its anchor. Repair and the next seed
         // form one two-row Draft span with only the last prediction sampled.
         const bool short_draft = cfg_.is_mtp && hc && !input.rollback_v4_cache &&
@@ -1042,8 +1017,7 @@ public:
             short_target && !input.rollback_v4_cache;
         const bool owned_hc = scratch_hc || direct_hc || draft_seed_graph;
         // Eligibility must agree across ranks before any capture or collective.
-        const bool local_capture =
-            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph);
+        const bool local_capture = (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph);
         bool capture_mtp = false;
         if (mtp_graph_barrier && input.mtp_graph_direct_commit && batch.query_offsets.size() == 2) {
             // Choose the same C128 graph on every rank, together with Graph eligibility.
@@ -1055,9 +1029,7 @@ public:
             capture_mtp = mtp_graph_barrier->all(local_capture);
         }
         // Both arms share the same immutable routes. No multi-row Fill is recorded.
-        batch.packed_shared_constants = capture_mtp && packed_target &&
-            (input.rollback_v4_cache || direct_hc) &&
-            packed_shared_constants_prepared_ && packed_shared_constants_enabled();
+        batch.packed_shared_constants = capture_mtp && packed_target && (input.rollback_v4_cache || direct_hc) && packed_shared_constants_prepared_ && packed_shared_constants_enabled();
         if (capture_mtp && draft_seed_graph && draft_seed_constants_prepared_) {
             const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED_CONSTANTS");
             // The existing plan key compares this bit before replaying a graph.
@@ -1066,14 +1038,9 @@ public:
         if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
             throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
         }
-        batch.packed_collectives = capture_mtp && direct_hc && batch.query_offsets.size() == 4 &&
-            env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_TARGET_COLLECTIVES");
+        batch.packed_collectives = capture_mtp && direct_hc && batch.query_offsets.size() == 4 && env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_TARGET_COLLECTIVES");
         constexpr std::array<size_t, 4> c3_q4_offsets{0, 4, 8, 12};
-        batch.packed_mhc_pre = capture_mtp && direct_hc &&
-            rt.device().type() == runtime::Device::Type::kHygon &&
-            env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_MHC_PRE") &&
-            std::equal(batch.query_offsets.begin(), batch.query_offsets.end(),
-                       c3_q4_offsets.begin(), c3_q4_offsets.end());
+        batch.packed_mhc_pre = capture_mtp && direct_hc && rt.device().type() == runtime::Device::Type::kHygon && env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_MHC_PRE") && std::equal(batch.query_offsets.begin(), batch.query_offsets.end(), c3_q4_offsets.begin(), c3_q4_offsets.end());
         if (input.mtp_graph_draft_seed && !capture_mtp) {
             throw std::runtime_error("Classic NextN Graph Draft seed requires a device Graph with owned Draft HC");
         }
@@ -1093,13 +1060,8 @@ public:
         }
         if (capture_mtp) {
             const auto table_width = batch.page_table->size(1);
-            batch.short_c4_index = direct_hc && batch.query_offsets.size() == 2 &&
-                rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 &&
-                table_width <= kC4IndexMaxUnscoredPages &&
-                env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
-            batch.share_flashmla_schedule = input.mtp_share_flashmla_schedule && direct_hc &&
-                batch.query_offsets.size() == 2 && ids->numel() == 4 &&
-                rt.device().type() == runtime::Device::Type::kHygon;
+            batch.short_c4_index = direct_hc && batch.query_offsets.size() == 2 && rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 && table_width <= kC4IndexMaxUnscoredPages && env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
+            batch.share_flashmla_schedule = input.mtp_share_flashmla_schedule && direct_hc && batch.query_offsets.size() == 2 && ids->numel() == 4 && rt.device().type() == runtime::Device::Type::kHygon;
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
                           draft_seed_graph, hc, true, owned_hc, direct_hc, draft_seed_graph);
         }
@@ -1252,8 +1214,8 @@ private:
                   bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
                   bool return_hc = false, bool packed_direct = false, bool draft_seed_graph = false) const {
         auto &plans = batch.c128_state_only ? c128_state_only_decode_plans_
-            : (draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
-                                : (classic_mtp ? mtp_decode_plans_ : decode_plans_));
+                                            : (draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
+                                                                : (classic_mtp ? mtp_decode_plans_ : decode_plans_));
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
@@ -1345,10 +1307,12 @@ private:
                         if (schedule) {
                             continue;
                         }
-                        const auto extra_lengths = ratio == 4 ? stable.c4_sparse_lengths
-                            : ratio == 128 ? stable.c128_lengths : Tensor{};
-                        const auto extra_width = ratio == 4 ? kC4IndexTopK
-                            : ratio == 128 ? stable.c128_indices->size(1) : 0;
+                        const auto extra_lengths = ratio == 4   ? stable.c4_sparse_lengths
+                                                 : ratio == 128 ? stable.c128_lengths
+                                                                : Tensor{};
+                        const auto extra_width = ratio == 4   ? kC4IndexTopK
+                                               : ratio == 128 ? stable.c128_indices->size(1)
+                                                              : 0;
                         schedule = prepare_sparse_mla_schedule(
                             rt, stable.swa_lengths, swa_width, extra_lengths, extra_width);
                         ++candidate.flashmla_schedules_prepared;
