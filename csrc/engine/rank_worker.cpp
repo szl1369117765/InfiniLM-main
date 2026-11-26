@@ -825,17 +825,11 @@ void RankWorker::thread_loop() {
                             && rank_info_.pp_size != 1) {
                             throw std::invalid_argument("V4 MTP requires a single pipeline stage");
                         }
-                        const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states ||
-                            local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
-                            local_args.mtp_graph_direct_commit || local_args.mtp_eager_packed_direct_commit;
+                        const bool classic_mtp = classic_draft || local_args.return_draft_hidden_states || local_args.rollback_v4_cache || local_args.mtp_scratch_step || local_args.mtp_graph_direct_commit || local_args.mtp_eager_packed_direct_commit;
                         const bool graph_enabled = enable_graph_compiling_ && rank_info_.pp_size == 1;
                         // For a one-row Draft proposal, the last token is all
                         // positions. Draft prefill/repair still request all rows.
-                        const bool mtp_graph_candidate = graph_enabled && !local_args.mtp_draft_cache_only &&
-                            (local_args.rollback_v4_cache || local_args.mtp_scratch_step ||
-                            local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed ||
-                            (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions &&
-                             !local_args.return_draft_hidden_states));
+                        const bool mtp_graph_candidate = graph_enabled && !local_args.mtp_draft_cache_only && (local_args.rollback_v4_cache || local_args.mtp_scratch_step || local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed || (classic_draft && local_args.target_hidden_states && !local_args.sample_all_positions && !local_args.return_draft_hidden_states));
                         std::shared_ptr<const nsa::Proof> nsa_proof;
                         // These retained RUN locals are OUTSIDE the inner try.
                         // Its catch sees the real exception before these locals unwind.
@@ -866,10 +860,7 @@ void RankWorker::thread_loop() {
                                 && (enable_graph_compiling_ || finite_paged_decode_profile_)) {
                                 throw std::logic_error("Packed eager direct MTP excludes Graph and worker-side page-table rewriting");
                             }
-                            if (local_v4_host_batch &&
-                                (finite_paged_decode_profile_ ||
-                                 (graph_enabled && (!local_args.mtp_graph_direct_commit ||
-                                                    !local_v4_host_batch->plans())))) {
+                            if (local_v4_host_batch && (finite_paged_decode_profile_ || (graph_enabled && (!local_args.mtp_graph_direct_commit || !local_v4_host_batch->plans())))) {
                                 throw std::logic_error("V4 host batch requires a validated direct Graph or eager metadata");
                             }
                             if (finite_paged_decode_profile_
@@ -1156,7 +1147,8 @@ void RankWorker::thread_loop() {
                                     // Preserve the legacy RNG sequence across greedy and stochastic requests.
                                     if (!local_args.random_values) {
                                         const auto draws = local_args.mtp_graph_draft_seed
-                                            ? local_args.input_ids.value()->numel() : 1;
+                                                             ? local_args.input_ids.value()->numel()
+                                                             : 1;
                                         for (size_t i = 0; i < draws; ++i) {
                                             (void)std::uniform_real_distribution<float>(0, 1)(rng_);
                                         }
@@ -1223,9 +1215,8 @@ void RankWorker::thread_loop() {
                             if (local_args.return_draft_hidden_states && rank_info_.tp_rank != 0) {
                                 runtime_->syncStream();
                                 const bool return_graph = local_args.mtp_graph_direct_commit || local_args.mtp_graph_draft_seed
-                                    || local_args.mtp_eager_packed_direct_commit;
-                                output_ = Output{{}, {}, std::move(hidden_states),
-                                                 return_graph ? std::move(graph_execution) : std::nullopt, eager_reason};
+                                                       || local_args.mtp_eager_packed_direct_commit;
+                                output_ = Output{{}, {}, std::move(hidden_states), return_graph ? std::move(graph_execution) : std::nullopt, eager_reason};
                                 output_.mtp_last_logits_used = last_logits_used;
                                 output_.mtp_eager_target_receipt = eager_target_receipt;
                             } else if (local_args.mtp_scratch_step && rank_info_.tp_rank != 0) {

@@ -1,5 +1,8 @@
 """Compare packed and serial Draft work through the classic NextN runner on CPU."""
 
+# The stub package must be registered before importing the real transport.
+# ruff: noqa: E402
+
 import os
 import sys
 import unittest
@@ -9,18 +12,18 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-
 package = ModuleType("batched_draft_test_llm")
 package.__path__ = [str(Path(__file__).resolve().parents[2] / "python/infinilm/llm")]
 sys.modules[package.__name__] = package
-from batched_draft_test_llm.model_runner.deepseek_v4_mtp_runner import DeepSeekV4MTPRunner
+from batched_draft_test_llm.model_runner.deepseek_v4_mtp_runner import (
+    DeepSeekV4MTPRunner,
+)
 from batched_draft_test_llm.model_runner.deepseek_v4_mtp_transport import (
-    _V4Transport,
     _batched_draft_enabled,
     _k1_graph_seed_enabled,
+    _V4Transport,
 )
 from batched_draft_test_llm.sampling_params import SamplingParams
-
 
 PAGE_SIZE = 256
 RANKS = 8

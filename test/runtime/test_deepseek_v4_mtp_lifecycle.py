@@ -2,17 +2,16 @@
 
 import ast
 import asyncio
-from contextlib import contextmanager, nullcontext
 import importlib
 import os
 import queue
 import sys
 import threading
 import unittest
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
-
 
 SOURCE = Path(__file__).resolve().parents[2] / "python" / "infinilm"
 

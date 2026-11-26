@@ -6,8 +6,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from .deepseek_v4_mtp_sampling import accept_or_resample, host_logit_rows, sample
-from .deepseek_v4_mtp_verify import GreedyCommitIntent, GreedyVerifyBatch, TargetVerifyRow
-
+from .deepseek_v4_mtp_verify import (
+    GreedyCommitIntent,
+    GreedyVerifyBatch,
+    TargetVerifyRow,
+)
 
 logger = logging.getLogger(__name__)
 

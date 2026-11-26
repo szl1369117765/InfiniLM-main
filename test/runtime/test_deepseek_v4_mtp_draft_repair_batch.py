@@ -21,7 +21,7 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
     def target_forward(**options):
         result = original_target(**options)
         for span, table in enumerate(options["block_tables"].rows):
-            start, end = options["input_offsets"].rows[span:span + 2]
+            start, end = options["input_offsets"].rows[span : span + 2]
             for row in range(start, end):
                 if table[0] == 7 and options["position_ids"].rows[row] == 257:
                     result["output_ids"].rows[row] += 1
@@ -40,7 +40,9 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
         assert all(len(segment.tokens) == 1 for segment in segments)
         sync_start = len(core.synced_devices)
         with patch.object(draft, "forward_raw", wraps=draft.forward_raw) as native:
-            result = original_packed(segments, return_hidden=False, worker_join=worker_join)
+            result = original_packed(
+                segments, return_hidden=False, worker_join=worker_join
+            )
         native.assert_called_once()
         assert "target_hidden_states_by_rank" in native.call_args.kwargs
         assert "target_hidden_segments_by_rank" not in native.call_args.kwargs
@@ -64,7 +66,14 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
         owner: (value.anchor, value.position, [tensor.rows for tensor in value.hidden])
         for owner, value in transport.states.items()
     }
-    return output, repairs, draft.cache, draft.input_hidden, transport.target.cache, state
+    return (
+        output,
+        repairs,
+        draft.cache,
+        draft.input_hidden,
+        transport.target.cache,
+        state,
+    )
 
 
 class DraftRepairBatchTest(unittest.TestCase):
@@ -73,8 +82,12 @@ class DraftRepairBatchTest(unittest.TestCase):
         packed = run_case(True)
         self.assertEqual(packed[0], serial[0])
         self.assertEqual(packed[2:], serial[2:])
-        self.assertEqual(serial[1], [((1, 255),), ((1, 256),), ((1, 257),), ((7, 255),), ((7, 256),)])
-        self.assertEqual(packed[1], [((1, 255), (7, 255)), ((1, 256), (7, 256)), ((1, 257),)])
+        self.assertEqual(
+            serial[1], [((1, 255),), ((1, 256),), ((1, 257),), ((7, 255),), ((7, 256),)]
+        )
+        self.assertEqual(
+            packed[1], [((1, 255), (7, 255)), ((1, 256), (7, 256)), ((1, 257),)]
+        )
 
     def test_terminal_owner_skips_repair(self):
         serial = run_case(False, first_stop=(12,))
@@ -83,7 +96,9 @@ class DraftRepairBatchTest(unittest.TestCase):
         self.assertEqual(packed[1], [((7, 255),), ((7, 256),)])
 
     def test_disabled_target_replay_keeps_serial_repair(self):
-        self.assertEqual(run_case(True, target_replay=False), run_case(False, target_replay=False))
+        self.assertEqual(
+            run_case(True, target_replay=False), run_case(False, target_replay=False)
+        )
 
     def test_failed_packed_write_does_not_publish_owner_states(self):
         runner, transport, prefilled, repairs = run_case(True, fail_packed=True)

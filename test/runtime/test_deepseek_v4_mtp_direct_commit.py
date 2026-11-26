@@ -1,5 +1,8 @@
 """Exercise eager and packed Graph Target commit with native call substitutes."""
 
+# The stub package must be registered before importing the real transport.
+# ruff: noqa: E402
+
 import os
 import sys
 import types
@@ -8,21 +11,23 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
-
 package = types.ModuleType("direct_commit_test_runner")
 package.__path__ = [str(Path(__file__).resolve().parents[2] / "python/infinilm/llm/model_runner")]
 sys.modules[package.__name__] = package
 from direct_commit_test_runner.deepseek_v4_mtp_transport import (
-    _DraftState,
-    _V4Transport,
     _direct_k1_commit_enabled,
     _direct_k23_commit_enabled,
     _draft_cache_only_enabled,
+    _DraftState,
     _eager_packed_direct_available,
     _graph_k3_draft_seed_enabled,
     _host_metadata_modes,
+    _V4Transport,
 )
-from direct_commit_test_runner.deepseek_v4_mtp_verify import GreedyVerifyBatch, GreedyVerifyRequest
+from direct_commit_test_runner.deepseek_v4_mtp_verify import (
+    GreedyVerifyBatch,
+    GreedyVerifyRequest,
+)
 
 
 class Tensor:

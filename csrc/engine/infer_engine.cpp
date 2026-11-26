@@ -540,7 +540,7 @@ InferEngine::Input::to_model_input(
         // and enqueue all copies on this Draft worker's stream before forward.
         const auto &first = target_hidden_segments.front();
         auto packed = infinilm::runtime::Tensor::empty(runtime,
-            {input.input_ids.value()->numel(), first->size(1), first->size(2)}, first->dtype());
+                                                       {input.input_ids.value()->numel(), first->size(1), first->size(2)}, first->dtype());
         size_t offset = 0;
         for (const auto &view : target_hidden_segments) {
             const auto rows = view->size(0);
@@ -605,8 +605,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     };
     // Freeze the same metadata used by direct-write admission on either path.
     const bool direct_host_plan = original.mtp_graph_direct_commit && enable_graph_compiling_
-        && paged && paged->max_batch_size() == 3
-        && env_enabled("INFINILM_MTP_GRAPH_C3_SHARED_TARGET_PLAN");
+                               && paged && paged->max_batch_size() == 3
+                               && env_enabled("INFINILM_MTP_GRAPH_C3_SHARED_TARGET_PLAN");
     const bool eager_direct = original.mtp_eager_packed_direct_commit;
     const bool eager_direct_plan = eager_direct && env_enabled("INFINILM_MTP_EAGER_C3_SHARED_TARGET_PLAN");
     if (eager_direct) {
@@ -634,19 +634,16 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         };
     }
     const bool eager_host_batch = !enable_graph_compiling_
-        && (original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan);
+                               && (original.mtp_cpu_metadata_shadow || original.mtp_shared_compression_plan);
     if ((direct_host_plan || eager_direct_plan || eager_host_batch) && dist.pp_size == 1
         && original.input_ids && *original.input_ids && (*original.input_ids)->ndim() == 2
         && (*original.input_ids)->size(0) == 1) {
         const auto type = model_config_->get<std::string>("model_type");
-        const bool classic = (type == "deepseek_v4" &&
-                              (original.return_draft_hidden_states || original.rollback_v4_cache))
-            || (type == "deepseek_v4_mtp" &&
-                (original.target_hidden_states_by_rank || original.target_hidden_segments_by_rank));
+        const bool classic = (type == "deepseek_v4" && (original.return_draft_hidden_states || original.rollback_v4_cache))
+                          || (type == "deepseek_v4_mtp" && (original.target_hidden_states_by_rank || original.target_hidden_segments_by_rank));
         if (classic && paged && paged->block_size() == models::deepseek_v4::kV4PageSize
             && original.input_ids && *original.input_ids
-            && original.position_ids && original.input_offsets &&
-            original.block_tables && original.slot_mapping) {
+            && original.position_ids && original.input_offsets && original.block_tables && original.slot_mapping) {
             v4_host_batch = DeepSeekV4HostBatch::prepare_short(
                 *original.position_ids, *original.input_offsets, *original.block_tables,
                 *original.slot_mapping, (*original.input_ids)->numel(), paged->num_blocks(),
@@ -717,7 +714,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     if (input.mtp_graph_direct_commit) {
         const auto owners = paged ? paged->max_batch_size() : 0;
         const auto *enabled = std::getenv(owners == 1
-            ? "INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT" : "INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT");
+                                              ? "INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT"
+                                              : "INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT");
         const auto [c4_ring, c128_ring] = deepseek_v4_raw_ring_rows();
         if (!enabled || std::string_view(enabled) != "1" || !enable_graph_compiling_
             || !classic_mtp_target_ || nsa_pool_epoch_ || dist.pp_size != 1
@@ -752,13 +750,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
         const auto segments = (*offsets)->numel() - 1;
-        if (c3_draft_repair_cache_only &&
-            (!enable_graph_compiling_ || workers_.size() != 8
-             || communication_group_.get_dist_config().moe_ep_size != 1
-             || !paged || paged->max_batch_size() != 3
-             || paged->block_size() != models::deepseek_v4::kV4PageSize
-             || input.return_draft_hidden_states || segments != 3
-             || bounds[0] != 0 || bounds[1] != 1 || bounds[2] != 2 || bounds[3] != 3)) {
+        if (c3_draft_repair_cache_only && (!enable_graph_compiling_ || workers_.size() != 8 || communication_group_.get_dist_config().moe_ep_size != 1 || !paged || paged->max_batch_size() != 3 || paged->block_size() != models::deepseek_v4::kV4PageSize || input.return_draft_hidden_states || segments != 3 || bounds[0] != 0 || bounds[1] != 1 || bounds[2] != 2 || bounds[3] != 3)) {
             throw std::invalid_argument("Classic NextN output-free C3 repair requires prepared TP8 Draft and three q1 spans");
         }
         if (bounds[0] != 0 || bounds[segments] <= 0 || size_t(bounds[segments]) != (*ids)->numel()) {
@@ -828,8 +820,8 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         for (int32_t row = 0; row < bounds[1]; ++row) {
             const auto position = positions_i64
-                ? reinterpret_cast<const int64_t *>((*positions)->data())[row]
-                : reinterpret_cast<const int32_t *>((*positions)->data())[row];
+                                    ? reinterpret_cast<const int64_t *>((*positions)->data())[row]
+                                    : reinterpret_cast<const int32_t *>((*positions)->data())[row];
             if (position != row) {
                 throw std::invalid_argument("Classic NextN Graph prefill positions must begin at zero and be contiguous");
             }
@@ -885,21 +877,11 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         last_logits_expected = rows > requests;
     }
-    if (input.mtp_eager_c3_draft_repair_cache_only &&
-        (!input.mtp_draft_cache_only || enable_graph_compiling_ || nsa_pool_epoch_
-         || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1 || workers_.size() != 8
-         || !paged || paged->block_size() != models::deepseek_v4::kV4PageSize
-         || input.target_hidden_states || !input.sample_all_positions || input.top_k != 1
-         || input.sampling_rows || input.random_values || input.mtp_scratch_step || input.mtp_last_logits
-         || input.mtp_graph_direct_commit || input.mtp_eager_packed_direct_commit
-         || input.mtp_graph_fresh_prefill || input.mtp_graph_draft_seed)) {
+    if (input.mtp_eager_c3_draft_repair_cache_only && (!input.mtp_draft_cache_only || enable_graph_compiling_ || nsa_pool_epoch_ || dist.tp_device_ids.size() != 8 || dist.moe_ep_size != 1 || workers_.size() != 8 || !paged || paged->block_size() != models::deepseek_v4::kV4PageSize || input.target_hidden_states || !input.sample_all_positions || input.top_k != 1 || input.sampling_rows || input.random_values || input.mtp_scratch_step || input.mtp_last_logits || input.mtp_graph_direct_commit || input.mtp_eager_packed_direct_commit || input.mtp_graph_fresh_prefill || input.mtp_graph_draft_seed)) {
         throw std::invalid_argument("Eager C3 cache-only repair requires a plain TP8 greedy Draft write");
     }
     if (input.mtp_draft_cache_only && !c3_draft_repair_cache_only) {
-        if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp" ||
-            communication_group_.get_dist_config().pp_size != 1 ||
-            (enable_graph_compiling_ && !input.mtp_graph_fresh_prefill) ||
-            !rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
+        if (model_config_->get<std::string>("model_type") != "deepseek_v4_mtp" || communication_group_.get_dist_config().pp_size != 1 || (enable_graph_compiling_ && !input.mtp_graph_fresh_prefill) || !rank_hidden || input.return_draft_hidden_states || input.rollback_v4_cache) {
             throw std::invalid_argument("Classic NextN cache-only requires an eager Draft with rank-local input HC and no outputs");
         }
         using namespace infinilm::runtime;
@@ -911,8 +893,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
             throw std::invalid_argument("Classic NextN cache-only requires one span with CPU int32 offsets");
         }
         const auto *bounds = reinterpret_cast<const int32_t *>((*offsets)->data());
-        if (bounds[0] != 0 || bounds[1] <= 0 ||
-            static_cast<size_t>(bounds[1]) != (*input.input_ids)->numel()
+        if (bounds[0] != 0 || bounds[1] <= 0 || static_cast<size_t>(bounds[1]) != (*input.input_ids)->numel()
             || (input.mtp_eager_c3_draft_repair_cache_only && bounds[1] != 1)) {
             throw std::invalid_argument("Classic NextN cache-only offsets must cover all input tokens");
         }
@@ -1075,7 +1056,7 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
     // thread can join Draft inputs without running on a Target worker runtime.
     const bool keep_hc_worker_runtime = (input.mtp_scratch_step || input.mtp_graph_direct_commit
                                          || input.mtp_graph_draft_seed)
-        && input.return_draft_hidden_states;
+                                     && input.return_draft_hidden_states;
     if (!keep_hc_worker_runtime) {
         output.hidden_states = completed_view(output.hidden_states);
     }
@@ -1086,25 +1067,14 @@ InferEngine::Output InferEngine::forward(const InferEngine::Input &original) {
         }
         for (size_t rank = 0; rank < workers_.size(); ++rank) {
             auto rank_output = workers_[rank]->get_output();
-            if (input.mtp_graph_draft_seed &&
-                (!rank_output.graph_execution || rank_output.graph_execution->device_graph_segments == 0)) {
+            if (input.mtp_graph_draft_seed && (!rank_output.graph_execution || rank_output.graph_execution->device_graph_segments == 0)) {
                 throw std::runtime_error("Classic NextN Draft seed did not run a device Graph on every rank");
             }
             auto hidden = std::move(rank_output.hidden_states);
             if (!hidden) {
                 throw std::runtime_error("V4 MTP did not return hidden states on every rank");
             }
-            if (eager_direct &&
-                (rank_output.graph_execution || !rank_output.mtp_eager_target_receipt
-                 || !(rank_output.mtp_eager_target_receipt == output.mtp_eager_target_receipt)
-                 || rank_output.mtp_eager_target_receipt->packed_collectives != input.mtp_eager_target_modes.packed_collectives
-                 || rank_output.mtp_eager_target_receipt->shared_plan != eager_direct_plan
-                 || (rank_output.mtp_eager_target_receipt->packed_mhc_pre && !input.mtp_eager_target_modes.packed_mhc_pre)
-                 || (rank_output.mtp_eager_target_receipt->short_c4_index && !input.mtp_eager_target_modes.short_c4_index)
-                 || hidden->device() != communication_group_.get_rank_info(rank).device
-                 || hidden->dtype() != infinilm::runtime::DataType::kBFloat16
-                 || hidden->ndim() != 3 || hidden->size(0) != (*input.input_ids)->numel()
-                 || hidden->size(1) != 4 || hidden->size(2) != model_config_->get<size_t>("hidden_size"))) {
+            if (eager_direct && (rank_output.graph_execution || !rank_output.mtp_eager_target_receipt || !(rank_output.mtp_eager_target_receipt == output.mtp_eager_target_receipt) || rank_output.mtp_eager_target_receipt->packed_collectives != input.mtp_eager_target_modes.packed_collectives || rank_output.mtp_eager_target_receipt->shared_plan != eager_direct_plan || (rank_output.mtp_eager_target_receipt->packed_mhc_pre && !input.mtp_eager_target_modes.packed_mhc_pre) || (rank_output.mtp_eager_target_receipt->short_c4_index && !input.mtp_eager_target_modes.short_c4_index) || hidden->device() != communication_group_.get_rank_info(rank).device || hidden->dtype() != infinilm::runtime::DataType::kBFloat16 || hidden->ndim() != 3 || hidden->size(0) != (*input.input_ids)->numel() || hidden->size(1) != 4 || hidden->size(2) != model_config_->get<size_t>("hidden_size"))) {
                 throw std::runtime_error("Packed eager direct MTP did not complete the selected path with full HC on every rank");
             }
             if ((input.mtp_last_logits || input.mtp_graph_draft_seed)
