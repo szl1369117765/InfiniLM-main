@@ -468,10 +468,11 @@ HyperConnectionMix run_mhc(Runtime &rt, const Tensor &x, const MixWeights &w,
             rt, input, w.projection, w.scale, w.base, norm_eps, mix_eps,
             static_cast<int64_t>(iterations), activation, post, combination);
     };
-    // For the Flash BF16 layout, q4 and M12 select the same per-row
-    // reduction and keep every row aligned at its original stride.
-    if (batch.packed_mhc_pre && rows == 12 && streams == 4 &&
-        x->size(2) == 4096 && x->dtype() == DataType::kBFloat16 && x->is_contiguous()) {
+    // Flash BF16 q2–q4 and packed M6–M12 use the same per-row reduction.
+    // A contiguous row preserves the alignment of every owner slice.
+    if (batch.packed_mhc_pre && rt.device().type() == runtime::Device::Type::kHygon &&
+        x->ndim() == 3 && x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
+        rows >= 6 && rows <= 12 && streams == 4 && x->size(2) == 4096) {
         submit_mix(x, out.activation, out.post, out.combination);
         if (packed_mhc_calls) {
             ++*packed_mhc_calls;
@@ -565,15 +566,21 @@ public:
                    const std::vector<LayerPagedCache> &caches,
                    const Tensor &swa_rope, const Tensor &compressed_rope,
                    const Tensor &target_hc, bool return_hc, bool cache_only = false,
-                   size_t *packed_mhc_calls = nullptr) const {
+                   size_t *packed_mhc_calls = nullptr, bool eager_cache_write_only = false) const {
         const auto rows = tokens->numel();
-        const bool cache_write_only = cache_only && batch.query_offsets.size() != 2;
-        constexpr std::array<size_t, 4> repair_offsets{0, 1, 2, 3};
-        if (cache_write_only &&
-            (!is_mtp_ || layers_.size() != 1 || caches.size() != 1 || caches.front().compression_ratio != 0
-             || rows != 3 || !std::equal(batch.query_offsets.begin(), batch.query_offsets.end(),
-                                        repair_offsets.begin(), repair_offsets.end()))) {
-            throw std::invalid_argument("Classic NextN output-free repair requires one SWA layer and three q1 spans");
+        const bool cache_write_only = eager_cache_write_only ||
+            (cache_only && batch.query_offsets.size() != 2);
+        if (cache_write_only) {
+            constexpr std::array<size_t, 2> eager_offsets{0, 1};
+            constexpr std::array<size_t, 4> packed_offsets{0, 1, 2, 3};
+            const auto &offsets = batch.query_offsets;
+            const bool layout_ok = eager_cache_write_only
+                ? rows == 1 && std::equal(offsets.begin(), offsets.end(), eager_offsets.begin(), eager_offsets.end())
+                : rows == 3 && std::equal(offsets.begin(), offsets.end(), packed_offsets.begin(), packed_offsets.end());
+            if (!cache_only || !is_mtp_ || layers_.size() != 1 || caches.size() != 1 ||
+                caches.front().compression_ratio != 0 || !layout_ok) {
+                throw std::invalid_argument("Classic NextN output-free repair requires one SWA layer and a supported q1 layout");
+            }
         }
         const Shape hc_shape{rows,streams_,hidden_};
         if (is_mtp_ && (!target_hc || target_hc->shape() != hc_shape ||
@@ -655,13 +662,43 @@ public:
         PagedCacheWriteSet writes;
         auto batch = make_batch(rt, input, cfg_.classic_mtp_target,
                                 input.rollback_v4_cache ? &writes : nullptr);
+        if (input.mtp_eager_packed_direct_commit) {
+            if (!cfg_.classic_mtp_target || cfg_.is_mtp || input.target_hidden_states
+                || !input.return_draft_hidden_states || !input.sample_all_positions
+                || input.rollback_v4_cache || input.mtp_scratch_step || input.mtp_draft_cache_only
+                || input.mtp_last_logits || input.mtp_graph_direct_commit || input.mtp_graph_draft_seed
+                || ctx.model_decode_barrier || ctx.mtp_graph_barrier || ctx.mtp_snapshot_barrier
+                || batch.query_offsets.size() != 4 || !short_verify_layout(batch.query_offsets, ids->numel())) {
+                throw std::invalid_argument("Packed eager direct MTP requires complete three-owner Target queries");
+            }
+            const auto &modes = input.mtp_eager_target_modes;
+            batch.packed_collectives = modes.packed_collectives;
+            batch.packed_mhc_pre = modes.packed_mhc_pre;
+            const auto table_width = batch.page_table->size(1);
+            batch.short_c4_index = modes.short_c4_index
+                && rt.device().type() == runtime::Device::Type::kHygon
+                && table_width > 0 && table_width <= kC4IndexMaxUnscoredPages;
+            size_t packed_mhc_calls = 0;
+            auto output = forward_logits(rt, ids, batch, {}, true, false,
+                                         modes.packed_mhc_pre ? &packed_mhc_calls : nullptr);
+            const auto &prepared = input.deepseek_v4_host_batch;
+            output.mtp_eager_target_receipt = EagerPackedTargetModes{
+                batch.packed_collectives,
+                prepared && bool(prepared->plans()),
+                packed_mhc_calls == cfg_.ratios.size() * 2 + 1,
+                batch.short_c4_index
+                    && std::find(cfg_.ratios.begin(), cfg_.ratios.end(), 4) != cfg_.ratios.end(),
+            };
+            return output;
+        }
         if (input.mtp_draft_cache_only) {
             if (!cfg_.is_mtp || input.return_draft_hidden_states || input.rollback_v4_cache ||
                 ctx.model_decode_barrier || ctx.mtp_graph_barrier) {
                 throw std::invalid_argument("Classic NextN cache-only is an eager Draft write");
             }
             backbone_->forward(rt, ids, batch, caches_, swa_rope_, compressed_rope_,
-                               input.target_hidden_states.value_or(Tensor{}), false, true);
+                               input.target_hidden_states.value_or(Tensor{}), false, true,
+                               nullptr, input.mtp_eager_c3_draft_repair_cache_only);
             Output output{};
             output.mtp_draft_cache_only_used = true;
             return output;

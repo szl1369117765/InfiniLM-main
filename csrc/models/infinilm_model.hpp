@@ -32,6 +32,17 @@ public:
         virtual ~Config() = default;
     };
 
+    struct EagerPackedTargetModes {
+        bool packed_collectives{false};
+        bool shared_plan{false};
+        bool packed_mhc_pre{false};
+        bool short_c4_index{false};
+        bool operator==(const EagerPackedTargetModes &other) const {
+            return packed_collectives == other.packed_collectives && shared_plan == other.shared_plan
+                && packed_mhc_pre == other.packed_mhc_pre && short_c4_index == other.short_c4_index;
+        }
+    };
+
     struct Input {
         /// Token IDs: static `[batch, seq_len]`; paged packed `[1, token_count]`.
         std::optional<infinilm::runtime::Tensor> input_ids;
@@ -76,12 +87,15 @@ public:
         bool return_draft_hidden_states{false};
         bool rollback_v4_cache{false};
         bool mtp_draft_cache_only{false};
+        bool mtp_eager_c3_draft_repair_cache_only{false};
         std::shared_ptr<const engine::DeepSeekV4HostBatch> deepseek_v4_host_batch;
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
         bool mtp_graph_direct_commit{false};
         bool mtp_share_flashmla_schedule{false};
         bool mtp_graph_draft_seed{false};
+        bool mtp_eager_packed_direct_commit{false};
+        EagerPackedTargetModes mtp_eager_target_modes{};
     };
 
     struct Output {
@@ -94,6 +108,7 @@ public:
         infinilm::runtime::Tensor model_sampled_ids{};
         bool mtp_draft_cache_only_used{false};
         bool mtp_last_logits_used{false};
+        std::optional<EagerPackedTargetModes> mtp_eager_target_receipt{};
     };
 
     virtual ~InfinilmModel() = default;
