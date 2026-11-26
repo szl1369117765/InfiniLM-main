@@ -365,6 +365,7 @@ class InferEngine(_infinilm.InferEngine):
         return_draft_hidden_states=False,
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
+        target_hidden_segments_by_rank=None,
         mtp_draft_cache_only=False,
         mtp_cpu_metadata_shadow=False,
         mtp_shared_compression_plan=False,
@@ -419,6 +420,11 @@ class InferEngine(_infinilm.InferEngine):
                     else None
                 ),
             }
+        if target_hidden_segments_by_rank is not None:
+            mtp_arguments["target_hidden_segments_by_rank"] = tuple(
+                tuple(unwrap_tensor(tensor) for tensor in rank_segments)
+                for rank_segments in target_hidden_segments_by_rank
+            )
         if mtp_draft_cache_only is not False:
             if mtp_draft_cache_only is not True:
                 raise ValueError("mtp_draft_cache_only must be a bool")
@@ -628,6 +634,7 @@ class InferEngine(_infinilm.InferEngine):
         return_draft_hidden_states=False,
         rollback_v4_cache=False,
         target_hidden_states_by_rank=None,
+        target_hidden_segments_by_rank=None,
         mtp_draft_cache_only=False,
         mtp_cpu_metadata_shadow=False,
         mtp_shared_compression_plan=False,
@@ -662,6 +669,7 @@ class InferEngine(_infinilm.InferEngine):
                     return_draft_hidden_states=return_draft_hidden_states,
                     rollback_v4_cache=rollback_v4_cache,
                     target_hidden_states_by_rank=target_hidden_states_by_rank,
+                    target_hidden_segments_by_rank=target_hidden_segments_by_rank,
                     mtp_draft_cache_only=mtp_draft_cache_only,
                     mtp_cpu_metadata_shadow=mtp_cpu_metadata_shadow,
                     mtp_shared_compression_plan=mtp_shared_compression_plan,
@@ -673,9 +681,9 @@ class InferEngine(_infinilm.InferEngine):
                 )
             )
             metadata_evidence = {}
-            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan:
+            if mtp_cpu_metadata_shadow or mtp_shared_compression_plan or mtp_graph_direct_commit:
                 metadata_evidence["mtp_cpu_metadata_shadow_used"] = output.mtp_cpu_metadata_shadow_used
-                if mtp_shared_compression_plan:
+                if mtp_shared_compression_plan or mtp_graph_direct_commit:
                     metadata_evidence["mtp_shared_compression_plan_used"] = output.mtp_shared_compression_plan_used
             if mtp_draft_cache_only:
                 if not output.mtp_draft_cache_only_used or any(

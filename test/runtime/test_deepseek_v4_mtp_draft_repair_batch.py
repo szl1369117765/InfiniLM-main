@@ -31,14 +31,22 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
         repairs.append(((table[0], start),))
         return original_single(tokens, start, table, hidden)
 
-    def packed(segments, *, return_hidden):
+    def packed(segments, *, return_hidden, worker_join=False):
         if return_hidden:
             return original_packed(segments, return_hidden=True)
         repairs.append(tuple((segment.table[0], segment.start) for segment in segments))
         if fail_packed:
             raise RuntimeError("simulated packed Draft repair failure")
         assert all(len(segment.tokens) == 1 for segment in segments)
-        return original_packed(segments, return_hidden=False)
+        sync_start = len(core.synced_devices)
+        with patch.object(draft, "forward_raw", wraps=draft.forward_raw) as native:
+            result = original_packed(segments, return_hidden=False, worker_join=worker_join)
+        native.assert_called_once()
+        assert "target_hidden_states_by_rank" in native.call_args.kwargs
+        assert "target_hidden_segments_by_rank" not in native.call_args.kwargs
+        assert core.synced_devices[sync_start:] == list(range(8))
+        assert core.get_device() == "cpu"
+        return result
 
     with (
         patch.object(transport.target, "forward_raw", target_forward),
@@ -56,7 +64,6 @@ def run_case(enabled, *, first_stop=(), target_replay=True, fail_packed=False):
         owner: (value.anchor, value.position, [tensor.rows for tensor in value.hidden])
         for owner, value in transport.states.items()
     }
-    assert core.device == "caller" and not core.pending
     return output, repairs, draft.cache, draft.input_hidden, transport.target.cache, state
 
 

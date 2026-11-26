@@ -64,6 +64,7 @@ public:
         size_t host_segments = 0;
         bool capture_attempted = false;
         std::string fallback_reason;
+        const char *mtp_graph_plan = nullptr;
     };
 
     Graph();

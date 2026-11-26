@@ -31,7 +31,6 @@ class Tensor:
         self.rows = rows
         self.device = device
         self.shape = (len(rows), 4, 1)
-        self.pending = False
 
     def to_numpy(self):
         return self
@@ -40,7 +39,7 @@ class Tensor:
         return self.rows
 
     def narrow(self, dim, start, count):
-        assert dim == 0 and not self.pending
+        assert dim == 0
         return Tensor(self.rows[start:start + count], self.device)
 
 
@@ -49,20 +48,17 @@ class Core:
     int32 = 32
 
     def __init__(self):
-        self.device = "caller"
-        self.pending = {}
+        self.device = "cpu"
+        self.synced_devices = []
 
     def from_list(self, rows, *, dtype):
         return Tensor(rows)
 
     def cat(self, tensors, *, dim):
+        assert dim == 0
         device = tensors[0].device
-        assert dim == 0 and all(tensor.device == device for tensor in tensors)
-        assert device not in self.pending
-        tensor = Tensor([row for value in tensors for row in value.rows], device)
-        tensor.pending = True
-        self.pending[device] = tensor
-        return tensor
+        assert all(tensor.device == device for tensor in tensors)
+        return Tensor([row for tensor in tensors for row in tensor.rows], device)
 
     def get_device(self):
         return self.device
@@ -71,7 +67,7 @@ class Core:
         self.device = device
 
     def sync_stream(self):
-        self.pending.pop(self.device).pending = False
+        self.synced_devices.append(self.device)
 
 
 class Engine:
@@ -95,13 +91,26 @@ class Engine:
         total = options["total_kv_lengths"].rows
         cumulative = options["cu_seqlens"].rows
         all_positions = options["sample_all_positions"]
-        rank_hidden = options.get("target_hidden_states_by_rank")
         assert offsets[0] == cumulative[0] == 0 and offsets[-1] == len(tokens)
         assert len(set(slots)) == len(tokens)
         assert options["top_k"] == 1
         if self.draft:
+            if "target_hidden_segments_by_rank" in options:
+                assert len(offsets) > 2
+                assert "target_hidden_states_by_rank" not in options
+                rank_segments = options["target_hidden_segments_by_rank"]
+                assert isinstance(rank_segments, tuple)
+                lengths = [end - begin for begin, end in zip(offsets, offsets[1:])]
+                rank_hidden = []
+                for rank, segments in enumerate(rank_segments):
+                    assert isinstance(segments, tuple)
+                    assert [len(tensor.rows) for tensor in segments] == lengths
+                    assert all(tensor.device == rank for tensor in segments)
+                    rank_hidden.append(Tensor([row for tensor in segments for row in tensor.rows], rank))
+            else:
+                rank_hidden = options["target_hidden_states_by_rank"]
             assert len(rank_hidden) == RANKS
-            assert all(tensor.device == rank and not tensor.pending and len(tensor.rows) == len(tokens)
+            assert all(tensor.device == rank and len(tensor.rows) == len(tokens)
                        for rank, tensor in enumerate(rank_hidden))
         predictions, hidden = [], [[] for _ in range(RANKS)]
         spans = []
@@ -134,6 +143,11 @@ class Engine:
         self.calls.append((tuple(spans), all_positions))
         self.return_hidden.append(options["return_draft_hidden_states"])
         result = {"output_ids": Tensor(predictions)}
+        if options.get("mtp_graph_direct_commit"):
+            assert not self.draft and not options["rollback_v4_cache"]
+            result["execution_report"] = {
+                "mode": "device_graph", "device_graph_segments": 1, "host_segments": 0,
+            }
         if options["return_draft_hidden_states"]:
             result["hidden_states_by_rank"] = tuple(Tensor(rows, rank) for rank, rows in enumerate(hidden))
         return result
@@ -162,6 +176,9 @@ class Request:
 
 
 class CacheOps:
+    def __init__(self, *, permit_direct=False):
+        self.permit_direct = permit_direct
+
     @contextmanager
     def verify_batch(self, candidates):
         for row in candidates:
@@ -175,12 +192,16 @@ class CacheOps:
             for row, length in zip(candidates, lengths, strict=True):
                 row["req"].block_table = row["block_table"][:(length + PAGE_SIZE - 1) // PAGE_SIZE]
 
-        yield SimpleNamespace(mark_submitted=lambda: None, mark_completed=lambda: None, commit=commit)
+        yield SimpleNamespace(mark_submitted=lambda: None, mark_completed=lambda: None, commit=commit,
+                              permits_packed_direct_target=lambda tables: self.permit_direct)
 
 
-def make_case(enabled, depth, specs):
+def make_case(enabled, depth, specs, *, transport_options=None, modes=None):
     target, draft, core = Engine(), Engine(draft=True), Core()
-    transport = _V4Transport(target, draft, core, PAGE_SIZE, batched_draft=enabled)
+    transport = _V4Transport(target, draft, core, PAGE_SIZE, batched_draft=enabled, **(transport_options or {}))
+    if modes is not None:
+        proposal, repair = modes
+        transport.set_c3_draft_modes(proposal=proposal, repair=repair)
     runner = DeepSeekV4MTPRunner(target, transport, 2048, num_draft_tokens=depth)
     requests = [Request(name, page, budget, stop=stop) for name, page, budget, stop in specs]
     pages = [request.block_table[0] for request in requests]
@@ -205,9 +226,10 @@ def make_case(enabled, depth, specs):
     return runner, requests, draft, core
 
 
-def decode(runner, requests):
+def decode(runner, requests, *, cache_ops=None):
     output = runner.forward(SimpleNamespace(
-        is_prefill=False, scheduled_requests=requests, speculative_cache_ops=CacheOps(),
+        is_prefill=False, scheduled_requests=requests,
+        speculative_cache_ops=CacheOps() if cache_ops is None else cache_ops,
     ), {})
     for request, tokens in zip(requests, output, strict=True):
         request.generated_token_ids.extend(tokens)
@@ -253,7 +275,7 @@ class BatchedDraftTest(unittest.TestCase):
         for cohort, expected in ((c1, ((1, 1), (1,))), (specs, ((3, 3), (3,)))):
             with self.subTest(owners=len(cohort)):
                 serial, old_requests, old_draft, _ = make_case(False, 1, cohort)
-                batched, requests, draft, core = make_case(True, 1, cohort)
+                batched, requests, draft, _ = make_case(True, 1, cohort)
                 actual = decode(batched, requests)
                 self.assertEqual(actual, decode(serial, old_requests))
                 self.assertEqual(actual, [row[0] for row in oracles[:len(cohort)]])
@@ -280,8 +302,6 @@ class BatchedDraftTest(unittest.TestCase):
                     self.assertEqual(requests[1].block_table, [4, 6])
                     self.assertNotIn(5 * PAGE_SIZE, draft.cache)
                     self.assertEqual(draft.cache[6 * PAGE_SIZE], 44)
-                self.assertEqual(core.device, "caller")
-                self.assertFalse(core.pending)
 
     def test_changed_retained_page_recomputes_only_its_seed(self):
         specs = (("a", 1, 8, ()), ("b", 7, 8, ()))
@@ -342,7 +362,7 @@ class BatchedDraftTest(unittest.TestCase):
         for depth, expected in ((2, (3, 2)), (3, (3, 2, 1))):
             with self.subTest(depth=depth):
                 serial, old_requests, old_draft, _ = make_case(False, depth, specs)
-                batched, requests, draft, core = make_case(True, depth, specs)
+                batched, requests, draft, _ = make_case(True, depth, specs)
                 self.assertEqual(decode(batched, requests), decode(serial, old_requests))
                 proposals = [spans for spans, all_positions in draft.calls if not all_positions]
                 old_proposals = [spans for spans, all_positions in old_draft.calls if not all_positions]
@@ -356,8 +376,6 @@ class BatchedDraftTest(unittest.TestCase):
                 for owner, state in batched.transport.states.items():
                     self.assertEqual([tensor.rows for tensor in state.hidden],
                                      [tensor.rows for tensor in serial.transport.states[owner].hidden])
-                self.assertEqual(core.device, "caller")
-                self.assertFalse(core.pending)
 
 
 if __name__ == "__main__":

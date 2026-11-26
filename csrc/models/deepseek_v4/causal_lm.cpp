@@ -36,6 +36,8 @@ using RowLinear = nn::RowParallelLinear;
 using RMSNorm = layers::RMSNorm;
 using Quant = quantization::CompressedTensors;
 
+constexpr size_t kV4TensorParallelSize = 8;
+
 struct V4Config {
     size_t hidden, vocab, heads, output_groups, q_rank, o_rank, experts, intermediate;
     size_t topk, hash_layers, index_heads, streams, iterations, max_positions;
@@ -63,7 +65,8 @@ struct V4Config {
             json.at("quantization_config").value("quant_method", "") != std::string("compressed-tensors")) {
             throw std::invalid_argument("DeepSeek V4 mainline currently requires the channel INT8 W8A8 checkpoint");
         }
-        if (rank.device.type() != runtime::Device::Type::kHygon || rank.tp_size != 8 || rank.pp_size != 1 ||
+        if (rank.device.type() != runtime::Device::Type::kHygon ||
+            rank.tp_size != kV4TensorParallelSize || rank.pp_size != 1 ||
             rank.tp_rank < 0 || rank.tp_rank >= rank.tp_size || !rank.comm ||
             config.get_dtype() != DataType::kBFloat16 || config.get<size_t>("head_dim") != 512 ||
             config.get<size_t>("qk_rope_head_dim") != 64 || config.get<size_t>("num_key_value_heads") != 1 ||
@@ -103,12 +106,16 @@ Tensor cast(Runtime &rt, const Tensor &value, DataType dtype) {
 // The HCU custom reduction used by the reference accumulates rank-local
 // BF16 contributions in FP32 and truncates only the final writeback.
 Tensor reduce_tp(Runtime &rt, const Tensor &local, infinicclComm_t comm,
-                 const std::vector<size_t> &query_offsets) {
+                 const std::vector<size_t> &query_offsets, bool packed) {
     auto sum = cast(rt,local,DataType::kFloat32);
-    for_each_request(query_offsets, [&](const RequestRows &rows) {
-        auto part = rows.slice(sum);
-        engine::distributed::allreduce_(rt, part, part, infinicclSum, comm);
-    });
+    if (packed) {
+        engine::distributed::allreduce_(rt, sum, sum, infinicclSum, comm);
+    } else {
+        for_each_request(query_offsets, [&](const RequestRows &rows) {
+            auto part = rows.slice(sum);
+            engine::distributed::allreduce_(rt, part, part, infinicclSum, comm);
+        });
+    }
     auto output = Tensor::empty(rt,local->shape(),local->dtype());
     submit<infini::ops::DeepseekV4CastRz>(rt,sum,output);
     return output;
@@ -162,6 +169,7 @@ struct BatchMetadata {
     bool single_decode{};
     bool packed_shared_constants{};
     bool short_c4_index{};
+    bool packed_collectives{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -322,7 +330,7 @@ public:
             return wo_a_->forward(rt, flattened);
         });
         auto contribution = static_cast<const nn::BaseLinear&>(*wo_b_).forward(rt,local);
-        return reduce_tp(rt, contribution, comm_, batch.query_offsets);
+        return reduce_tp(rt, contribution, comm_, batch.query_offsets, batch.packed_collectives);
     }
 
 private:
@@ -398,7 +406,7 @@ public:
         }
         auto shared = run_routed_experts(rt,x,{ones,zero},*shared_,limit_,std::nullopt);
         auto sum = add(rt,routed,shared);
-        return reduce_tp(rt, sum, comm_, query_offsets);
+        return reduce_tp(rt, sum, comm_, query_offsets, batch.packed_collectives);
     }
 
 private:
@@ -633,6 +641,8 @@ public:
         if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
             throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
         }
+        batch.packed_collectives = capture_mtp && direct_hc && batch.query_offsets.size() == 4 &&
+            env_enabled("INFINILM_MTP_GRAPH_C3_PACKED_TARGET_COLLECTIVES");
         if (input.mtp_graph_draft_seed && !capture_mtp) {
             throw std::runtime_error("Classic NextN Graph Draft seed requires a device Graph with owned Draft HC");
         }
@@ -735,12 +745,37 @@ private:
         return stable;
     }
 
+    Tensor gather_packed_logits(Runtime &rt, const Tensor &hidden) const {
+        const auto rows = hidden->size(0);
+        const auto local_vocab = cfg_.vocab / kV4TensorParallelSize;
+        auto local = Tensor::empty(rt, {rows, local_vocab}, hidden->dtype());
+        const auto copy_logits = [&](const Tensor &source, const Tensor &destination) {
+            execution::submit<infini::ops::Copy>(
+                rt, execution::RecordingPolicy::DeviceOnly,
+                infini::ops::Copy::DefaultConfig(rt.device().type()), source, false, destination);
+        };
+        for (size_t row = 0; row < rows; ++row) {
+            auto input = hidden->narrow({{0, row, 1}});
+            copy_logits(head_->forward(rt, input), local->narrow({{0, row, 1}}));
+        }
+
+        // AllGather writes [rank, row, local_vocab]. Restore the row-major token order.
+        auto gathered = Tensor::empty(rt, {kV4TensorParallelSize, rows, local_vocab}, local->dtype());
+        engine::distributed::allgather_(rt, gathered, local, comm_);
+        auto output = Tensor::empty(rt, {rows, kV4TensorParallelSize, local_vocab}, local->dtype());
+        copy_logits(gathered->permute({1, 0, 2}), output);
+        return output->view({1, rows, cfg_.vocab});
+    }
+
     Output forward_logits(Runtime &rt,const Tensor &ids,const BatchMetadata &batch,
                           const Tensor &target_hc = {},bool return_hc = false,
                           bool last_logits = false) const {
         auto [hidden,hc] = backbone_->forward(rt,ids,batch,caches_,swa_rope_,compressed_rope_,target_hc,return_hc);
         // A per-token projection retains the reference's M=1 accumulation boundary
         // and leaves full packed HC available to seed or repair Draft.
+        if (batch.packed_collectives && !last_logits) {
+            return Output{gather_packed_logits(rt, hidden), std::move(hc), std::nullopt, {}};
+        }
         const auto requests = batch.query_offsets.size() - 1;
         const bool select_last = last_logits && requests < ids->numel();
         const auto rows = select_last ? requests : ids->numel();
@@ -773,6 +808,7 @@ private:
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
                 plan->batch.packed_shared_constants != batch.packed_shared_constants ||
                 plan->batch.short_c4_index != batch.short_c4_index ||
+                plan->batch.packed_collectives != batch.packed_collectives ||
                 plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
@@ -871,6 +907,9 @@ private:
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
+        if (classic_mtp && env_enabled("INFINILM_MTP_GRAPH_PLAN_RECEIPT")) {
+            report.mtp_graph_plan = common_slots ? "hit" : "capture";
+        }
         Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
         output.mtp_last_logits_used = draft_seed_graph;
         return output;

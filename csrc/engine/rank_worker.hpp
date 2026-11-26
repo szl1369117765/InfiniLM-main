@@ -103,6 +103,9 @@ public:
         bool return_draft_hidden_states{false};
         bool rollback_v4_cache{false};
         std::optional<std::vector<infinilm::runtime::Tensor>> target_hidden_states_by_rank;
+        std::optional<std::vector<std::vector<infinilm::runtime::Tensor>>> target_hidden_segments_by_rank;
+        // Populated by InferEngine for a single worker, in packed request order.
+        std::vector<infinilm::runtime::Tensor> target_hidden_segments;
         bool mtp_draft_cache_only{false};
         bool mtp_cpu_metadata_shadow{false};
         bool mtp_shared_compression_plan{false};

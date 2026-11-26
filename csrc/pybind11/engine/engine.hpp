@@ -250,6 +250,7 @@ inline void bind_infer_engine(py::module &m) {
                     "return_draft_hidden_states",
                     "rollback_v4_cache",
                     "target_hidden_states_by_rank",
+                    "target_hidden_segments_by_rank",
                     "mtp_draft_cache_only",
                     "mtp_cpu_metadata_shadow",
                     "mtp_shared_compression_plan",
@@ -328,6 +329,9 @@ inline void bind_infer_engine(py::module &m) {
                     } else if (key == "target_hidden_states_by_rank" && !item.second.is_none()) {
                         input.target_hidden_states_by_rank =
                             py::cast<std::vector<infinilm::runtime::Tensor>>(item.second);
+                    } else if (key == "target_hidden_segments_by_rank" && !item.second.is_none()) {
+                        input.target_hidden_segments_by_rank =
+                            py::cast<std::vector<std::vector<infinilm::runtime::Tensor>>>(item.second);
                     }
                 }
 
@@ -397,6 +401,9 @@ inline void bind_infer_engine(py::module &m) {
             result["host_segments"] = host_segments;
             result["operator_count"] = graph ? graph->operator_count : 0;
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
+            if (graph && graph->mtp_graph_plan) {
+                result["mtp_graph_plan"] = graph->mtp_graph_plan;
+            }
             if (!output.mtp_graph_direct_rank_reports.empty()) {
                 py::list rank_reports;
                 for (size_t rank = 0; rank < output.mtp_graph_direct_rank_reports.size(); ++rank) {
@@ -406,6 +413,9 @@ inline void bind_infer_engine(py::module &m) {
                     entry["device_graph_segments"] = report.device_graph_segments;
                     entry["host_segments"] = report.host_segments;
                     entry["operator_count"] = report.operator_count;
+                    if (report.mtp_graph_plan) {
+                        entry["mtp_graph_plan"] = report.mtp_graph_plan;
+                    }
                     rank_reports.append(std::move(entry));
                 }
                 result["mtp_graph_direct_rank_reports"] = std::move(rank_reports);

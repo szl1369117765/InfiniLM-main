@@ -52,7 +52,7 @@ class _TargetTransaction:
     def __init__(self, transport, batch, tables, tokens, verify_hidden=None,
                  proposal_laws=(), logits=None, *, omit_terminal=False, early_rejection=False,
                  scratch_commit=None, batch_draft_seed=False, k1_graph_seed=False,
-                 graph_k3_draft_seed=False):
+                 graph_k3_draft_seed=False, graph_batched_direct_draft_repair=False):
         self.transport = transport
         self.batch = batch
         self.tables = tables
@@ -71,6 +71,7 @@ class _TargetTransaction:
         self.batch_draft_seed = batch_draft_seed
         self.k1_graph_seed = k1_graph_seed
         self.graph_k3_draft_seed = graph_k3_draft_seed
+        self.graph_batched_direct_draft_repair = graph_batched_direct_draft_repair
         self._resolved = None
         self.committed = False
 
@@ -123,6 +124,14 @@ class _TargetTransaction:
             raise ValueError("MTP commit must match the current verify decision exactly once")
         if self.batch_draft_seed:
             self._commit_k1_draft_batch(decisions)
+        elif self.graph_batched_direct_draft_repair:
+            # Direct verify already materialized the retained Target rows.
+            # Each owner consumes only its own prefix from the packed HC.
+            direct_hc = tuple(
+                self._retained_target(decision, table, self.batch.input_offsets[index])
+                for index, (decision, table) in enumerate(zip(decisions, self.tables, strict=True))
+            )
+            self._commit_draft_repair_batch(decisions, direct_hc, worker_join=True)
         else:
             retained = (None,) * len(decisions)
             if (self.transport.batched_target_replay and len(decisions) in (2, 3)
@@ -135,7 +144,7 @@ class _TargetTransaction:
                     self._commit_owner(decision, table, self.batch.input_offsets[index], replay)
         self.committed = True
 
-    def _commit_draft_repair_batch(self, decisions, retained):
+    def _commit_draft_repair_batch(self, decisions, retained, *, worker_join=False):
         updates, by_depth = {}, []
         for intent, table, (tokens, start, hidden) in zip(decisions, self.tables, retained, strict=True):
             updates[intent.owner] = _DraftState(
@@ -157,7 +166,9 @@ class _TargetTransaction:
                 (segment,) = segments
                 self.transport._write_draft_cache(segment.tokens, segment.start, segment.table, segment.hidden)
             else:
-                self.transport._forward_draft_segments(segments, return_hidden=False)
+                self.transport._forward_draft_segments(
+                    segments, return_hidden=False, worker_join=worker_join,
+                )
         self.transport.states.update(updates)
 
     def _batch_retained_target(self, decisions):
@@ -325,6 +336,7 @@ class _V4Transport:
                  shared_compression_plan=False, stepwise_direct_commit=False,
                  batched_draft=False, last_logits=False, k1_graph_seed=False,
                  batched_target_replay=False, batched_draft_repair=False,
+                 graph_batched_draft_proposal=False, graph_batched_direct_draft_repair=False,
                  graph_packed_direct_available=False, graph_single_direct_available=False,
                  graph_prefill_last_logits=False, graph_prefill_draft_cache_only=False,
                  graph_k3_draft_seed=False):
@@ -346,6 +358,9 @@ class _V4Transport:
         self.batched_draft = batched_draft
         self.batched_target_replay = batched_target_replay
         self.batched_draft_repair = batched_draft_repair
+        self.graph_batched_draft_proposal = graph_batched_draft_proposal
+        self.graph_batched_direct_draft_repair = graph_batched_direct_draft_repair
+        self._c3_draft_modes_prepared = graph_batched_draft_proposal or graph_batched_direct_draft_repair
         self.last_logits = last_logits
         self.k1_graph_seed = k1_graph_seed
         self.graph_packed_direct_available = graph_packed_direct_available
@@ -358,6 +373,12 @@ class _V4Transport:
 
     def graph_single_direct_enabled(self):
         return self.graph_single_direct_available and os.getenv("INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT") == "1"
+
+    def set_c3_draft_modes(self, *, proposal, repair):
+        if not self._c3_draft_modes_prepared or self.states or self.transaction is not None:
+            raise RuntimeError("C3 Draft modes require prepared capacity and an idle transport")
+        self.graph_batched_draft_proposal = proposal
+        self.graph_batched_direct_draft_repair = repair
 
     @property
     def owner(self):
@@ -486,7 +507,7 @@ class _V4Transport:
             core.set_device(previous)
         return hidden
 
-    def _forward_draft_segments(self, segments, *, return_hidden):
+    def _forward_draft_segments(self, segments, *, return_hidden, worker_join=False):
         if len(segments) == 1:
             (segment,) = segments
             return self._forward(
@@ -510,6 +531,13 @@ class _V4Transport:
             tables.append(list(table) + [-1] * (width - len(table)))
         if len(set(slots)) != len(slots):
             raise ValueError("MTP packed Draft has overlapping physical slots")
+        if worker_join:
+            # The C3 optimizations join rank-local HC on the Draft worker.
+            hidden_input = {"target_hidden_segments_by_rank": tuple(zip(
+                *(segment.hidden for segment in segments), strict=True,
+            ))}
+        else:
+            hidden_input = {"target_hidden_states_by_rank": self._join_draft_hidden(segments)}
         core = self.core
         result = self.draft.forward_raw(
             input_ids=core.from_list([tokens], dtype=core.int64),
@@ -523,7 +551,7 @@ class _V4Transport:
             sample_all_positions=False,
             top_k=1,
             return_draft_hidden_states=return_hidden,
-            target_hidden_states_by_rank=self._join_draft_hidden(segments),
+            **hidden_input,
             **self._host_metadata_options(),
         )
         return self._decode(result, len(segments))
@@ -659,7 +687,7 @@ class _V4Transport:
             return seed
         return None
 
-    def propose_batched(self, requests, tables, counts):
+    def propose_batched(self, requests, tables, counts, *, keep_final_graph=False):
         states, chains, hidden = [], [], []
         for request, table, count in zip(requests, tables, counts, strict=True):
             state = self._ready_state(request.owner, request.anchor, request.start)
@@ -673,12 +701,20 @@ class _V4Transport:
                 chain = chains[index]
                 token = chain[-1] if chain else request.anchor
                 if len(chain) == depth < count and (not chain or token not in request.eos_token_ids):
-                    active.append(index)
-                    segments.append(_DraftSegment((token,), request.start - 1 + depth, table, hidden[index]))
+                    segment = _DraftSegment((token,), request.start - 1 + depth, table, hidden[index])
+                    if keep_final_graph and depth + 1 == count:
+                        # Keep the span eligible for the Draft q1 Graph.
+                        (last,), _ = self._forward_draft_segments((segment,), return_hidden=False)
+                        chain.append(last)
+                    else:
+                        active.append(index)
+                        segments.append(segment)
             if not segments:
                 continue
             next_depth = any(depth + 1 < counts[index] for index in active)
-            ids, rows = self._forward_draft_segments(segments, return_hidden=next_depth)
+            ids, rows = self._forward_draft_segments(
+                segments, return_hidden=next_depth, worker_join=keep_final_graph,
+            )
             if next_depth and (
                 not rows or len(rows) != len(segments[0].hidden)
                 or any(tensor.shape[0] != len(active) for tensor in rows)
@@ -783,6 +819,9 @@ class _V4Transport:
                 len(request.draft_tokens) == 1 for request in batch.requests
             ),
             graph_k3_draft_seed=self.graph_k3_draft_seed and len(tables) == 1 and direct_tables is not None,
+            graph_batched_direct_draft_repair=(
+                self.graph_batched_direct_draft_repair and direct_tables is not None and len(tables) == 3
+            ),
         )
         with self._publishing(transaction):
             yield transaction
@@ -1107,6 +1146,14 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         and config.enable_graph and config.num_draft_tokens == 3
         and config.max_batch_size in (2, 3) and config.nextn_branch_draft_lengths is None
     )
+    c3_graph = graph_direct_available and config.max_batch_size == 3
+    graph_batched_draft_proposal = c3_graph and os.getenv("INFINILM_MTP_GRAPH_BATCHED_DRAFT_PROPOSAL") == "1"
+    graph_batched_direct_draft_repair = (
+        c3_graph and os.getenv("INFINILM_MTP_GRAPH_BATCHED_DIRECT_DRAFT_REPAIR") == "1"
+    )
+    draft_batch_size = config.max_batch_size if (
+        batched_draft or batched_draft_repair or graph_batched_draft_proposal or graph_batched_direct_draft_repair
+    ) else 1
     k1_graph_seed = _k1_graph_seed_enabled(config, InferEngine)
     last_logits = os.getenv("INFINILM_MTP_LAST_LOGITS") == "1" and not config.enable_graph
     if last_logits and getattr(InferEngine, "mtp_last_logits_version", 0) != 1:
@@ -1119,7 +1166,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         distributed_config=DistConfig(config.tensor_parallel_size),
         cache_config=PagedKVCacheConfig(
             num_blocks=config.num_blocks, block_size=config.block_size,
-            max_batch_size=config.max_batch_size if batched_draft or batched_draft_repair else 1,
+            max_batch_size=draft_batch_size,
         ),
         enable_graph_compiling=config.enable_graph,
         attention_backend="paged-attn",
@@ -1143,12 +1190,14 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         "draft_seed=%s draft_cache_only=%s batched_draft=%s k1_graph_seed=%s last_logits=%s terminal_tail_trim=%s "
         "cpu_metadata_shadow=%s shared_compression_plan=%s stepwise_direct_commit=%s "
         "batched_target_replay=%s batched_draft_repair=%s "
+        "graph_batched_draft_proposal=%s graph_batched_direct_draft_repair=%s "
         "graph_prefill_last_logits=%s graph_prefill_draft_cache_only=%s graph_k3_draft_seed=%s",
         config.num_draft_tokens, config.enable_graph, config.nextn_branch_draft_lengths,
         config.nextn_branch_execution, direct_k1_commit, direct_k23_commit, reuse_seed,
         draft_cache_only, batched_draft, k1_graph_seed, last_logits, terminal_tail_trim,
         cpu_metadata_shadow or shared_compression_plan,
         shared_compression_plan, stepwise_direct_commit, batched_target_replay, batched_draft_repair,
+        graph_batched_draft_proposal, graph_batched_direct_draft_repair,
         graph_prefill_last_logits, graph_prefill_draft_cache_only,
         graph_k3_draft_seed,
     )
@@ -1161,7 +1210,9 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         stepwise_direct_commit=stepwise_direct_commit, batched_draft=batched_draft, last_logits=last_logits,
         k1_graph_seed=k1_graph_seed, batched_target_replay=batched_target_replay,
         batched_draft_repair=batched_draft_repair,
-        graph_packed_direct_available=graph_direct_available and config.max_batch_size == 3,
+        graph_batched_draft_proposal=graph_batched_draft_proposal,
+        graph_batched_direct_draft_repair=graph_batched_direct_draft_repair,
+        graph_packed_direct_available=c3_graph,
         graph_single_direct_available=graph_direct_available and config.max_batch_size == 1,
         graph_prefill_last_logits=graph_prefill_last_logits,
         graph_prefill_draft_cache_only=graph_prefill_draft_cache_only,
