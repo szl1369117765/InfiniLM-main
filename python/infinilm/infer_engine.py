@@ -371,6 +371,8 @@ class InferEngine(_infinilm.InferEngine):
         mtp_scratch_step=False,
         mtp_last_logits=False,
         mtp_graph_direct_commit=False,
+        mtp_graph_fresh_prefill=False,
+        mtp_graph_draft_seed=False,
     ):
         def unwrap_tensor(tensor):
             return (
@@ -451,6 +453,18 @@ class InferEngine(_infinilm.InferEngine):
             if getattr(self, "mtp_last_logits_version", 0) != 1:
                 raise RuntimeError("Classic NextN last logits require native head selection support")
             mtp_arguments["mtp_last_logits"] = True
+        if mtp_graph_fresh_prefill is not False:
+            if mtp_graph_fresh_prefill is not True:
+                raise ValueError("mtp_graph_fresh_prefill must be a bool")
+            if getattr(self, "mtp_graph_fresh_prefill_version", 0) != 1:
+                raise RuntimeError("Classic NextN Graph prefill requires native support")
+            mtp_arguments["mtp_graph_fresh_prefill"] = True
+        if type(mtp_graph_draft_seed) is not bool:
+            raise ValueError("mtp_graph_draft_seed must be a bool")
+        if mtp_graph_draft_seed:
+            if getattr(self, "mtp_graph_draft_seed_version", 0) != 1:
+                raise RuntimeError("Classic NextN Graph Draft seed requires native owned Draft HC")
+            mtp_arguments["mtp_graph_draft_seed"] = True
 
         return super().Input(
             input_ids,
@@ -620,6 +634,8 @@ class InferEngine(_infinilm.InferEngine):
         mtp_scratch_step=False,
         mtp_last_logits=False,
         mtp_graph_direct_commit=False,
+        mtp_graph_fresh_prefill=False,
+        mtp_graph_draft_seed=False,
     ):
         try:
             output = super().forward(
@@ -652,6 +668,8 @@ class InferEngine(_infinilm.InferEngine):
                     mtp_scratch_step=mtp_scratch_step,
                     mtp_last_logits=mtp_last_logits,
                     mtp_graph_direct_commit=mtp_graph_direct_commit,
+                    mtp_graph_fresh_prefill=mtp_graph_fresh_prefill,
+                    mtp_graph_draft_seed=mtp_graph_draft_seed,
                 )
             )
             metadata_evidence = {}
@@ -683,7 +701,7 @@ class InferEngine(_infinilm.InferEngine):
                 result["hidden_states_by_rank"] = tuple(
                     infinicore.Tensor(tensor) for tensor in output.hidden_states_by_rank
                 )
-            if mtp_last_logits:
+            if mtp_last_logits or mtp_graph_draft_seed:
                 result["mtp_last_logits_used"] = output.mtp_last_logits_used
             return result
         except BaseException as e:

@@ -109,6 +109,8 @@ public:
         bool mtp_scratch_step{false};
         bool mtp_last_logits{false};
         bool mtp_graph_direct_commit{false};
+        bool mtp_graph_fresh_prefill{false};
+        bool mtp_graph_draft_seed{false};
 
         infinilm::InfinilmModel::Input to_model_input(
             infinilm::runtime::Device device,

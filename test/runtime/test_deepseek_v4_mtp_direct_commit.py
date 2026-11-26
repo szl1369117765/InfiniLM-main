@@ -18,6 +18,7 @@ from direct_commit_test_runner.deepseek_v4_mtp_transport import (
     _direct_k1_commit_enabled,
     _direct_k23_commit_enabled,
     _draft_cache_only_enabled,
+    _graph_k3_draft_seed_enabled,
     _host_metadata_modes,
 )
 from direct_commit_test_runner.deepseek_v4_mtp_verify import GreedyVerifyBatch, GreedyVerifyRequest
@@ -386,6 +387,121 @@ class DirectCommitTest(unittest.TestCase):
             self.assertEqual(call["position_ids"].values, [2 + offset])
             self.assertEqual(call["input_ids"].values, [[candidates[offset]]])
             self.assert_hidden_row(call["target_hidden_states_by_rank"], "verify", offset)
+
+
+class GraphK3DraftSeedTest(unittest.TestCase):
+    table = (6, 2)
+    candidates = (8, 9, 10)
+
+    def make_verify(self, accepted, *, remaining=9, eos=(), enabled=True, start=255):
+        predictions = [11] * 4
+        predictions[:accepted] = self.candidates[:accepted]
+        target_hc = output(predictions, "verify", rows=4)
+        target_hc["execution_report"] = {
+            "mode": "device_graph", "device_graph_segments": 1, "host_segments": 0,
+        }
+        target = Engine(target_hc)
+        draft = Engine(*(output([token], "proposal", rows=1) for token in self.candidates))
+        core = types.SimpleNamespace(from_list=lambda data, dtype: Tensor(data), int64=64, int32=32)
+        port = _V4Transport(target, draft, core, 256, graph_single_direct_available=True,
+                            graph_k3_draft_seed=enabled)
+        port.states["r"] = _DraftState(output([], "prefill", rows=1)["hidden_states_by_rank"], 7, start)
+        self.assertEqual(port.propose_many("r", 7, start, self.table, 3, eos), self.candidates)
+        batch = GreedyVerifyBatch.pack([GreedyVerifyRequest("r", start, remaining, 7, self.candidates, eos)], 512)
+        return port, target, draft, batch
+
+    def commit(self, port, batch):
+        with patch.dict(os.environ, {"INFINILM_MTP_GRAPH_K3_DIRECT_COMMIT": "1"}):
+            with port.target_transaction(batch, self.table, graph_packed_direct_commit=True) as transaction:
+                (intent,) = batch.resolve(transaction.rows)
+                transaction.commit(intent)
+        return intent
+
+    def seed_receipt(self, length, segments=1, last=True):
+        return {**output([90], "seed", rows=length), "execution_report": {"device_graph_segments": segments},
+                "mtp_last_logits_used": last}
+
+    def test_fused_draft_uses_only_retained_hc_across_pages(self):
+        for accepted in (1, 2, 3):
+            with self.subTest(accepted=accepted):
+                port, target, draft, batch = self.make_verify(accepted)
+                count = accepted + 1
+                draft.responses.append(self.seed_receipt(count))
+                self.assertEqual(len(self.commit(port, batch).materialized_rows), count)
+                self.assertEqual(len(target.calls), 1)
+                self.assertEqual(len(draft.calls), 4)
+                fused = draft.calls[-1]
+                self.assertIs(fused["mtp_graph_draft_seed"], True)
+                self.assertFalse(fused["sample_all_positions"])
+                self.assertTrue(fused["return_draft_hidden_states"])
+                self.assertNotIn("mtp_last_logits", fused)
+                self.assertEqual(fused["input_ids"].values, [[*self.candidates[:accepted], 11]])
+                self.assertEqual(fused["position_ids"].values, list(range(255, 255 + count)))
+                self.assertEqual(fused["slot_mapping"].values, [6 * 256 + 255, *range(512, 512 + accepted)])
+                for rank, tensor in enumerate(fused["target_hidden_states_by_rank"]):
+                    self.assertEqual(tensor.values, [("verify", rank, row) for row in range(count)])
+                seed = port.states["r"].seed
+                self.assertEqual(seed.pages, self.table)
+                for rank, tensor in enumerate(seed.hidden):
+                    self.assertEqual(tensor.values, [("seed", rank, count - 1)])
+                draft.responses.extend((output([91], "next", rows=1), output([92])))
+                self.assertEqual(port.propose_many("r", 11, 255 + count, self.table, 3, ()), (90, 91, 92))
+                self.assertEqual(draft.calls[-2]["target_hidden_states_by_rank"], seed.hidden)
+                self.assertEqual(draft.calls[-2]["position_ids"].values, [255 + count])
+                self.assertIsNone(port.states["r"].seed)
+
+    def test_fused_draft_does_not_expose_reserved_page_after_rejection(self):
+        port, target, draft, batch = self.make_verify(1, start=254)
+        draft.responses.append(self.seed_receipt(2))
+        self.commit(port, batch)
+        self.assertEqual(target.calls[-1]["block_tables"].values, [[6, 2]])
+        self.assertEqual(draft.calls[-1]["block_tables"].values, [[6]])
+        self.assertEqual(draft.calls[-1]["slot_mapping"].values, [6 * 256 + 254, 6 * 256 + 255])
+        self.assertEqual(port.states["r"].seed.pages, (6,))
+
+    def test_zero_acceptance_terminal_tail_short_budget_and_off_keep_serial_behavior(self):
+        for accepted, remaining, eos, enabled, repairs in (
+            (0, 9, (), True, 0), (1, 4, (), True, 1), (3, 4, (), True, 0),
+            (1, 9, (11,), True, 1), (2, 9, (), False, 2),
+        ):
+            with self.subTest(accepted=accepted, remaining=remaining, eos=eos, enabled=enabled):
+                port, target, draft, batch = self.make_verify(accepted, remaining=remaining, eos=eos, enabled=enabled)
+                draft.responses.extend(output([1]) for _ in range(repairs))
+                self.commit(port, batch)
+                self.assertEqual(len(target.calls), 1)
+                self.assertEqual(len(draft.calls), 3 + repairs)
+                self.assertTrue(all("mtp_graph_draft_seed" not in call for call in draft.calls))
+                self.assertIsNone(port.states["r"].seed)
+
+    def test_submitted_fused_draft_rejects_bad_receipt_without_retry(self):
+        for segments, last, expected in ((0, True, "device Graph"), (1, False, "last logits")):
+            with self.subTest(segments=segments, last=last):
+                port, target, draft, batch = self.make_verify(1)
+                draft.responses.append(self.seed_receipt(2, segments, last))
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    self.commit(port, batch)
+                self.assertEqual(len(target.calls), 1)
+                self.assertEqual(len(draft.calls), 4)
+                self.assertIsNone(port.states["r"].seed)
+                self.assertEqual(port.position, 255)
+                self.assertIsNone(port.transaction)
+
+    def test_opt_in_requires_direct_single_stage_serial_graph_and_native_abi(self):
+        config = types.SimpleNamespace(pipeline_parallel_size=1, nextn_branch_execution="serial")
+        native = types.SimpleNamespace(mtp_graph_draft_seed_version=1)
+        flag = "INFINILM_MTP_GRAPH_K3_DRAFT_SEED"
+        with patch.dict(os.environ, {flag: "0"}):
+            self.assertFalse(_graph_k3_draft_seed_enabled(config, True, native))
+        with patch.dict(os.environ, {flag: "1"}):
+            self.assertTrue(_graph_k3_draft_seed_enabled(config, True, native))
+            self.assertFalse(_graph_k3_draft_seed_enabled(config, False, native))
+            with self.assertRaisesRegex(RuntimeError, "native owned Draft HC"):
+                _graph_k3_draft_seed_enabled(config, True, object())
+            config.pipeline_parallel_size = 2
+            self.assertFalse(_graph_k3_draft_seed_enabled(config, True, native))
+            config.pipeline_parallel_size = 1
+            config.nextn_branch_execution = "packed"
+            self.assertFalse(_graph_k3_draft_seed_enabled(config, True, native))
 
 
 if __name__ == "__main__":

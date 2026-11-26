@@ -136,9 +136,21 @@ struct MixWeights {
 
 // Three short verify spans can contribute up to four rows apiece.
 constexpr size_t kPackedSharedExpertRows = 3 * 4;
+constexpr size_t kC4IndexWidth = 128;
+constexpr size_t kC4IndexTopK = 512;
+constexpr size_t kC4IndexMaxUnscoredPages = kC4IndexTopK / (kV4PageSize / 4);
+
+bool env_enabled(const char *name) {
+    const auto *mode = std::getenv(name);
+    return mode && std::string_view(mode) == "1";
+}
 
 bool packed_shared_constants_enabled() {
-    const auto *mode = std::getenv("INFINILM_MTP_GRAPH_PACKED_SHARED_EXPERT_CONSTANTS");
+    return env_enabled("INFINILM_MTP_GRAPH_PACKED_SHARED_EXPERT_CONSTANTS");
+}
+
+bool k3_draft_seed_enabled() {
+    const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED");
     return mode && std::string_view(mode) == "1";
 }
 
@@ -149,6 +161,7 @@ struct BatchMetadata {
     std::vector<size_t> query_offsets;
     bool single_decode{};
     bool packed_shared_constants{};
+    bool short_c4_index{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -272,14 +285,20 @@ public:
             auto key = index_compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
                                                  cache.indexer_state,batch.c4_positions,frequencies,batch.query_offsets);
             key = cast(rt,key,DataType::kBFloat16);
-            auto query = index_query_->forward(rt,q_lora)->view({rows,index_heads_,128});
-            apply_rotary_tail(rt,query,batch.position,frequencies);
-            auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
-                auto input = part.slice(x);
-                return index_weights_->forward(rt, input);
-            });
-            // A positive scalar common to all candidates does not change top-k.
-            indices = Tensor::empty(rt,{rows,512},DataType::kInt32);
+            Tensor query, weights;
+            if (batch.short_c4_index) {
+                // This table is too short for scoring. The key still updates the cache.
+                query = key->view({rows, 1, kC4IndexWidth});
+                weights = key->view({key->numel()})->narrow({{0, 0, rows}})->view({rows, 1});
+            } else {
+                query = index_query_->forward(rt,q_lora)->view({rows,index_heads_,kC4IndexWidth});
+                apply_rotary_tail(rt,query,batch.position,frequencies);
+                weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+                    auto input = part.slice(x);
+                    return index_weights_->forward(rt, input);
+                });
+            }
+            indices = Tensor::empty(rt,{rows,kC4IndexTopK},DataType::kInt32);
             submit<infini::ops::DeepseekV4C4Index>(rt,key,batch.c4_slots,query,weights,batch.page_table,
                                                   batch.c4_lengths,cache.indexer,indices);
             lengths = batch.c4_sparse_lengths;
@@ -337,7 +356,8 @@ public:
         const int64_t zero=0;
         rt.memcpyH2D(shared_one_->data(),&one,sizeof(one),false);
         rt.memcpyH2D(shared_zero_->data(),&zero,sizeof(zero),false);
-        if (c.classic_mtp_target && !c.is_mtp && packed_shared_constants_enabled()) {
+        if ((c.classic_mtp_target && !c.is_mtp && packed_shared_constants_enabled())
+            || (c.is_mtp && k3_draft_seed_enabled())) {
             const Shape shape{kPackedSharedExpertRows, 1};
             std::array<float, kPackedSharedExpertRows> ones;
             ones.fill(1.f);
@@ -548,6 +568,7 @@ public:
         k1_graph_seed_ = cfg_.is_mtp && k1_seed && std::string_view(k1_seed) == "1";
         packed_shared_constants_prepared_ =
             cfg_.classic_mtp_target && !cfg_.is_mtp && packed_shared_constants_enabled();
+        draft_seed_constants_prepared_ = cfg_.is_mtp && k3_draft_seed_enabled();
         backbone_ = bind_child("model",std::make_shared<Backbone>(rt,cfg_,rank));
         head_ = bind_child("lm_head",std::make_shared<ColumnLinear>(
             rt,cfg_.hidden,cfg_.vocab,false,DataType::kBFloat16,rank.tp_rank,rank.tp_size));
@@ -585,6 +606,9 @@ public:
             input.return_draft_hidden_states && !input.rollback_v4_cache;
         const bool short_target = !cfg_.is_mtp && !hc &&
             (input.mtp_scratch_step || direct_hc || (input.rollback_v4_cache && short_verify));
+        const bool draft_seed_graph = input.mtp_graph_draft_seed && cfg_.is_mtp && hc &&
+            input.return_draft_hidden_states && !input.sample_all_positions && !input.rollback_v4_cache &&
+            batch.query_offsets.size() == 2 && short_verify;
         // The K1 proposal already wrote its anchor. Repair and the next seed
         // form one two-row Draft span with only the last prediction sampled.
         const bool short_draft = cfg_.is_mtp && hc && !input.rollback_v4_cache &&
@@ -593,16 +617,24 @@ public:
                                   batch.query_offsets.front() == 0 && batch.query_offsets.back() == 2));
         const bool scratch_hc = input.mtp_scratch_step && input.return_draft_hidden_states &&
             short_target && !input.rollback_v4_cache;
-        const bool owned_hc = scratch_hc || direct_hc;
+        const bool owned_hc = scratch_hc || direct_hc || draft_seed_graph;
         // Eligibility must agree across ranks before any capture or collective.
         const bool capture_mtp = mtp_graph_barrier && mtp_graph_barrier->all(
-            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft));
+            (!input.return_draft_hidden_states || owned_hc) && (short_target || short_draft || draft_seed_graph));
         // Both arms share the same immutable routes. No multi-row Fill is recorded.
         batch.packed_shared_constants = capture_mtp && packed_target &&
             (input.rollback_v4_cache || direct_hc) &&
             packed_shared_constants_prepared_ && packed_shared_constants_enabled();
+        if (capture_mtp && draft_seed_graph && draft_seed_constants_prepared_) {
+            const auto *mode = std::getenv("INFINILM_MTP_GRAPH_K3_DRAFT_SEED_CONSTANTS");
+            // The existing plan key compares this bit before replaying a graph.
+            batch.packed_shared_constants = mode && std::string_view(mode) == "1";
+        }
         if (input.mtp_graph_direct_commit && (!direct_hc || !batch.packed_shared_constants)) {
             throw std::runtime_error("Direct MTP requires the prepared Target Graph path");
+        }
+        if (input.mtp_graph_draft_seed && !capture_mtp) {
+            throw std::runtime_error("Classic NextN Graph Draft seed requires a device Graph with owned Draft HC");
         }
         if (input.rollback_v4_cache) {
             if (!ctx.mtp_snapshot_barrier)
@@ -619,8 +651,13 @@ public:
             return output;
         }
         if (capture_mtp) {
+            const auto table_width = batch.page_table->size(1);
+            batch.short_c4_index = direct_hc && batch.query_offsets.size() == 2 &&
+                rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 &&
+                table_width <= kC4IndexMaxUnscoredPages &&
+                env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
-                          false, hc, true, owned_hc, direct_hc);
+                          draft_seed_graph, hc, true, owned_hc, direct_hc, draft_seed_graph);
         }
         return forward_logits(rt,ids,batch,hc,input.return_draft_hidden_states,input.mtp_last_logits);
     }
@@ -646,6 +683,7 @@ public:
         cache::validate_backend_cache_config(requested,backend);
         decode_plans_ = {};
         mtp_decode_plans_ = {};
+        draft_seed_decode_plans_ = {};
         snapshot_backup_.reset();
         if (!requested) {
             caches_.clear();
@@ -684,6 +722,7 @@ private:
         Tensor sampled_ids;
         bool greedy;
         bool return_hc;
+        std::array<bool, 3> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
     };
 
@@ -719,14 +758,22 @@ private:
 
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
                   bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
-                  bool return_hc = false, bool packed_direct = false) const {
-        auto &plans = classic_mtp ? mtp_decode_plans_ : decode_plans_;
+                  bool return_hc = false, bool packed_direct = false, bool draft_seed_graph = false) const {
+        auto &plans = draft_seed_graph ? draft_seed_decode_plans_.at(ids->numel() - 2)
+            : (classic_mtp ? mtp_decode_plans_ : decode_plans_);
         auto &recent = plans.front();
         auto &previous = plans.back();
         const auto incoming = batch.tensors();
+        const std::array short_kernel_modes{
+            env_enabled("INFINIOPS_V4_C128_POOL_SHORT"),
+            env_enabled("INFINI_HYGON_MOE_Q4_GROUP"),
+            env_enabled("INFINIOPS_V4_I8_PROJECTION_Q4"),
+        };
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
                 plan->batch.packed_shared_constants != batch.packed_shared_constants ||
+                plan->batch.short_c4_index != batch.short_c4_index ||
+                plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
                 return false;
@@ -785,14 +832,15 @@ private:
                 batch.position = copy_graph_tensor(rt, batch.position);
             }
             DecodePlan candidate{std::move(ids), std::move(batch),
-                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc, {}};
+                                 copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc,
+                                 short_kernel_modes, {}};
             if (classic_mtp) {
                 barrier.wait();
             }
             rt.startGraphRecording(true);
             try {
                 auto recorded = forward_logits(
-                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc);
+                    rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph);
                 candidate.logits = std::move(recorded.logits);
                 candidate.hidden_states = std::move(recorded.hidden_states);
                 if (greedy && sampling_rank_) {
@@ -823,8 +871,9 @@ private:
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
-        return {recent->logits, std::move(hidden_states), std::move(report),
-                recent->sampled_ids};
+        Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
+        output.mtp_last_logits_used = draft_seed_graph;
+        return output;
     }
 
     V4Config cfg_;
@@ -835,6 +884,7 @@ private:
     std::vector<LayerPagedCache> caches_;
     bool reuse_snapshot_buffer_ = false;
     bool packed_shared_constants_prepared_ = false;
+    bool draft_seed_constants_prepared_ = false;
     bool k1_graph_seed_ = false;
     // The rank worker serializes verify calls; rollback synchronizes before
     // the next request can reuse or resize this device buffer.
@@ -844,6 +894,8 @@ private:
     // The two most recent shapes cover both sides of adjacent page boundaries.
     mutable std::array<std::optional<DecodePlan>, 2> decode_plans_;
     mutable std::array<std::optional<DecodePlan>, 2> mtp_decode_plans_;
+    // q2, q3 and q4 repair plans do not evict the proposal plans or one another.
+    mutable std::array<std::array<std::optional<DecodePlan>, 2>, 3> draft_seed_decode_plans_;
 };
 
 } // namespace
