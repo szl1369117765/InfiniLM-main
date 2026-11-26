@@ -66,6 +66,7 @@ public:
         std::string fallback_reason;
         const char *mtp_graph_plan = nullptr;
         bool mtp_c128_state_only = false;
+        size_t mtp_flashmla_schedules_prepared = 0;
     };
 
     Graph();

@@ -404,6 +404,7 @@ inline void bind_infer_engine(py::module &m) {
             if (graph && graph->mtp_graph_plan) {
                 result["mtp_graph_plan"] = graph->mtp_graph_plan;
                 result["mtp_c128_state_only"] = graph->mtp_c128_state_only;
+                result["mtp_flashmla_schedules_prepared"] = graph->mtp_flashmla_schedules_prepared;
             }
             if (!output.mtp_graph_direct_rank_reports.empty()) {
                 py::list rank_reports;
@@ -417,6 +418,7 @@ inline void bind_infer_engine(py::module &m) {
                     if (report.mtp_graph_plan) {
                         entry["mtp_graph_plan"] = report.mtp_graph_plan;
                         entry["mtp_c128_state_only"] = report.mtp_c128_state_only;
+                        entry["mtp_flashmla_schedules_prepared"] = report.mtp_flashmla_schedules_prepared;
                     }
                     rank_reports.append(std::move(entry));
                 }

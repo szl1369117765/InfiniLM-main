@@ -173,6 +173,10 @@ struct BatchMetadata {
     bool packed_collectives{};
     bool c128_no_store{};
     bool c128_state_only{};
+    bool share_flashmla_schedule{};
+    // Derived from the current execution's stable length buffers by Graph nodes.
+    // Keep these outputs out of tensors(), which enumerates only incoming copies.
+    std::array<Tensor, 3> flashmla_schedules{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -180,6 +184,10 @@ struct BatchMetadata {
             &c128_slots,&c128_positions,&c128_indices,&c128_lengths,&c128_sources,&c128_state_slots};
     }
 };
+
+constexpr size_t flashmla_schedule_index(size_t ratio) {
+    return ratio == 0 ? 0 : ratio == 4 ? 1 : 2;
+}
 
 bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) {
     if (offsets.size() < 2 || offsets.size() > 4 ||
@@ -345,7 +353,8 @@ public:
         auto local = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
             auto attended = sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
                                        part.slice(batch.swa_lengths), sink_, part.slice(indices),
-                                       part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)));
+                                       part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)),
+                                       batch.flashmla_schedules[flashmla_schedule_index(ratio_)]);
             apply_rotary_tail(rt, attended, part.slice(batch.position), frequencies, true);
             auto flattened = attended->view({part.count, heads_ * kV4HeadDim});
             return wo_a_->forward(rt, flattened);
@@ -697,6 +706,9 @@ public:
                 rt.device().type() == runtime::Device::Type::kHygon && table_width > 0 &&
                 table_width <= kC4IndexMaxUnscoredPages &&
                 env_enabled("INFINILM_MTP_GRAPH_SHORT_C4_INDEX");
+            batch.share_flashmla_schedule = input.mtp_share_flashmla_schedule && direct_hc &&
+                batch.query_offsets.size() == 2 && ids->numel() == 4 &&
+                rt.device().type() == runtime::Device::Type::kHygon;
             return decode(rt, std::move(ids), std::move(batch), *mtp_graph_barrier,
                           draft_seed_graph, hc, true, owned_hc, direct_hc, draft_seed_graph);
         }
@@ -766,6 +778,7 @@ private:
         bool return_hc;
         std::array<bool, 3> short_kernel_modes;
         std::shared_ptr<execution::graph::Graph> graph;
+        size_t flashmla_schedules_prepared = 0;
     };
 
     static Tensor copy_graph_tensor(Runtime &rt, const Tensor &source) {
@@ -842,6 +855,7 @@ private:
                 plan->batch.packed_shared_constants != batch.packed_shared_constants ||
                 plan->batch.short_c4_index != batch.short_c4_index ||
                 plan->batch.packed_collectives != batch.packed_collectives ||
+                plan->batch.share_flashmla_schedule != batch.share_flashmla_schedule ||
                 plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
@@ -908,6 +922,23 @@ private:
             }
             rt.startGraphRecording(true);
             try {
+                if (candidate.batch.share_flashmla_schedule) {
+                    auto &stable = candidate.batch;
+                    const auto swa_width = stable.swa_indices->size(1);
+                    for (const auto ratio : cfg_.ratios) {
+                        auto &schedule = stable.flashmla_schedules[flashmla_schedule_index(ratio)];
+                        if (schedule) {
+                            continue;
+                        }
+                        const auto extra_lengths = ratio == 4 ? stable.c4_sparse_lengths
+                            : ratio == 128 ? stable.c128_lengths : Tensor{};
+                        const auto extra_width = ratio == 4 ? kC4IndexTopK
+                            : ratio == 128 ? stable.c128_indices->size(1) : 0;
+                        schedule = prepare_sparse_mla_schedule(
+                            rt, stable.swa_lengths, swa_width, extra_lengths, extra_width);
+                        ++candidate.flashmla_schedules_prepared;
+                    }
+                }
                 auto recorded = forward_logits(
                     rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph);
                 candidate.logits = std::move(recorded.logits);
@@ -943,6 +974,7 @@ private:
         if (classic_mtp && env_enabled("INFINILM_MTP_GRAPH_PLAN_RECEIPT")) {
             report.mtp_graph_plan = common_slots ? "hit" : "capture";
             report.mtp_c128_state_only = recent->batch.c128_state_only;
+            report.mtp_flashmla_schedules_prepared = recent->flashmla_schedules_prepared;
         }
         Output output{recent->logits, std::move(hidden_states), std::move(report), recent->sampled_ids};
         output.mtp_last_logits_used = draft_seed_graph;
