@@ -435,7 +435,7 @@ public:
         kv_norm_fp32_ = cast(rt,kv_norm_->weight(),DataType::kFloat32);
     }
 
-    void write_swa(Runtime &rt, const Tensor &x, const BatchMetadata &batch,
+    void write_swa(Runtime &rt, Tensor x, const BatchMetadata &batch,
                    const LayerPagedCache &cache, const Tensor &frequencies) const {
         auto key = wkv_->forward(rt, x);
         store_swa_rows(rt,key,kv_norm_fp32_,batch.position,frequencies,
