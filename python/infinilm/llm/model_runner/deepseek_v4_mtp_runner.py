@@ -247,16 +247,23 @@ class DeepSeekV4MTPRunner:
                 graph_direct_selector = {
                     1: "graph_single_direct_enabled", 3: "graph_packed_direct_enabled",
                 }.get(len(candidates), "")
-                packed_direct = (
-                    self.num_draft_tokens == 3
-                    and getattr(self.transport, graph_direct_selector, lambda: False)()
+                direct_option = None
+                if self.num_draft_tokens == 3:
+                    if getattr(self.transport, graph_direct_selector, lambda: False)():
+                        direct_option = "graph_packed_direct_commit"
+                    elif len(candidates) == 3 and getattr(self.transport, "eager_packed_direct_enabled", lambda: False)():
+                        direct_option = "eager_packed_direct_commit"
+                direct_options = (
+                    {direct_option: True}
+                    if direct_option is not None
                     and all(not item["req"].sampling_params.do_sample for item in candidates)
                     and reservation.permits_packed_direct_target(tables)
+                    else {}
                 )
                 with self.transport.target_transaction(
                     batch, tables[0] if len(candidates) == 1 else tables,
                     **({"batch_draft_seed": True} if batched and self.num_draft_tokens == 1 else {}),
-                    **({"graph_packed_direct_commit": True} if packed_direct else {}),
+                    **direct_options,
                 ) as transaction:
                     intents = (
                         transaction.resolve_stochastic()

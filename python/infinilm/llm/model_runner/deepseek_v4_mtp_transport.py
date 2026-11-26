@@ -52,7 +52,8 @@ class _TargetTransaction:
     def __init__(self, transport, batch, tables, tokens, verify_hidden=None,
                  proposal_laws=(), logits=None, *, omit_terminal=False, early_rejection=False,
                  scratch_commit=None, batch_draft_seed=False, k1_graph_seed=False,
-                 graph_k3_draft_seed=False, graph_batched_direct_draft_repair=False):
+                 graph_k3_draft_seed=False, graph_batched_direct_draft_repair=False,
+                 eager_c3_repair_cache_only=False):
         self.transport = transport
         self.batch = batch
         self.tables = tables
@@ -72,6 +73,7 @@ class _TargetTransaction:
         self.k1_graph_seed = k1_graph_seed
         self.graph_k3_draft_seed = graph_k3_draft_seed
         self.graph_batched_direct_draft_repair = graph_batched_direct_draft_repair
+        self.eager_c3_repair_cache_only = eager_c3_repair_cache_only
         self._resolved = None
         self.committed = False
 
@@ -169,7 +171,7 @@ class _TargetTransaction:
             else:
                 self.transport._forward_draft_segments(
                     segments, return_hidden=False, worker_join=worker_join,
-                    cache_only=cache_only and len(segments) == 3,
+                    **({"cache_only": True} if cache_only and len(segments) == 3 else {}),
                 )
         self.transport.states.update(updates)
 
@@ -283,6 +285,7 @@ class _TargetTransaction:
                     self.transport._write_draft_cache(
                         tokens[offset:offset + 1], start + offset - 1, table,
                         _slice_hidden(hidden, offset - 1, 1),
+                        **({"eager_c3_repair": True} if self.eager_c3_repair_cache_only else {}),
                     )
         self.transport.states[intent.owner] = _DraftState(
             _slice_hidden(hidden, count - 1, 1), intent.next_anchor, intent.retain_length, seed=seed,
@@ -340,6 +343,7 @@ class _V4Transport:
                  batched_target_replay=False, batched_draft_repair=False,
                  graph_batched_draft_proposal=False, graph_batched_direct_draft_repair=False,
                  graph_packed_direct_available=False, graph_single_direct_available=False,
+                 eager_packed_direct_available=False,
                  graph_prefill_last_logits=False, graph_prefill_draft_cache_only=False,
                  graph_k3_draft_seed=False):
         self.target = target
@@ -367,6 +371,8 @@ class _V4Transport:
         self.k1_graph_seed = k1_graph_seed
         self.graph_packed_direct_available = graph_packed_direct_available
         self.graph_single_direct_available = graph_single_direct_available
+        self.eager_packed_direct_available = eager_packed_direct_available
+        self._eager_packed_direct_commit = False
         self.states = {}
         self.transaction = None
 
@@ -381,6 +387,18 @@ class _V4Transport:
             raise RuntimeError("C3 Draft modes require prepared capacity and an idle transport")
         self.graph_batched_draft_proposal = proposal
         self.graph_batched_direct_draft_repair = repair
+
+    def eager_packed_direct_enabled(self):
+        return self.eager_packed_direct_available and self._eager_packed_direct_commit
+
+    def set_eager_packed_direct_commit(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("Packed eager MTP direct commit requires a bool")
+        if self.states or self.transaction is not None:
+            raise RuntimeError("Packed eager MTP mode can only change with no active owners or transaction")
+        if enabled and not self.eager_packed_direct_available:
+            raise RuntimeError("Packed eager MTP direct commit was not prepared")
+        self._eager_packed_direct_commit = enabled
 
     @property
     def owner(self):
@@ -431,11 +449,15 @@ class _V4Transport:
     def _forward(self, engine, tokens, start, table, *, draft_hidden=None,
                  return_hidden=True, rollback=False, sample_all_positions=True,
                  return_logits=False, cache_only=False, graph_fresh_prefill=False,
-                 graph_draft_seed=False):
+                 graph_draft_seed=False, eager_c3_repair=False):
         if cache_only and (
             engine is not self.draft or not draft_hidden or return_hidden or rollback or return_logits
         ):
             raise ValueError("Classic NextN cache-only is limited to an output-free Draft cache write")
+        if eager_c3_repair and (
+            not cache_only or len(tokens) != 1 or not sample_all_positions or graph_fresh_prefill or graph_draft_seed
+        ):
+            raise ValueError("Eager C3 cache-only repair requires one Draft row")
         end = start + len(tokens)
         if graph_draft_seed:
             # The reservation also holds pages written by rejected proposals.
@@ -463,6 +485,7 @@ class _V4Transport:
             rollback_v4_cache=rollback,
             target_hidden_states_by_rank=draft_hidden,
             **({"mtp_draft_cache_only": True} if cache_only else {}),
+            **({"mtp_eager_c3_draft_repair_cache_only": True} if eager_c3_repair else {}),
             **({"mtp_last_logits": True} if last_logits else {}),
             **({"mtp_graph_fresh_prefill": True} if graph_fresh_prefill else {}),
             **({"mtp_graph_draft_seed": True} if graph_draft_seed else {}),
@@ -489,10 +512,11 @@ class _V4Transport:
             return decoded
         return (*decoded, host_logit_rows(result["logits"], len(tokens), engine.hf_config["vocab_size"]))
 
-    def _write_draft_cache(self, tokens, start, table, hidden, *, graph_fresh_prefill=False):
+    def _write_draft_cache(self, tokens, start, table, hidden, *, graph_fresh_prefill=False, eager_c3_repair=False):
         self._forward(
             self.draft, tokens, start, table, draft_hidden=hidden, return_hidden=False,
-            **({"cache_only": True} if self.draft_cache_only or graph_fresh_prefill else {}),
+            **({"cache_only": True} if self.draft_cache_only or graph_fresh_prefill or eager_c3_repair else {}),
+            **({"eager_c3_repair": True} if eager_c3_repair else {}),
             **({"graph_fresh_prefill": True} if graph_fresh_prefill else {}),
         )
 
@@ -572,7 +596,8 @@ class _V4Transport:
         return self._decode(result, len(segments))
 
     def _forward_packed(self, engine, batch, tables, *, return_hidden=False, rollback=False,
-                        return_logits=False, scratch_step=False, graph_direct_commit=False):
+                        return_logits=False, scratch_step=False, graph_direct_commit=False,
+                        eager_direct_commit=False):
         width = max(map(len, tables))
         slots = []
         for table, start, end in zip(tables, batch.past_kv_lengths, batch.total_kv_lengths):
@@ -595,15 +620,21 @@ class _V4Transport:
             top_k=1,
             return_draft_hidden_states=return_hidden,
             rollback_v4_cache=rollback,
-            **self._host_metadata_options(),
+            **({} if eager_direct_commit else self._host_metadata_options()),
             **({"mtp_scratch_step": True} if scratch_step else {}),
             **({"mtp_graph_direct_commit": True} if graph_direct_commit else {}),
+            **({"mtp_eager_packed_direct_commit": True} if eager_direct_commit else {}),
         )
         if graph_direct_commit:
             report = result.get("execution_report") or {}
             if (report.get("mode") != "device_graph" or report.get("device_graph_segments") != 1
                     or report.get("host_segments") != 0):
                 raise RuntimeError("Packed direct MTP did not execute a single Target device Graph")
+        if eager_direct_commit:
+            report = result.get("execution_report") or {}
+            if (report.get("mtp_eager_packed_direct_commit") is not True or report.get("mode") != "eager"
+                    or report.get("device_graph_segments") != 0 or report.get("host_segments") != 0):
+                raise RuntimeError("Packed direct MTP did not execute a verified eager Target forward")
         decoded = self._decode(result, len(batch.rows))
         if not return_logits:
             return decoded
@@ -780,7 +811,10 @@ class _V4Transport:
         return actual if len(pages) == len(set(pages)) and all(page >= 0 for page in pages) else None
 
     @contextmanager
-    def target_transaction(self, batch, block_table, *, batch_draft_seed=False, graph_packed_direct_commit=False):
+    def target_transaction(self, batch, block_table, *, batch_draft_seed=False, graph_packed_direct_commit=False,
+                           eager_packed_direct_commit=False):
+        if graph_packed_direct_commit and eager_packed_direct_commit:
+            raise ValueError("Packed MTP verification must select a single direct execution mode")
         tables = (tuple(block_table),) if len(batch.requests) == 1 else tuple(block_table)
         if self.transaction is not None or len(tables) != len(batch.requests):
             raise ValueError("MTP verify must match the current owner and proposal")
@@ -802,10 +836,22 @@ class _V4Transport:
         direct_tables = None
         direct_graph_enabled = (self.graph_single_direct_enabled if len(tables) == 1
                                 else self.graph_packed_direct_enabled)
-        if graph_packed_direct_commit and not (stochastic or batch_draft_seed) and direct_graph_enabled():
-            direct_tables = self._packed_direct_tables(batch, tables)
+        direct_option = None
+        if not (stochastic or batch_draft_seed):
+            if graph_packed_direct_commit and direct_graph_enabled():
+                direct_option = "graph_direct_commit"
+            elif eager_packed_direct_commit and len(tables) == 3 and self.eager_packed_direct_enabled():
+                direct_option = "eager_direct_commit"
+            if direct_option is not None:
+                direct_tables = self._packed_direct_tables(batch, tables)
+        eager_c3_repair_cache_only = (
+            direct_option == "eager_direct_commit" and direct_tables is not None
+            and os.getenv("INFINILM_MTP_EAGER_C3_DRAFT_REPAIR_CACHE_ONLY") == "1"
+        )
+        if eager_c3_repair_cache_only and getattr(self.draft, "mtp_eager_c3_draft_repair_cache_only_version", 0) != 1:
+            raise RuntimeError("Eager C3 repair requires native output-free Draft cache support")
         if direct_tables is not None:
-            result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, graph_direct_commit=True)
+            result = self._forward_packed(self.target, batch, direct_tables, return_hidden=True, **{direct_option: True})
             verify_hidden = result[1]
             if not verify_hidden or len(verify_hidden) != 8 or any(
                 tensor is None or len(tensor.shape) != 3 or tensor.shape[0] != len(batch.rows)
@@ -841,8 +887,10 @@ class _V4Transport:
             ),
             graph_k3_draft_seed=self.graph_k3_draft_seed and len(tables) == 1 and direct_tables is not None,
             graph_batched_direct_draft_repair=(
-                self.graph_batched_direct_draft_repair and direct_tables is not None and len(tables) == 3
+                self.graph_batched_direct_draft_repair and direct_option == "graph_direct_commit"
+                and direct_tables is not None and len(tables) == 3
             ),
+            eager_c3_repair_cache_only=eager_c3_repair_cache_only,
         )
         with self._publishing(transaction):
             yield transaction
@@ -1090,6 +1138,19 @@ def _direct_k23_commit_enabled(config, target_engine):
     return True
 
 
+def _eager_packed_direct_available(config, target_engine):
+    if (os.getenv("INFINILM_MTP_EAGER_C3_DIRECT_COMMIT") != "1"
+            or config.enable_graph or config.num_draft_tokens != 3 or config.max_batch_size != 3
+            or config.pipeline_parallel_size != 1 or config.tensor_parallel_size != 8 or config.moe_ep_size != 1
+            or config.block_size != 256 or config.nextn_branch_draft_lengths is not None
+            or config.enable_prefix_caching):
+        return False
+    if (getattr(target_engine, "mtp_eager_packed_direct_commit_version", 0) != 1
+            or getattr(target_engine, "deepseek_v4_raw_ring_rows", None) != (16, 256)):
+        raise RuntimeError("Packed eager MTP direct commit requires its native ABI and expanded compressor rings")
+    return True
+
+
 def _graph_k3_prefill_modes(config, engine_type):
     if (
         not config.enable_graph or config.max_batch_size != 1 or config.num_draft_tokens != 3
@@ -1137,6 +1198,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
     if stepwise_direct_commit and getattr(target_engine, "mtp_scratch_hc_version", 0) != 1:
         raise RuntimeError("Stepwise direct commit requires native owned scratch q1 hidden states")
     direct_k23_commit = _direct_k23_commit_enabled(config, target_engine)
+    eager_packed_direct_available = _eager_packed_direct_available(config, target_engine)
     graph_direct_available = (
         config.enable_graph and config.num_draft_tokens == 3
         and config.pipeline_parallel_size == 1 and config.tensor_parallel_size == 8 and config.moe_ep_size == 1
@@ -1210,7 +1272,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         "Classic NextN K=%s graph=%s branches=%s branch_execution=%s direct_k1=%s direct_k23=%s "
         "draft_seed=%s draft_cache_only=%s batched_draft=%s k1_graph_seed=%s last_logits=%s terminal_tail_trim=%s "
         "cpu_metadata_shadow=%s shared_compression_plan=%s stepwise_direct_commit=%s "
-        "batched_target_replay=%s batched_draft_repair=%s "
+        "batched_target_replay=%s batched_draft_repair=%s eager_packed_direct_available=%s "
         "graph_batched_draft_proposal=%s graph_batched_direct_draft_repair=%s "
         "graph_prefill_last_logits=%s graph_prefill_draft_cache_only=%s graph_k3_draft_seed=%s",
         config.num_draft_tokens, config.enable_graph, config.nextn_branch_draft_lengths,
@@ -1218,6 +1280,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         draft_cache_only, batched_draft, k1_graph_seed, last_logits, terminal_tail_trim,
         cpu_metadata_shadow or shared_compression_plan,
         shared_compression_plan, stepwise_direct_commit, batched_target_replay, batched_draft_repair,
+        eager_packed_direct_available,
         graph_batched_draft_proposal, graph_batched_direct_draft_repair,
         graph_prefill_last_logits, graph_prefill_draft_cache_only,
         graph_k3_draft_seed,
@@ -1235,6 +1298,7 @@ def create_deepseek_v4_mtp_transport(config, target_engine, device):
         graph_batched_direct_draft_repair=graph_batched_direct_draft_repair,
         graph_packed_direct_available=c3_graph,
         graph_single_direct_available=graph_direct_available and config.max_batch_size == 1,
+        eager_packed_direct_available=eager_packed_direct_available,
         graph_prefill_last_logits=graph_prefill_last_logits,
         graph_prefill_draft_cache_only=graph_prefill_draft_cache_only,
         graph_k3_draft_seed=graph_k3_draft_seed,

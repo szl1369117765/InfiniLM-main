@@ -2,7 +2,7 @@
 
 import ast
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import importlib
 import os
 import queue
@@ -631,12 +631,19 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
                 self.assert_usable_pages(4)
 
     def test_async_abort_during_packed_cross_page_commit_retires_only_that_owner(self):
-        self.assert_async_abort_during_packed_cross_page_commit(direct=False)
+        self.assert_async_abort_during_packed_cross_page_commit(direct=None)
 
     def test_async_abort_during_direct_packed_cross_page_commit_retires_only_that_owner(self):
-        self.assert_async_abort_during_packed_cross_page_commit(direct=True)
+        self.assert_async_abort_during_packed_cross_page_commit(direct="graph_packed_direct_commit")
 
-    def assert_async_abort_during_packed_cross_page_commit(self, *, direct):
+    def test_async_abort_during_eager_packed_commit_uses_direct_only_with_a_lease(self):
+        for leased in (True, False):
+            with self.subTest(leased=leased):
+                self.assert_async_abort_during_packed_cross_page_commit(
+                    direct="eager_packed_direct_commit", leased=leased,
+                )
+
+    def assert_async_abort_during_packed_cross_page_commit(self, *, direct, leased=True):
         self.engine = self.make_engine(max_batch_size=3, num_draft_tokens=3)
         self.engine._async_abort_owner = True
         canceled = self.llm.InferenceRequest(
@@ -658,7 +665,7 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
         @contextmanager
         def target_transaction(batch, tables, **options):
             calls.append(options)
-            self.assertEqual(options, {"graph_packed_direct_commit": True} if direct else {})
+            self.assertEqual(options, {direct: True} if direct and leased else {})
             self.assertEqual(batch.input_offsets, (0, 4, 8, 12))
             self.assertEqual([len(table) for table in tables], [2, 1, 1])
             self.assertEqual(
@@ -675,14 +682,26 @@ class ClassicMTPLifecycleTest(unittest.TestCase):
 
             yield SimpleNamespace(rows=rows, commit=commit)
 
-        availability = self.native_transport._V4Transport(None, None, None, 256,
-                                                            graph_packed_direct_available=True)
+        eager = direct == "eager_packed_direct_commit"
+        graph = direct == "graph_packed_direct_commit"
+        availability = self.native_transport._V4Transport(
+            None, None, None, 256, graph_packed_direct_available=graph, eager_packed_direct_available=eager,
+        )
+        if eager:
+            availability.set_eager_packed_direct_commit(True)
+        scheduler_module = importlib.import_module("infinilm.llm.scheduler")
+        lease = nullcontext() if leased else patch.object(
+            scheduler_module._SpeculativeCacheReservation, "permits_packed_direct_target", return_value=False,
+        )
         with (
-            patch.dict(os.environ, {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": str(int(direct))}),
+            patch.dict(os.environ, {"INFINILM_MTP_GRAPH_C3_DIRECT_COMMIT": str(int(graph))}),
             patch.object(self.transport, "graph_packed_direct_enabled",
                          availability.graph_packed_direct_enabled, create=True),
+            patch.object(self.transport, "eager_packed_direct_enabled",
+                         availability.eager_packed_direct_enabled, create=True),
             patch.object(self.transport, "propose_many", propose_many, create=True),
             patch.object(self.transport, "target_transaction", target_transaction, create=True),
+            lease,
         ):
             self.assertTrue(self.engine.step())
 
