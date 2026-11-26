@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <string_view>
 #include "rank_worker.hpp"
 #include "../engine/distributed/communication_group.hpp"
 #include "../layers/moe/ep/ep_config.hpp"
@@ -920,6 +922,17 @@ void RankWorker::thread_loop() {
                                 proof->owner = *local_args.nsa_owner_snapshot;
                                 proof->owner.upload = nsa_upload(effective_args); // actual normalized CPU tensor
                                 proof->one_tail = nsa::validate(proof->owner, proof->owner.upload);
+                                // One-shot recording is a diagnostic path, not a cached plan.
+                                // Owner/epoch validation and setup still run outside capture.
+                                const auto *graph_test = std::getenv("INFINILM_VIDEONSA_REQUEST_GRAPH_TEST");
+                                const bool fresh_video = !proof->one_tail
+                                    && proof->owner.rows.front().past == 0
+                                    && effective_args.pixel_values && !effective_args.pixel_values->empty();
+                                proof->request_graph =
+                                    enable_graph_compiling_ && graph_test && std::string_view(graph_test) == "1"
+                                    && rank_info_.tp_size == 1 && proof->owner.rows.size() == 1
+                                    && runtime_->device().type() == infinilm::runtime::Device::Type::kHygon
+                                    && (fresh_video || proof->one_tail);
                                 if (nsa_run_serial_ == std::numeric_limits<std::uint64_t>::max()) {
                                     throw std::overflow_error("NSA invocation exhausted");
                                 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "../../layers/common_modules.hpp"
 #include "videonsa_attention.hpp"
 #include "videonsa_vision.hpp"
@@ -33,6 +35,15 @@ protected:
                             const infinilm::runtime::Tensor &vision_hidden,
                             const infinilm::runtime::Tensor &image_bound) const;
 
+    struct RequestGraphPlan;
+    Output run_cached_graph(const infinilm::runtime::Tensor &activations,
+                            const infinilm::runtime::Tensor &positions,
+                            global_state::ForwardContext &context,
+                            const Input *decode_input = nullptr) const;
+    void mark_decode_graph_submitted() const;
+    // Owner-worker-only plans; decode separates full and incremental compression.
+    mutable std::shared_ptr<RequestGraphPlan> prefill_graph_;
+    mutable std::array<std::shared_ptr<RequestGraphPlan>, 2> decode_graphs_;
     std::shared_ptr<VideoNSATextModel> model_;
     std::shared_ptr<VideoNSAVisionModel> visual_;
     std::shared_ptr<infinilm::layers::linear::ReplicatedLinear> lm_head_;

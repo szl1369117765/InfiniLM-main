@@ -349,7 +349,8 @@ infinilm::runtime::Tensor VideoNSAAttention::forward(const infinilm::runtime::Te
         const auto &proof = *forward_context.nsa_owner;
         const auto &rows = proof.owner.rows;
         const auto dtype = hidden_states->dtype();
-        if (runtime.isGraphRecording() || proof.one_tail || rows.size() != 1
+        if ((runtime.isGraphRecording() && !proof.request_graph)
+            || proof.one_tail || rows.size() != 1
             || rows[0].past != 0 || rows[0].total != hidden_states->size(1)
             || rows[0].total < 2 || rows[0].total > 8192 || head_dim_ != 128
             || !num_key_value_heads_ || num_attention_heads_ % num_key_value_heads_
@@ -558,7 +559,9 @@ infinilm::runtime::Tensor VideoNSAAttention::forward(const infinilm::runtime::Te
             infini::ops::NsaCompressPagedCache::DefaultConfig(runtime.device().type()),
             k_cache_for_nsa, v_cache_for_nsa, block_tables, cache_lens,
             int(kNsaBlockSize), nsa_update_last_only_, k_compressed, v_compressed);
-        nsa_lane_.compression_enqueued(); // Native compression accepted on the owner stream.
+        if (!runtime.isGraphRecording()) {
+            nsa_lane_.compression_enqueued(); // Native compression accepted on the owner stream.
+        }
         auto decoded = infinilm::runtime::Tensor::empty(runtime,
             {seq_len, num_attention_heads_, head_dim_}, q_reshaped->dtype());
         infinilm::execution::submit<infini::ops::NsaPagedAttention>(
@@ -711,6 +714,21 @@ void VideoNSAAttention::prepare_paged_owner(global_state::ForwardContext &contex
     }
     nsa_update_last_only_ = nsa_lane_.begin(std::move(evidence)); // BEFORE ANY layer raw write
     nsa_prepared_tail_ = true;
+}
+
+VideoNSAAttention::CompressionGraphBinding VideoNSAAttention::compression_graph_binding() const {
+    if (!nsa_prepared_tail_ || !nsa_k_cmp_cache_ || !nsa_v_cmp_cache_) {
+        throw std::logic_error("VideoNSA decode graph needs the current compression backing");
+    }
+    return {nsa_compressed_generation_, nsa_update_last_only_,
+            nsa_k_cmp_cache_.value()->data(), nsa_v_cmp_cache_.value()->data()};
+}
+
+void VideoNSAAttention::mark_paged_graph_submitted() const {
+    if (!nsa_prepared_tail_) {
+        throw std::logic_error("VideoNSA decode Graph lacks a prepared tail");
+    }
+    nsa_lane_.compression_enqueued();
 }
 
 void VideoNSAAttention::finish_paged_owner(bool completed) const {

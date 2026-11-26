@@ -413,6 +413,13 @@ inline void bind_infer_engine(py::module &m) {
             result["host_segments"] = host_segments;
             result["operator_count"] = graph ? graph->operator_count : 0;
             result["fallback_reason"] = graph ? graph->fallback_reason : output.eager_reason;
+            if (graph && graph->videonsa_prefill_plan) {
+                result["videonsa_prefill_plan"] = graph->videonsa_prefill_plan;
+            }
+            if (graph && graph->videonsa_decode_plan) {
+                result["videonsa_decode_plan"] = graph->videonsa_decode_plan;
+                result["videonsa_decode_compression"] = graph->videonsa_decode_compression;
+            }
             if (graph && graph->mtp_graph_plan) {
                 result["mtp_graph_plan"] = graph->mtp_graph_plan;
                 result["mtp_c128_state_only"] = graph->mtp_c128_state_only;

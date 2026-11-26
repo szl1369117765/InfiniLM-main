@@ -37,6 +37,7 @@ struct Proof {
     infinilm::runtime::Runtime *runtime{};
     std::uint64_t worker{}, invocation{};
     bool one_tail{};
+    bool request_graph{};
 };
 inline bool validate(const Snapshot &s, const Upload &u) {
     const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max());
