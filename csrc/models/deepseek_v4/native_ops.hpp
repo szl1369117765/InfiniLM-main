@@ -16,11 +16,16 @@ void store_mla_rows(runtime::Runtime &runtime, const runtime::Tensor &kv,
                     const runtime::Tensor &slots, const runtime::Tensor &pages,
                     size_t page_tokens);
 
+runtime::Tensor prepare_sparse_mla_schedule(runtime::Runtime &runtime,
+                                            const runtime::Tensor &swa_lengths, size_t swa_width,
+                                            const runtime::Tensor &extra_lengths, size_t extra_width);
+
 runtime::Tensor sparse_mla(runtime::Runtime &runtime, const runtime::Tensor &query,
                            const LayerPagedCache &cache, const runtime::Tensor &swa_indices,
                            const runtime::Tensor &swa_lengths, const runtime::Tensor &sink,
                            const runtime::Tensor &compressed_indices,
-                           const runtime::Tensor &compressed_lengths, double scale);
+                           const runtime::Tensor &compressed_lengths, double scale,
+                           const runtime::Tensor &schedule);
 
 // A rank-local expert contribution. The decoder must reduce across TP ranks
 // and combine shared expert output before applying the residual.
