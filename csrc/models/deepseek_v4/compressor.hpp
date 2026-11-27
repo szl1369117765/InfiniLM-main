@@ -14,18 +14,18 @@ public:
                             const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                             const runtime::Tensor &state, const runtime::Tensor &positions,
                             const runtime::Tensor &cos_sin,
-                            const std::vector<size_t> &query_offsets) const;
+                            const std::vector<size_t> &query_offsets, bool packed_projection) const;
 
     void store_paged(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                      const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                      const runtime::Tensor &state, const runtime::Tensor &positions,
                      const runtime::Tensor &cos_sin, const std::vector<size_t> &query_offsets,
                      const runtime::Tensor &slots, const runtime::Tensor &pages,
-                     size_t page_tokens) const;
+                     size_t page_tokens, bool packed_projection) const;
     // C128 short verification with no compressed cache row to publish.
     void update_state(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                       const runtime::Tensor &state_slots, const runtime::Tensor &state,
-                      const std::vector<size_t> &query_offsets) const;
+                      const std::vector<size_t> &query_offsets, bool packed_projection) const;
 
     std::vector<std::shared_ptr<weights::ModelWeights>> loading_children() const override;
 
@@ -33,7 +33,7 @@ private:
     runtime::Tensor project_and_pool(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                                      const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                                      const runtime::Tensor &state,
-                                     const std::vector<size_t> &query_offsets) const;
+                                     const std::vector<size_t> &query_offsets, bool packed_projection) const;
 
     size_t head_dim_;
     runtime::Tensor ape_;

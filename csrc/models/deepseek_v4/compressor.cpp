@@ -40,15 +40,21 @@ runtime::Tensor Compressor::project_and_pool(runtime::Runtime &runtime,
                                              const runtime::Tensor &sources,
                                              const runtime::Tensor &state_slots,
                                              const runtime::Tensor &state,
-                                             const std::vector<size_t> &query_offsets) const {
+                                             const std::vector<size_t> &query_offsets, bool packed_projection) const {
     if (!hidden_states || hidden_states->ndim() != 2 || !sources || sources->ndim() != 2) {
         throw std::invalid_argument("DeepSeek V4 compressor requires rank-two input and source rows");
     }
-    auto projection = project_requests(runtime, query_offsets, [&](const RequestRows &part) {
+    // The Hygon packed path keeps the BF16 inputs, FP32 output and row order.
+    const auto &weight = projection_->weight();
+    const auto project = [&](const runtime::Tensor &input) {
         return layers::linear::dense_projection(
-            runtime, part.slice(hidden_states), projection_->weight(), std::nullopt, 1.0f,
-            runtime::DataType::kFloat32);
-    });
+            runtime, input, weight, std::nullopt, 1.0f, runtime::DataType::kFloat32);
+    };
+    auto projection = packed_projection
+        ? project(hidden_states)
+        : project_requests(runtime, query_offsets, [&](const RequestRows &part) {
+              return project(part.slice(hidden_states));
+          });
     auto output = runtime::Tensor::empty(runtime, {sources->size(0), head_dim_}, projection->dtype());
     using Op = infini::ops::DeepseekV4Compress;
     execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
@@ -59,17 +65,17 @@ runtime::Tensor Compressor::project_and_pool(runtime::Runtime &runtime,
 
 void Compressor::update_state(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                               const runtime::Tensor &state_slots, const runtime::Tensor &state,
-                              const std::vector<size_t> &query_offsets) const {
+                              const std::vector<size_t> &query_offsets, bool packed_projection) const {
     auto sources = runtime::Tensor::empty(runtime, {0, 128}, runtime::DataType::kInt32);
-    project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets);
+    project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets, packed_projection);
 }
 
 runtime::Tensor Compressor::forward(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                                     const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                                     const runtime::Tensor &state, const runtime::Tensor &positions,
                                     const runtime::Tensor &cos_sin,
-                                    const std::vector<size_t> &query_offsets) const {
-    auto output = project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets);
+                                    const std::vector<size_t> &query_offsets, bool packed_projection) const {
+    auto output = project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets, packed_projection);
     auto kv = norm_->forward(runtime, output);
     apply_rotary_tail(runtime, kv, positions, cos_sin);
     return kv;
@@ -80,17 +86,17 @@ void Compressor::store_paged(runtime::Runtime &runtime, const runtime::Tensor &h
                              const runtime::Tensor &state, const runtime::Tensor &positions,
                              const runtime::Tensor &cos_sin, const std::vector<size_t> &query_offsets,
                              const runtime::Tensor &slots, const runtime::Tensor &pages,
-                             size_t page_tokens) const {
+                             size_t page_tokens, bool packed_projection) const {
     if (runtime.device().type() == runtime::Device::Type::kHygon) {
         using Op = infini::ops::DeepseekV4StoreCompressed;
-        auto pooled = project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets);
+        auto pooled = project_and_pool(runtime, hidden_states, sources, state_slots, state, query_offsets, packed_projection);
         execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
                               Op::DefaultConfig(runtime.device().type()), pooled, norm_->weight(),
                               positions, cos_sin, slots, static_cast<float>(norm_->eps()),
                               static_cast<int64_t>(page_tokens), pages);
         return;
     }
-    auto kv = forward(runtime, hidden_states, sources, state_slots, state, positions, cos_sin, query_offsets);
+    auto kv = forward(runtime, hidden_states, sources, state_slots, state, positions, cos_sin, query_offsets, packed_projection);
     auto rounded = runtime::Tensor::empty(runtime, kv->shape(), runtime::DataType::kBFloat16);
     using Cast = infini::ops::Cast;
     execution::submit<Cast>(runtime, execution::RecordingPolicy::DeviceOnly,

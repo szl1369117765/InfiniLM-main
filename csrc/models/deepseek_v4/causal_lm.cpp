@@ -11,12 +11,15 @@
 #include "execution/submit.hpp"
 #include "global_state/forward_context.hpp"
 #include "layers/embedding/embedding.hpp"
+#include "layers/linear/dense.hpp"
 #include "models/models_registry.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
 #include <string_view>
 #include <stdexcept>
 #include <utility>
@@ -248,16 +251,24 @@ struct BatchMetadata {
     std::optional<RoutedExperts> shared_expert_route{};
     bool packed_decode_collectives{};
     bool packed_decode_mla{};
+    unsigned partial_decode_mla_rows{};
     bool packed_shared_constants{};
     bool short_c4_index{};
     bool packed_collectives{};
     bool packed_mhc_pre{};
+    bool batched_decode_mhc_pre{};
     bool c128_no_store{};
     bool c128_state_only{};
     bool share_flashmla_schedule{};
     // Derived from the current execution's stable length buffers by Graph nodes.
     // Keep these outputs out of tensors(), which enumerates only incoming copies.
     std::array<Tensor, 3> flashmla_schedules{};
+    bool reuse_c4_flashmla_schedule{};
+    std::vector<Tensor> c4_flashmla_schedules;
+    bool direct_decode_wo_a{};
+    bool packed_compressor_projection{};
+    bool packed_moe_gate{};
+    bool uniform_decode_positions{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -387,7 +398,17 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
             device(metadata.c128_positions), device(metadata.c128_page_indices),
             device(metadata.c128_topk_lengths_clamp1), device(c128.sources), device(c128.state_slots), std::move(query_offsets), packed_decode,
             c4_sequential, c4_query_begin, c4_tp_shard, std::move(c4_score_plan)};
+    if (hygon && packed_decode && !classic_mtp_target && rows > 1 && rows <= 16) {
+        const auto *mode = std::getenv("INFINILM_DSV4_COMPRESS_PROJECTION");
+        batch.packed_compressor_projection = mode && std::string_view(mode) == "packed";
+    }
     if (hygon && packed_decode && rows >= 2 && rows <= 8) {
+        const auto uniform_positions = [rows](const auto *values) {
+            return std::all_of(values + 1, values + rows, [first = values[0]](auto position) { return position == first; });
+        };
+        batch.uniform_decode_positions = positions->dtype() == DataType::kInt64
+            ? uniform_positions(reinterpret_cast<const int64_t*>(positions->data()))
+            : uniform_positions(reinterpret_cast<const int32_t*>(positions->data()));
         const auto *setting = std::getenv("INFINILM_DSV4_PACKED_DECODE_MLA");
         if (!setting || std::string_view(setting) == "1") {
             const auto tested_context = [rows](const auto *values) {
@@ -396,6 +417,21 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
             batch.packed_decode_mla = positions->dtype() == DataType::kInt64
                 ? tested_context(reinterpret_cast<const int64_t*>(positions->data()))
                 : tested_context(reinterpret_cast<const int32_t*>(positions->data()));
+            if (!batch.packed_decode_mla && env_enabled("INFINILM_DSV4_PARTIAL_DECODE_MLA")) {
+                const auto eligible = [rows](const auto *values) {
+                    unsigned mask = 0;
+                    for (size_t row = 0; row < rows; ++row) {
+                        if (values[row] < 8192) {
+                            mask |= 1u << row;
+                        }
+                    }
+                    // Only contiguous runs of at least two rows can share an MLA call.
+                    return mask & ((mask << 1) | (mask >> 1));
+                };
+                batch.partial_decode_mla_rows = positions->dtype() == DataType::kInt64
+                    ? eligible(reinterpret_cast<const int64_t*>(positions->data()))
+                    : eligible(reinterpret_cast<const int32_t*>(positions->data()));
+            }
         }
     }
     batch.c128_no_store = c128_no_store;
@@ -454,9 +490,11 @@ public:
         if (ratio_ == 4) {
             compressor_->store_paged(rt,x,batch.c4_sources,batch.c4_state_slots,
                                      cache.compressor_state,batch.c4_positions,frequencies,
-                                     batch.query_offsets,batch.c4_slots,cache.compressed,kV4PageSize/4);
+                                     batch.query_offsets,batch.c4_slots,cache.compressed,kV4PageSize/4,
+                                     batch.packed_compressor_projection);
             auto key = index_compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
-                                                 cache.indexer_state,batch.c4_positions,frequencies,batch.query_offsets);
+                                                 cache.indexer_state,batch.c4_positions,frequencies,
+                                                 batch.query_offsets,batch.packed_compressor_projection);
             key = cast(rt,key,DataType::kBFloat16);
             if (batch.short_c4_index) {
                 // This table is too short for scoring. The key still updates the cache.
@@ -499,47 +537,159 @@ public:
         } else if (ratio_ == 128) {
             if (batch.c128_state_only) {
                 compressor_->update_state(rt, x, batch.c128_state_slots, cache.compressor_state,
-                                          batch.query_offsets);
+                                          batch.query_offsets,batch.packed_compressor_projection);
             } else {
                 compressor_->store_paged(rt,x,batch.c128_sources,batch.c128_state_slots,
                                          cache.compressor_state,batch.c128_positions,frequencies,
-                                         batch.query_offsets,batch.c128_slots,cache.compressed,kV4PageSize/128);
+                                         batch.query_offsets,batch.c128_slots,cache.compressed,kV4PageSize/128,
+                                         batch.packed_compressor_projection);
             }
             indices = batch.c128_indices;
             lengths = batch.c128_lengths;
         }
         const auto attend = [&](const RequestRows &part) {
+            const auto &schedule = ratio_ == 4 && batch.reuse_c4_flashmla_schedule
+                ? batch.c4_flashmla_schedules.at(part.first)
+                : batch.flashmla_schedules[flashmla_schedule_index(ratio_)];
             return sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
                               part.slice(batch.swa_lengths), sink_, part.slice(indices),
-                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)),
-                              batch.flashmla_schedules[flashmla_schedule_index(ratio_)]);
+                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)), schedule);
         };
         Tensor packed_attention;
+        std::vector<std::pair<size_t, Tensor>> prefill_attention_parts;
         // C4 can repartition the FP32 split-KV reduction when the batch grows.
         // Packed decode MLA is limited to the tested SWA and C128 geometries.
-        if (batch.packed_decode_mla && q->dtype() == DataType::kBFloat16 && heads_ == 8 &&
-            tp_size_ == 8 && (ratio_ == 0 || ratio_ == 128)) {
+        const bool packable_decode_mla = q->dtype() == DataType::kBFloat16 && heads_ == 8 &&
+            tp_size_ == 8 && (ratio_ == 0 || ratio_ == 128);
+        if (batch.packed_decode_mla && packable_decode_mla) {
             packed_attention = attend({0, rows});
         } else if (rt.device().type() == runtime::Device::Type::kHygon && !rt.isGraphRecording()
             && q->dtype() == DataType::kBFloat16 && heads_ == 8 && tp_size_ == 8
-            && batch.query_offsets.size() > 2 && rows <= 32768) {
-            bool long_requests = true;
-            for_each_request(batch.query_offsets, [&](const RequestRows &part) {
-                // Keep the provider's long-prefill kernel for every query.
-                long_requests = long_requests && part.count >= 4096;
-            });
+            && batch.query_offsets.size() > 2) {
+            constexpr size_t min_request_rows = 4096;
+            constexpr size_t max_group_rows = 32768;
             const auto *setting = std::getenv("INFINILM_DSV4_PACKED_PREFILL_MLA");
-            if (long_requests && (!setting || std::string_view(setting) != "0")) {
-                packed_attention = attend({0, rows});
+            if (!setting || std::string_view(setting) != "0") {
+                bool long_requests = true;
+                for_each_request(batch.query_offsets, [&](const RequestRows &part) {
+                    long_requests = long_requests && part.count >= min_request_rows;
+                });
+                if (long_requests && rows <= max_group_rows) {
+                    packed_attention = attend({0, rows});
+                } else if (env_enabled("INFINILM_DSV4_PACKED_RAGGED_PREFILL_MLA")) {
+                    std::vector<RequestRows> group;
+                    size_t group_rows = 0;
+                    const auto submit_group = [&] {
+                        if (group.size() >= 2) {
+                            const auto &first = group.front();
+                            const auto &last = group.back();
+                            Tensor attended;
+                            if (last.first + last.count - first.first == group_rows) {
+                                attended = attend({first.first, group_rows});
+                            } else {
+                                const auto pack = [&](const Tensor &input) -> Tensor {
+                                    if (!input) {
+                                        return {};
+                                    }
+                                    auto shape = input->shape();
+                                    shape[0] = group_rows;
+                                    auto packed = Tensor::empty(rt, shape, input->dtype());
+                                    size_t offset = 0;
+                                    for (const auto &part : group) {
+                                        const RequestRows target{offset, part.count};
+                                        target.slice(packed)->copy_from(rt, part.slice(input));
+                                        offset += part.count;
+                                    }
+                                    return packed;
+                                };
+                                attended = sparse_mla(rt, pack(q), cache, pack(batch.swa_indices),
+                                                      pack(batch.swa_lengths), sink_, pack(indices),
+                                                      pack(lengths), 1.0 / std::sqrt(double(kV4HeadDim)), {});
+                            }
+                            // Keep request order for RoPE and the shape-sensitive wo_a.
+                            size_t offset = 0;
+                            for (const auto &part : group) {
+                                const RequestRows source{offset, part.count};
+                                prefill_attention_parts.emplace_back(part.first, source.slice(attended));
+                                offset += part.count;
+                            }
+                        }
+                        group.clear();
+                        group_rows = 0;
+                    };
+                    for_each_request(batch.query_offsets, [&](const RequestRows &part) {
+                        if (part.count < min_request_rows || part.count > max_group_rows) {
+                            return;
+                        }
+                        if (group_rows + part.count > max_group_rows) {
+                            submit_group();
+                        }
+                        group.push_back(part);
+                        group_rows += part.count;
+                    });
+                    submit_group();
+                }
             }
         }
-        // RoPE and wo_a keep their request-local projection geometry.
-        auto local = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
-            auto attended = packed_attention ? part.slice(packed_attention) : attend(part);
-            apply_rotary_tail(rt, attended, part.slice(batch.position), frequencies, true);
-            auto flattened = attended->view({part.count, heads_ * kV4HeadDim});
-            return wo_a_->forward(rt, flattened);
-        });
+        std::array<Tensor, 8> partial_attention{};
+        if (batch.partial_decode_mla_rows && packable_decode_mla) {
+            const auto mask = batch.partial_decode_mla_rows;
+            for (size_t first = 0; first < rows;) {
+                if (!(mask & (1u << first))) {
+                    ++first;
+                    continue;
+                }
+                size_t end = first + 1;
+                while (end < rows && (mask & (1u << end))) {
+                    ++end;
+                }
+                auto grouped = attend({first, end - first});
+                for (size_t row = first; row < end; ++row) {
+                    partial_attention[row] = grouped->narrow({{0, row - first, 1}});
+                }
+                first = end;
+            }
+        }
+        const auto attend_request = [&](const RequestRows &part) {
+            if (packed_attention) {
+                return part.slice(packed_attention);
+            }
+            if (batch.partial_decode_mla_rows && partial_attention[part.first]) {
+                return partial_attention[part.first];
+            }
+            return attend(part);
+        };
+        Tensor local;
+        if (batch.direct_decode_wo_a && tp_size_ == 8 && heads_ == 8 &&
+            wo_a_->weight()->size(0) == 1024) {
+            const auto weight = wo_a_->weight()->contiguous(rt);
+            local = Tensor::empty(rt, {rows, weight->size(0)}, weight->dtype());
+            // Keep request-local rotary execution in mixed-position batches.
+            const bool packed_rope = packed_attention && batch.uniform_decode_positions;
+            if (packed_rope) {
+                apply_rotary_tail(rt, packed_attention, batch.position, frequencies, true);
+            }
+            // Keep the individual BLAS calls. Changing the batch count can
+            // change the accumulation even while each logical GEMM remains M=1.
+            for_each_request(batch.query_offsets, [&](const RequestRows &part) {
+                auto attended = attend_request(part);
+                if (!packed_rope) {
+                    apply_rotary_tail(rt, attended, part.slice(batch.position), frequencies, true);
+                }
+                auto flattened = attended->view({part.count, heads_ * kV4HeadDim});
+                layers::linear::dense_projection(rt, flattened, weight, std::nullopt, wo_a_->alpha(),
+                                                 std::nullopt, false, part.slice(local));
+            });
+        } else {
+            auto prefill = prefill_attention_parts.begin();
+            local = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+                auto attended = prefill != prefill_attention_parts.end() && prefill->first == part.first
+                    ? (prefill++)->second : attend_request(part);
+                apply_rotary_tail(rt, attended, part.slice(batch.position), frequencies, true);
+                auto flattened = attended->view({part.count, heads_ * kV4HeadDim});
+                return wo_a_->forward(rt, flattened);
+            });
+        }
         auto contribution = static_cast<const nn::BaseLinear&>(*wo_b_).forward(rt,local);
         return reduce_tp(rt, contribution, comm_, batch.query_offsets,
                          batch.packed_decode_collectives || batch.packed_collectives);
@@ -575,8 +725,10 @@ private:
             }
             return packed;
         };
-        auto query_input = q_lora;
-        auto query = pack(index_query_->forward(rt, query_input))->view({count, index_heads_, 128});
+        const bool project_local = env_enabled("INFINILM_DSV4_C4_PROJECT_LOCAL");
+        auto query_input = project_local ? pack(q_lora) : q_lora;
+        auto projected = index_query_->forward(rt, query_input);
+        auto query = (project_local ? projected : pack(projected))->view({count, index_heads_, 128});
         auto positions = pack(batch.position);
         apply_rotary_tail(rt, query, positions, frequencies);
         auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
@@ -628,11 +780,12 @@ private:
                                   take(gathered, 0, write_rows));
 
         const bool multi_request = batch.query_offsets.size() > 2;
-        // Retain packed query projection and per-request weight projection
-        // shapes before partitioning the score and Top-512 computation.
-        auto query_input = multi_request ? q_lora : take(q_lora, first, count);
+        // Hygon can project only this rank's W8A8 query rows. The BF16
+        // index weight projection remains request-local.
+        const bool project_full = multi_request && !env_enabled("INFINILM_DSV4_C4_PROJECT_LOCAL");
+        auto query_input = project_full ? q_lora : take(q_lora, first, count);
         auto projected = index_query_->forward(rt, query_input);
-        auto query = (multi_request ? take(projected, first, count) : projected)
+        auto query = (project_full ? take(projected, first, count) : projected)
                          ->view({count, index_heads_, 128});
         apply_rotary_tail(rt, query, take(batch.position, first, count), frequencies);
         auto weights = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
@@ -709,10 +862,12 @@ public:
     }
 
     Tensor forward(Runtime &rt, Tensor x, const Tensor &tokens, const BatchMetadata &batch) const {
-        auto logits = project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
-            auto input = part.slice(x);
-            return gate_->forward(rt, input);
-        });
+        auto logits = batch.packed_moe_gate
+            ? gate_->forward(rt, x)
+            : project_requests(rt, batch.query_offsets, [&](const RequestRows &part) {
+                  auto input = part.slice(x);
+                  return gate_->forward(rt, input);
+              });
         using Opt=std::optional<Tensor>;
         const Shape routes{x->size(0),topk_};
         RoutedExperts route{Tensor::empty(rt,routes,DataType::kFloat32),
@@ -759,6 +914,23 @@ HyperConnectionMix run_mhc(Runtime &rt, const Tensor &x, const MixWeights &w,
             rt, input, w.projection, w.scale, w.base, norm_eps, mix_eps,
             static_cast<int64_t>(iterations), activation, post, combination);
     };
+    if (batch.batched_decode_mhc_pre && x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
+        rows >= 2 && rows <= 8 && streams == 4 && x->size(2) == 4096 &&
+        reinterpret_cast<uintptr_t>(x->data()) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(w.projection->data()) % 16 == 0) {
+        if (iterations == 0) {
+            // The head already applies its single-row reduction independently.
+            submit_mix(x, out.activation, out.post, out.combination);
+        } else {
+            using Op = infini::ops::DeepseekV4MhcPre;
+            infini::ops::DeepseekV4MhcPreSingleTokenBatchConfig config;
+            config.set_implementation_index(Op::DefaultConfig(rt.device().type()).implementation_index());
+            execution::submit<Op>(rt, execution::RecordingPolicy::DeviceOnly, config,
+                                  x, w.projection, w.scale, w.base, norm_eps, mix_eps,
+                                  static_cast<int64_t>(iterations), out.activation, out.post, out.combination);
+        }
+        return out;
+    }
     // Flash BF16 q2–q4 and packed M6–M12 use the same per-row reduction.
     // A contiguous row preserves the alignment of every owner slice.
     if (batch.packed_mhc_pre && rt.device().type() == runtime::Device::Type::kHygon && x->ndim() == 3 && x->dtype() == DataType::kBFloat16 && x->is_contiguous() && rows >= 6 && rows <= 12 && streams == 4 && x->size(2) == 4096) {
@@ -949,7 +1121,10 @@ public:
         PagedCacheWriteSet writes;
         auto batch = make_batch(rt, input, cfg_.classic_mtp_target,
                                 input.rollback_v4_cache ? &writes : nullptr);
-        batch.packed_decode_mla = batch.packed_decode_mla && ctx.model_decode_barrier && !cfg_.is_mtp;
+        if (!ctx.model_decode_barrier || cfg_.is_mtp) {
+            batch.packed_decode_mla = false;
+            batch.partial_decode_mla_rows = 0;
+        }
         if (input.mtp_eager_packed_direct_commit) {
             if (!cfg_.classic_mtp_target || cfg_.is_mtp || input.target_hidden_states
                 || !input.return_draft_hidden_states || !input.sample_all_positions
@@ -996,6 +1171,21 @@ public:
             batch.packed_decode_collectives = !cfg_.is_mtp && ids->numel() > 1 &&
                 rt.device().type() == runtime::Device::Type::kHygon &&
                 (!packed || std::string_view(packed) != "0");
+            batch.packed_moe_gate = !cfg_.is_mtp && !cfg_.classic_mtp_target &&
+                ids->numel() >= 2 && ids->numel() <= 16 &&
+                rt.device().type() == runtime::Device::Type::kHygon &&
+                env_enabled("INFINILM_DSV4_PACK_MOE_GATE");
+            batch.reuse_c4_flashmla_schedule = batch.uniform_decode_positions && !cfg_.is_mtp && ids->numel() >= 2
+                && ids->numel() <= 8 && cfg_.heads / kV4TensorParallelSize == 8
+                && rt.device().type() == runtime::Device::Type::kHygon
+                && env_enabled("INFINILM_DSV4_C4_FLASHMLA_SCHEDULE")
+                && std::find(cfg_.ratios.begin(), cfg_.ratios.end(), 4) != cfg_.ratios.end();
+            batch.direct_decode_wo_a = batch.packed_decode_collectives && ids->numel() <= 8 &&
+                env_enabled("INFINILM_DSV4_DIRECT_WO_A") &&
+                (batch.uniform_decode_positions || env_enabled("INFINILM_DSV4_RAGGED_WO_A"));
+            batch.batched_decode_mhc_pre = batch.packed_decode_collectives && ids->numel() <= 8 &&
+                env_enabled("INFINILM_DSV4_BATCHED_MHC_PRE") &&
+                (batch.uniform_decode_positions || env_enabled("INFINILM_DSV4_RAGGED_MHC_PRE"));
             const bool fused_greedy = ctx.model_decode_greedy && ids->numel() == 1;
             return decode(rt, std::move(ids), std::move(batch), *ctx.model_decode_barrier,
                           fused_greedy);
@@ -1231,7 +1421,13 @@ private:
         auto matches = [&](const std::optional<DecodePlan> &plan) {
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
                 plan->batch.packed_decode_collectives != batch.packed_decode_collectives ||
+                plan->batch.direct_decode_wo_a != batch.direct_decode_wo_a ||
+                plan->batch.packed_moe_gate != batch.packed_moe_gate ||
+                plan->batch.packed_compressor_projection != batch.packed_compressor_projection ||
+                (batch.direct_decode_wo_a && batch.packed_decode_mla &&
+                 plan->batch.uniform_decode_positions != batch.uniform_decode_positions) ||
                 plan->batch.packed_decode_mla != batch.packed_decode_mla ||
+                plan->batch.partial_decode_mla_rows != batch.partial_decode_mla_rows ||
                 plan->batch.c4_sequential != batch.c4_sequential ||
                 plan->batch.c4_query_begin != batch.c4_query_begin ||
                 plan->batch.query_offsets != batch.query_offsets ||
@@ -1239,7 +1435,9 @@ private:
                 plan->batch.short_c4_index != batch.short_c4_index ||
                 plan->batch.packed_collectives != batch.packed_collectives ||
                 plan->batch.packed_mhc_pre != batch.packed_mhc_pre ||
+                plan->batch.batched_decode_mhc_pre != batch.batched_decode_mhc_pre ||
                 plan->batch.share_flashmla_schedule != batch.share_flashmla_schedule ||
+                plan->batch.reuse_c4_flashmla_schedule != batch.reuse_c4_flashmla_schedule ||
                 plan->short_kernel_modes != short_kernel_modes ||
                 ids->shape() != plan->ids->shape() ||
                 ids->dtype() != plan->ids->dtype()) {
@@ -1318,6 +1516,19 @@ private:
                         ++candidate.flashmla_schedules_prepared;
                     }
                 }
+                if (candidate.batch.reuse_c4_flashmla_schedule) {
+                    auto &stable = candidate.batch;
+                    // C4 keeps one-query partitions. Every C4 layer sees the same
+                    // lengths, so each request can reuse its own scheduler output.
+                    static_assert(kC4IndexTopK == C4SequentialIndex::kMaxCandidates);
+                    const auto swa_width = stable.swa_indices->size(1);
+                    stable.c4_flashmla_schedules.reserve(stable.swa_lengths->size(0));
+                    for_each_request(stable.query_offsets, [&](const RequestRows &part) {
+                        stable.c4_flashmla_schedules.push_back(prepare_sparse_mla_schedule(
+                            rt, part.slice(stable.swa_lengths), swa_width,
+                            part.slice(stable.c4_sparse_lengths), kC4IndexTopK));
+                    });
+                }
                 auto recorded = forward_logits(
                     rt, candidate.ids, candidate.batch, candidate.target_hc, return_hc, draft_seed_graph,
                     &candidate.packed_mhc_calls);
@@ -1348,6 +1559,11 @@ private:
             throw std::runtime_error("Packed direct MTP requires one device Graph on every TP rank");
         }
         recent->graph->run();
+        if (!classic_mtp && sampling_rank_ && env_enabled("INFINILM_DSV4_GRAPH_PLAN_LOG")) {
+            std::fprintf(stderr, "DSV4_DECODE_PLAN %s rows=%zu slots=%zu operators=%zu\n",
+                         common_slots ? "hit" : "capture", recent->ids->numel(),
+                         plans.size(), report.operator_count);
+        }
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
         auto hidden_states = return_hc ? copy_graph_tensor(rt, recent->hidden_states) : Tensor{};
