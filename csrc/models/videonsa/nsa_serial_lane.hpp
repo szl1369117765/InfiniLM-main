@@ -132,7 +132,7 @@ public:
         if (!current_ || enqueued_) {
             throw std::logic_error("NSA enqueue order");
         }
-        enqueued_ = true; // ONLY after successful eager native Call return
+        enqueued_ = true; // Only after successful eager Call or Graph replay submission.
     }
     // Worker calls for each model-owned NSA lane before job_done. Completed is
     // legal ONLY immediately after its already-existing successful owner sync.
