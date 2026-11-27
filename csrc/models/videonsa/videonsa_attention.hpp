@@ -1,4 +1,6 @@
 #pragma once
+
+#include <tuple>
 #include "nsa_serial_lane.hpp"
 #include <cstdint>
 
@@ -22,6 +24,9 @@ public:
                                       global_state::ForwardContext &forward_context) const;
 
     void prepare_paged_owner(global_state::ForwardContext &) const;
+    using CompressionGraphBinding = std::tuple<std::uint64_t, bool, const std::byte *, const std::byte *>;
+    CompressionGraphBinding compression_graph_binding() const;
+    void mark_paged_graph_submitted() const;
     void finish_paged_owner(bool) const;
     void invalidate_paged_owner() const noexcept;
 

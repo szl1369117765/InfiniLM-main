@@ -64,6 +64,9 @@ public:
         size_t host_segments = 0;
         bool capture_attempted = false;
         std::string fallback_reason;
+        const char *videonsa_prefill_plan = nullptr;
+        const char *videonsa_decode_plan = nullptr;
+        const char *videonsa_decode_compression = nullptr;
         const char *mtp_graph_plan = nullptr;
         size_t mtp_packed_mhc_calls = 0;
         bool mtp_c128_state_only = false;
