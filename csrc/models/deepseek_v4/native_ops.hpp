@@ -30,7 +30,8 @@ runtime::Tensor sparse_mla(runtime::Runtime &runtime, const runtime::Tensor &que
                            const runtime::Tensor &swa_lengths, const runtime::Tensor &sink,
                            const runtime::Tensor &compressed_indices,
                            const runtime::Tensor &compressed_lengths, double scale,
-                           const runtime::Tensor &schedule);
+                           const runtime::Tensor &schedule,
+                           size_t first_prefill_page = 0, size_t prefill_pages = 0);
 
 // A rank-local expert contribution. The decoder must reduce across TP ranks
 // and combine shared expert output before applying the residual.

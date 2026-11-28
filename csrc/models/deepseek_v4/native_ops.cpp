@@ -78,7 +78,8 @@ runtime::Tensor sparse_mla(runtime::Runtime &runtime, const runtime::Tensor &que
                            const runtime::Tensor &swa_lengths, const runtime::Tensor &sink,
                            const runtime::Tensor &compressed_indices,
                            const runtime::Tensor &compressed_lengths, double scale,
-                           const runtime::Tensor &schedule) {
+                           const runtime::Tensor &schedule,
+                           size_t first_prefill_page, size_t prefill_pages) {
     const auto ratio = cache.compression_ratio;
     if (!query || (ratio != 0 && ratio != 4 && ratio != 128)
         || static_cast<bool>(ratio) != static_cast<bool>(cache.compressed)
@@ -100,8 +101,13 @@ runtime::Tensor sparse_mla(runtime::Runtime &runtime, const runtime::Tensor &que
                               extra_page_size, scale, schedule, output);
     } else {
         using Op = infini::ops::DeepseekV4SparseMla;
+        const auto default_config = Op::DefaultConfig(runtime.device().type());
+        infini::ops::DeepseekV4PrefillPageWindowConfig window(first_prefill_page,prefill_pages);
+        window.set_implementation_index(default_config.implementation_index());
+        const auto &config = prefill_pages && query->size(0) > 3072
+            ? static_cast<const infini::ops::Config &>(window) : default_config;
         execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
-                              Op::DefaultConfig(runtime.device().type()), query, cache.swa,
+                              config, query, cache.swa,
                               swa_indices, swa_lengths, sink, extra, extra_indices, extra_lengths,
                               extra_page_size, scale, output);
     }

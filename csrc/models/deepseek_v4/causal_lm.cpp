@@ -9,6 +9,9 @@
 #include "engine/rank_barrier.hpp"
 #include "engine/distributed/communication_group.hpp"
 #include "execution/submit.hpp"
+#include "base/deepseek_v4_q_lora_quant.h"
+#include "base/i8_gemm.h"
+#include "base/per_channel_quant_i8.h"
 #include "global_state/forward_context.hpp"
 #include "layers/embedding/embedding.hpp"
 #include "layers/linear/dense.hpp"
@@ -20,6 +23,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <string_view>
 #include <stdexcept>
 #include <utility>
@@ -97,9 +101,8 @@ Tensor cast(Runtime &rt, const Tensor &value, DataType dtype) {
 
 // The HCU custom reduction used by the reference accumulates rank-local
 // BF16 contributions in FP32 and truncates only the final writeback.
-Tensor reduce_tp(Runtime &rt, const Tensor &local, infinicclComm_t comm,
-                 const std::vector<size_t> &query_offsets, bool packed_collectives) {
-    auto sum = cast(rt,local,DataType::kFloat32);
+Tensor reduce_tp_rounded(Runtime &rt, const Tensor &sum, DataType output_type, infinicclComm_t comm,
+                         const std::vector<size_t> &query_offsets, bool packed_collectives) {
     if (packed_collectives) {
         engine::distributed::allreduce_(rt, sum, sum, infinicclSum, comm);
     } else {
@@ -108,8 +111,39 @@ Tensor reduce_tp(Runtime &rt, const Tensor &local, infinicclComm_t comm,
             engine::distributed::allreduce_(rt, part, part, infinicclSum, comm);
         });
     }
-    auto output = Tensor::empty(rt,local->shape(),local->dtype());
+    auto output = Tensor::empty(rt,sum->shape(),output_type);
     submit<infini::ops::DeepseekV4CastRz>(rt,sum,output);
+    return output;
+}
+
+Tensor reduce_tp(Runtime &rt, const Tensor &local, infinicclComm_t comm,
+                 const std::vector<size_t> &query_offsets, bool packed_collectives) {
+    return reduce_tp_rounded(rt,cast(rt,local,DataType::kFloat32),local->dtype(),comm,
+                             query_offsets,packed_collectives);
+}
+
+// Cast only after FP32 reduction. The BF16 AllGather then moves the same
+// values that would have been written on every rank by the FP32 AllReduce.
+Tensor scatter_gather_attn_prefill(Runtime &rt, const Tensor &sum, infinicclComm_t comm,
+                                  const std::vector<size_t> &query_offsets) {
+    constexpr size_t ranks = kV4TensorParallelSize;
+    constexpr size_t min_rows = 1024;
+    const auto output = Tensor::empty(rt,sum->shape(),DataType::kBFloat16);
+    for_each_request(query_offsets, [&](const RequestRows &rows) {
+        const auto input_part = rows.slice(sum);
+        const auto output_part = rows.slice(output);
+        if (rows.count < min_rows || rows.count % ranks != 0) {
+            engine::distributed::allreduce_(rt, input_part, input_part, infinicclSum, comm);
+            submit<infini::ops::DeepseekV4CastRz>(rt,input_part,output_part);
+            return;
+        }
+        const Shape shard_shape{rows.count/ranks,sum->size(1)};
+        auto reduced = Tensor::empty(rt,shard_shape,DataType::kFloat32);
+        auto narrowed = Tensor::empty(rt,shard_shape,DataType::kBFloat16);
+        engine::distributed::reduce_scatter_(rt, reduced, input_part, infinicclSum, comm);
+        submit<infini::ops::DeepseekV4CastRz>(rt,reduced,narrowed);
+        engine::distributed::allgather_(rt, output_part, narrowed, comm);
+    });
     return output;
 }
 
@@ -238,6 +272,10 @@ bool k3_draft_seed_enabled() {
     return mode && std::string_view(mode) == "1";
 }
 
+struct CompressedStoreRows {
+    Tensor sources, positions, slots;
+};
+
 struct BatchMetadata {
     Tensor position, swa_indices, swa_lengths, swa_slots, page_table;
     Tensor c4_slots, c4_positions, c4_lengths, c4_sparse_lengths, c4_sources, c4_state_slots;
@@ -266,9 +304,27 @@ struct BatchMetadata {
     bool reuse_c4_flashmla_schedule{};
     std::vector<Tensor> c4_flashmla_schedules;
     bool direct_decode_wo_a{};
+    bool batch_decode_wo_a{};
+    bool joined_decode_qkv{};
+    bool joined_qkv_scale_first{};
     bool packed_compressor_projection{};
     bool packed_moe_gate{};
+    bool packed_all_flashmla{};
+    bool packed_c4_flashmla{};
+    bool c4_decode_row_shard{};
+    bool fuse_c4_index_key{};
     bool uniform_decode_positions{};
+    std::optional<CompressedStoreRows> c4_prefill_store;
+    bool pack_mhc_prefill{};
+    Tensor packed_decode_metadata;
+    bool scatter_attn_prefill{};
+    bool widen_wo_b_prefill{};
+    bool fuse_q_lora_quant{};
+    bool matrix_wq_b{};
+    bool native_attention_matrix{};
+    bool vector_attention_rms{};
+    bool share_prefill_qkv_quant{};
+    size_t first_prefill_page{}, prefill_pages{};
 
     auto tensors() const {
         return std::array<const Tensor*,17>{&position,&swa_indices,&swa_lengths,&swa_slots,&page_table,
@@ -299,8 +355,32 @@ bool short_verify_layout(const std::vector<size_t> &offsets, size_t total_rows) 
     return true;
 }
 
+Tensor bucket_decode_page_table(const Tensor &table) {
+    constexpr size_t kLastParallelPageWidth = 64;
+    const auto width = table->size(1);
+    if (width == 0 || width >= kLastParallelPageWidth) {
+        return table;
+    }
+    // The shifted buckets absorb crossings such as 16 -> 17 and 32 -> 33.
+    // Keep the unscored and parallel C4 selector ranges separate.
+    const size_t capacity = width <= kC4IndexMaxUnscoredPages ? (width + 1) / 2 * 2
+        : std::min(kLastParallelPageWidth, (width + 2) / 4 * 4 + 1);
+    if (capacity == width) {
+        return table;
+    }
+
+    const auto rows = table->size(0);
+    auto values = std::make_shared<std::vector<int32_t>>(rows * capacity, -1);
+    const auto *source = reinterpret_cast<const int32_t *>(table->data());
+    for (size_t row = 0; row < rows; ++row) {
+        std::copy_n(source + row * width, width, values->data() + row * capacity);
+    }
+    const runtime::Device cpu{runtime::Device::Type::kCpu};
+    return Tensor::from_blob(values->data(), {rows, capacity}, DataType::kInt32, cpu, values);
+}
+
 BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
-                         bool classic_mtp_target,
+                         bool classic_mtp_target, bool is_mtp, bool ordinary_graph,
                          PagedCacheWriteSet *writes = nullptr) {
     const runtime::Device cpu{runtime::Device::Type::kCpu};
     auto host = [&](const std::optional<Tensor> &value) {
@@ -390,14 +470,134 @@ BatchMetadata make_batch(Runtime &rt, const InfinilmModel::Input &input,
         c128_no_store = std::all_of(slots, slots + metadata.c128_out_loc->numel(),
                                     [](int32_t slot) { return slot == -1; });
     }
+    const bool optimize_prefill = hygon && !packed_decode && !classic_mtp_target && !is_mtp;
+    const bool bucket_pages = ordinary_graph && hygon && packed_decode && rows <= 8 &&
+        !classic_mtp_target && !is_mtp && env_enabled("INFINILM_DSV4_GRAPH_PAGE_BUCKET");
+    const auto graph_page_table = bucket_pages ? bucket_decode_page_table(metadata.page_table)
+                                               : metadata.page_table;
+
+    const bool compact_prefill = optimize_prefill && rows >= 128 &&
+        env_enabled("INFINILM_DSV4_COMPACT_PREFILL_STORE");
+    // Projection and state destinations still cover all input rows. Only
+    // rows whose output slot is valid need pooling, RoPE and page storage.
+    const auto compact_store = [&](const Tensor &sources, const Tensor &pos, const Tensor &slots)
+        -> std::optional<CompressedStoreRows> {
+        if (!compact_prefill) {
+            return {};
+        }
+        const auto *slot_data = reinterpret_cast<const int32_t*>(slots->data());
+        const auto *pos_data = reinterpret_cast<const int32_t*>(pos->data());
+        const auto *source_data = reinterpret_cast<const int32_t*>(sources->data());
+        const size_t count = std::count_if(slot_data,slot_data+rows,[](int32_t slot) { return slot >= 0; });
+        if (!count || count == rows) {
+            return {};
+        }
+        const size_t window = sources->size(1);
+        auto d_sources = std::make_shared<std::vector<int32_t>>(count*window);
+        auto d_pos = std::make_shared<std::vector<int32_t>>(count);
+        auto d_slots = std::make_shared<std::vector<int32_t>>(count);
+        size_t out = 0;
+        for (size_t row=0; row<rows; ++row) {
+            if (slot_data[row] < 0) {
+                continue;
+            }
+            std::memcpy(d_sources->data()+out*window,source_data+row*window,window*sizeof(int32_t));
+            (*d_pos)[out] = pos_data[row];
+            (*d_slots)[out] = slot_data[row];
+            ++out;
+        }
+        const auto transfer = [&](const auto &data, const Shape &shape) {
+            return device(Tensor::from_blob(data->data(),shape,DataType::kInt32,cpu,data));
+        };
+        return CompressedStoreRows{transfer(d_sources,{count,window}),transfer(d_pos,{count}),
+                                   transfer(d_slots,{count})};
+    };
+    auto compact_c128_store = compact_store(c128.sources,metadata.c128_positions,metadata.c128_out_loc);
+    std::array<Tensor,16> fields{
+        metadata.swa_indices, metadata.swa_topk_lengths, metadata.raw_out_loc,
+        graph_page_table, metadata.c4_out_loc, metadata.c4_positions,
+        metadata.c4_topk_lengths_raw, metadata.c4_sparse_topk_lengths, c4.sources, c4.state_slots,
+        compact_c128_store ? compact_c128_store->slots : metadata.c128_out_loc,
+        compact_c128_store ? compact_c128_store->positions : metadata.c128_positions,
+        metadata.c128_page_indices, metadata.c128_topk_lengths_clamp1,
+        compact_c128_store ? compact_c128_store->sources : c128.sources, c128.state_slots};
+    Tensor packed_metadata;
+    if (ordinary_graph && hygon && packed_decode && !classic_mtp_target && !is_mtp &&
+        env_enabled("INFINILM_DSV4_PACK_GRAPH_METADATA")) {
+        // Plan-owned views use the same alignment as separate allocations.
+        constexpr size_t alignment = 256 / sizeof(int32_t);
+        std::array<size_t,16> offsets{};
+        size_t total = 0;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            offsets[i] = total;
+            total += (fields[i]->numel() + alignment - 1) / alignment * alignment;
+        }
+        auto bytes = std::make_shared<std::vector<int32_t>>(total);
+        for (size_t i = 0; i < fields.size(); ++i) {
+            std::memcpy(bytes->data()+offsets[i],fields[i]->data(),fields[i]->nbytes());
+        }
+        auto host_pack = Tensor::from_blob(bytes->data(),{total},DataType::kInt32,cpu,bytes);
+        packed_metadata = device(host_pack);
+        for (size_t i = 0; i < fields.size(); ++i) {
+            fields[i] = packed_metadata->narrow({{0,offsets[i],fields[i]->numel()}})
+                            ->view(fields[i]->shape());
+        }
+    } else {
+        for (auto &field : fields) {
+            if (field->device() == cpu) {
+                field = device(field);
+            }
+        }
+    }
     BatchMetadata batch{input.position_ids.value()->view({positions->numel()}),
-            device(metadata.swa_indices), device(metadata.swa_topk_lengths), device(metadata.raw_out_loc),
-            device(metadata.page_table), device(metadata.c4_out_loc), device(metadata.c4_positions),
-            device(metadata.c4_topk_lengths_raw), device(metadata.c4_sparse_topk_lengths),
-            device(c4.sources), device(c4.state_slots), device(metadata.c128_out_loc),
-            device(metadata.c128_positions), device(metadata.c128_page_indices),
-            device(metadata.c128_topk_lengths_clamp1), device(c128.sources), device(c128.state_slots), std::move(query_offsets), packed_decode,
-            c4_sequential, c4_query_begin, c4_tp_shard, std::move(c4_score_plan)};
+            fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
+            fields[7], fields[8], fields[9], fields[10], fields[11], fields[12], fields[13],
+            fields[14], fields[15], std::move(query_offsets), packed_decode, c4_sequential,
+            c4_query_begin, c4_tp_shard, std::move(c4_score_plan)};
+    batch.packed_decode_metadata = std::move(packed_metadata);
+    batch.c4_prefill_store = compact_store(c4.sources,metadata.c4_positions,metadata.c4_out_loc);
+    if (optimize_prefill && rows > 3072 && env_enabled("INFINILM_DSV4_PREFILL_PAGE_WINDOW")) {
+        const auto width = metadata.page_table->size(1);
+        const auto *table = reinterpret_cast<const int32_t*>(metadata.page_table->data());
+        constexpr size_t kMaxValidatedPrefillRowsPerRequest = 8192;
+        bool validated_length = true;
+        size_t first = std::numeric_limits<size_t>::max(), last = 0;
+        for_each_request(batch.query_offsets,[&](const RequestRows &part) {
+            if (part.count > kMaxValidatedPrefillRowsPerRequest) {
+                validated_length = false;
+                return;
+            }
+            if (!part.count) return;
+            const auto *pages = table + part.first * width;
+            for (size_t col = 0; col < width; ++col) {
+                if (pages[col] < 0) continue;
+                first = std::min(first, static_cast<size_t>(pages[col]));
+                last = std::max(last, static_cast<size_t>(pages[col]));
+            }
+        });
+        if (validated_length && first <= last) {
+            batch.first_prefill_page = first;
+            batch.prefill_pages = last - first + 1;
+        }
+    }
+    batch.pack_mhc_prefill = optimize_prefill && multi_request && env_enabled("INFINILM_DSV4_PACK_MHC_PREFILL");
+    batch.scatter_attn_prefill = optimize_prefill && env_enabled("INFINILM_DSV4_ATTN_TP_RSAG");
+    batch.widen_wo_b_prefill = optimize_prefill && env_enabled("INFINILM_DSV4_WO_B_WIDEN");
+    batch.fuse_q_lora_quant = hygon && !classic_mtp_target && !is_mtp &&
+        env_enabled("INFINILM_DSV4_FUSE_Q_LORA_QUANT");
+    batch.vector_attention_rms = hygon && !classic_mtp_target && !is_mtp &&
+        env_enabled("INFINILM_DSV4_VECTOR_ATTN_RMS");
+    batch.share_prefill_qkv_quant = optimize_prefill && rows >= 4096 &&
+        env_enabled("INFINILM_DSV4_SHARE_PREFILL_QKV_QUANT");
+    // The reference GEMM chooses its accumulation order from the full prefill batch.
+    if (hygon && !packed_decode && !classic_mtp_target) {
+        if (multi_request && (env_enabled("INFINILM_DSV4_COMPRESS_PREFILL_REFERENCE") ||
+            (optimize_prefill && rows >= 256 && env_enabled("INFINILM_DSV4_PACK_COMPRESS_PREFILL")))) {
+            batch.packed_compressor_projection = true;
+        }
+        batch.fuse_c4_index_key = optimize_prefill && rows >= 128 &&
+            env_enabled("INFINILM_DSV4_FUSE_PREFILL_INDEX_KEY");
+    }
     if (hygon && packed_decode && !classic_mtp_target && rows > 1 && rows <= 16) {
         const auto *mode = std::getenv("INFINILM_DSV4_COMPRESS_PROJECTION");
         batch.packed_compressor_projection = mode && std::string_view(mode) == "packed";
@@ -469,6 +669,24 @@ public:
 
     void process_weights_after_loading(Runtime &rt, bool) override {
         kv_norm_fp32_ = cast(rt,kv_norm_->weight(),DataType::kFloat32);
+        if (rt.device().type() != runtime::Device::Type::kHygon ||
+            !env_enabled("INFINILM_DSV4_GRAPH_QKV_JOIN")) {
+            return;
+        }
+        const auto q = wq_a_->weight();
+        const auto kv = wkv_->weight();
+        if (q->dtype() != DataType::kInt8 || kv->dtype() != DataType::kInt8 ||
+            q->shape() != Shape{1024,4096} || kv->shape() != Shape{512,4096}) {
+            return;
+        }
+        const auto q_scale = wq_a_->get_parameter_ref("weight_scale").tensor();
+        const auto kv_scale = wkv_->get_parameter_ref("weight_scale").tensor();
+        joined_qkv_weight_ = Tensor::empty(rt,{1536,4096},DataType::kInt8);
+        joined_qkv_weight_->narrow({{0,0,1024}})->copy_from(rt,q);
+        joined_qkv_weight_->narrow({{0,1024,512}})->copy_from(rt,kv);
+        joined_qkv_scale_ = Tensor::empty(rt,{1536,1},DataType::kFloat32);
+        joined_qkv_scale_->narrow({{0,0,1024}})->copy_from(rt,q_scale);
+        joined_qkv_scale_->narrow({{0,1024,512}})->copy_from(rt,kv_scale);
     }
 
     void write_swa(Runtime &rt, Tensor x, const BatchMetadata &batch,
@@ -481,21 +699,104 @@ public:
     Tensor forward(Runtime &rt, Tensor x, const BatchMetadata &batch, const LayerPagedCache &cache,
                    const Tensor &frequencies) const {
         const auto rows = x->size(0);
-        auto q_lora = q_norm_->forward(rt,wq_a_->forward(rt,x));
-        auto q_raw = wq_b_->forward(rt,q_lora)->view({rows,heads_,kV4HeadDim});
+        Tensor q_input, swa_key;
+        Tensor prefill_input_i8, prefill_scale;
+        const auto project_prefill = [&](const Linear &projection) {
+            const auto weight = projection.weight();
+            auto output = Tensor::empty(rt,{rows,weight->size(0)},DataType::kBFloat16);
+            using Gemm = infini::ops::I8Gemm;
+            execution::submit<Gemm>(rt,execution::RecordingPolicy::DeviceOnly,
+                Gemm::DefaultConfig(rt.device().type()),output,prefill_input_i8,prefill_scale,
+                weight->permute({1,0}),projection.get_parameter_ref("weight_scale").tensor(),
+                std::optional<Tensor>{});
+            return output;
+        };
+        if (batch.joined_decode_qkv && joined_qkv_weight_ &&
+            x->dtype() == DataType::kBFloat16 && x->is_contiguous()) {
+            auto input_i8 = Tensor::empty(rt,x->shape(),DataType::kInt8);
+            auto scale = Tensor::empty(rt,{rows,1},DataType::kFloat32);
+            submit<infini::ops::PerChannelQuantI8>(rt,x,input_i8,scale);
+            auto output = Tensor::empty(rt,{rows,1536},DataType::kBFloat16);
+            using Op = infini::ops::I8Gemm;
+            infini::ops::DeepseekV4JoinedQkvConfig config(
+                batch.joined_qkv_scale_first,batch.native_attention_matrix);
+            config.set_implementation_index(Op::DefaultConfig(rt.device().type()).implementation_index());
+            execution::submit<Op>(rt,execution::RecordingPolicy::DeviceOnly,config,
+                                  output,input_i8,scale,joined_qkv_weight_->permute({1,0}),
+                                  joined_qkv_scale_,std::optional<Tensor>{});
+            const auto flat = output->view({rows*1536});
+            q_input = flat->narrow({{0,0,rows*1024}})->view({rows,1024});
+            swa_key = flat->narrow({{0,rows*1024,rows*512}})->view({rows,512});
+        } else if (batch.share_prefill_qkv_quant && !rt.isGraphRecording() &&
+                   x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
+                   x->size(1) == 4096 && wq_a_->weight()->dtype() == DataType::kInt8 &&
+                   wkv_->weight()->dtype() == DataType::kInt8 &&
+                   !wq_a_->has_bias() && !wkv_->has_bias() &&
+                   wq_a_->alpha() == 1.0f && wkv_->alpha() == 1.0f) {
+            prefill_input_i8 = Tensor::empty(rt,x->shape(),DataType::kInt8);
+            prefill_scale = Tensor::empty(rt,{rows,1},DataType::kFloat32);
+            submit<infini::ops::PerChannelQuantI8>(rt,x,prefill_input_i8,prefill_scale);
+            q_input = project_prefill(*wq_a_);
+        } else {
+            q_input = wq_a_->forward(rt,x);
+        }
+        Tensor q_lora, q_raw;
+        const auto q_weight = wq_b_->weight();
+        const bool matrix_wq_b = batch.matrix_wq_b && q_weight->size(0) == 4096;
+        if ((batch.fuse_q_lora_quant || matrix_wq_b) &&
+            q_input->dtype() == DataType::kBFloat16 && q_input->is_contiguous() &&
+            q_input->size(1) == 1024 && q_weight->dtype() == DataType::kInt8 &&
+            q_weight->size(1) == 1024 && wq_b_->alpha() == 1.0f && !wq_b_->has_bias()) {
+            auto input_i8 = Tensor::empty(rt,q_input->shape(),DataType::kInt8);
+            auto scale = Tensor::empty(rt,{rows,1},DataType::kFloat32);
+            q_raw = Tensor::empty(rt,{rows,q_weight->size(0)},DataType::kBFloat16);
+            if (batch.fuse_q_lora_quant) {
+                q_lora = Tensor::empty(rt,q_input->shape(),DataType::kBFloat16);
+                using NormalizeQuant = infini::ops::DeepseekV4QLoraQuant;
+                execution::submit<NormalizeQuant>(rt,execution::RecordingPolicy::DeviceOnly,
+                    NormalizeQuant::DefaultConfig(rt.device().type()),q_input,q_norm_->weight(),
+                    static_cast<float>(q_norm_->eps()),q_lora,input_i8,scale);
+            } else {
+                q_lora = q_norm_->forward(rt,q_input);
+                submit<infini::ops::PerChannelQuantI8>(rt,q_lora,input_i8,scale);
+            }
+            using Gemm = infini::ops::I8Gemm;
+            const auto default_config = Gemm::DefaultConfig(rt.device().type());
+            infini::ops::DeepseekV4WqBMatrixConfig matrix_config;
+            matrix_config.set_implementation_index(default_config.implementation_index());
+            const auto &config = matrix_wq_b ? static_cast<const infini::ops::Config &>(matrix_config)
+                                            : default_config;
+            execution::submit<Gemm>(rt,execution::RecordingPolicy::DeviceOnly,
+                config,q_raw,input_i8,scale,q_weight->permute({1,0}),
+                wq_b_->get_parameter_ref("weight_scale").tensor(),std::optional<Tensor>{});
+        } else {
+            q_lora = q_norm_->forward(rt,q_input);
+            q_raw = wq_b_->forward(rt,q_lora);
+        }
+        q_raw = q_raw->view({rows,heads_,kV4HeadDim});
         const auto eps = static_cast<float>(eps_);
         auto q = normalize_query_and_rotate(rt, q_raw, q_ones_, eps, batch.position, frequencies);
-        write_swa(rt,x,batch,cache,frequencies);
+        if (prefill_input_i8) {
+            swa_key = project_prefill(*wkv_);
+        }
+        if (swa_key) {
+            store_swa_rows(rt,swa_key,kv_norm_fp32_,batch.position,frequencies,batch.swa_slots,eps,cache.swa);
+        } else {
+            write_swa(rt,x,batch,cache,frequencies);
+        }
         Tensor indices, lengths;
         if (ratio_ == 4) {
-            compressor_->store_paged(rt,x,batch.c4_sources,batch.c4_state_slots,
-                                     cache.compressor_state,batch.c4_positions,frequencies,
-                                     batch.query_offsets,batch.c4_slots,cache.compressed,kV4PageSize/4,
+            const auto &compact = batch.c4_prefill_store;
+            compressor_->store_paged(rt,x,compact ? compact->sources : batch.c4_sources,
+                                     batch.c4_state_slots,cache.compressor_state,
+                                     compact ? compact->positions : batch.c4_positions,
+                                     frequencies,batch.query_offsets,
+                                     compact ? compact->slots : batch.c4_slots,cache.compressed,kV4PageSize/4,
                                      batch.packed_compressor_projection);
-            auto key = index_compressor_->forward(rt,x,batch.c4_sources,batch.c4_state_slots,
-                                                 cache.indexer_state,batch.c4_positions,frequencies,
-                                                 batch.query_offsets,batch.packed_compressor_projection);
-            key = cast(rt,key,DataType::kBFloat16);
+            auto key = index_compressor_->forward_index_key(
+                rt, x, batch.c4_sources, batch.c4_state_slots, cache.indexer_state,
+                batch.c4_positions, frequencies, batch.query_offsets,
+                batch.packed_compressor_projection, batch.fuse_c4_index_key);
             if (batch.short_c4_index) {
                 // This table is too short for scoring. The key still updates the cache.
                 auto query = key->view({rows, 1, kC4IndexWidth});
@@ -512,6 +813,23 @@ public:
                 indices = batch.c4_score_plan
                     ? index_balanced(rt, x, q_lora, key, batch, cache.indexer, frequencies)
                     : index_sharded(rt, x, q_lora, key, batch, cache.indexer, frequencies);
+            } else if (batch.c4_decode_row_shard && tp_size_ == 8 && index_heads_ == 64) {
+                // Each rank publishes the compressed key for every live row.
+                // Project and score only the query that this rank owns.
+                const RequestRows row{tp_rank_ % rows, 1};
+                auto query_input = row.slice(q_lora);
+                auto query = index_query_->forward(rt, query_input)->view({1, index_heads_, kC4IndexWidth});
+                apply_rotary_tail(rt, query, row.slice(batch.position), frequencies);
+                auto weight_input = row.slice(x);
+                auto weights = index_weights_->forward(rt, weight_input);
+                auto local = Tensor::empty(rt, {1, kC4IndexTopK}, DataType::kInt32);
+                submit<infini::ops::DeepseekV4C4Index>(
+                    rt, key, batch.c4_slots, query, weights, row.slice(batch.page_table),
+                    row.slice(batch.c4_lengths), cache.indexer, local);
+                auto gathered = Tensor::empty(rt, {tp_size_, kC4IndexTopK}, DataType::kInt32);
+                engine::distributed::allgather_(rt, gathered, local, comm_);
+                // The extra ranks repeat valid work to keep the collective count fixed.
+                indices = RequestRows{0, rows}.slice(gathered);
             } else {
                 indices = Tensor::empty(rt, {rows, C4SequentialIndex::kMaxCandidates}, DataType::kInt32);
                 const auto begin = batch.c4_query_begin;
@@ -529,9 +847,9 @@ public:
                     return index_weights_->forward(rt, input);
                 });
                 // A positive scalar common to all candidates does not change top-k.
-                submit<infini::ops::DeepseekV4C4Index>(rt, key, batch.c4_slots, query, suffix(weights),
-                                                      batch.page_table, batch.c4_lengths,
-                                                      cache.indexer, indices);
+                submit<infini::ops::DeepseekV4C4Index>(
+                    rt, key, batch.c4_slots, query, suffix(weights), batch.page_table,
+                    batch.c4_lengths, cache.indexer, indices);
             }
             lengths = batch.c4_sparse_lengths;
         } else if (ratio_ == 128) {
@@ -548,25 +866,35 @@ public:
             lengths = batch.c128_lengths;
         }
         const auto attend = [&](const RequestRows &part) {
-            const auto &schedule = ratio_ == 4 && batch.reuse_c4_flashmla_schedule
+            const auto &schedule = ratio_ == 4 && batch.reuse_c4_flashmla_schedule && !batch.packed_c4_flashmla
                 ? batch.c4_flashmla_schedules.at(part.first)
                 : batch.flashmla_schedules[flashmla_schedule_index(ratio_)];
             return sparse_mla(rt, part.slice(q), cache, part.slice(batch.swa_indices),
                               part.slice(batch.swa_lengths), sink_, part.slice(indices),
-                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)), schedule);
+                              part.slice(lengths), 1.0 / std::sqrt(double(kV4HeadDim)), schedule,
+                              batch.first_prefill_page,batch.prefill_pages);
         };
         Tensor packed_attention;
         std::vector<std::pair<size_t, Tensor>> prefill_attention_parts;
-        // C4 can repartition the FP32 split-KV reduction when the batch grows.
-        // Packed decode MLA is limited to the tested SWA and C128 geometries.
+        // The optional independent FlashMLA schedules preserve a separate split per query.
         const bool packable_decode_mla = q->dtype() == DataType::kBFloat16 && heads_ == 8 &&
             tp_size_ == 8 && (ratio_ == 0 || ratio_ == 128);
-        if (batch.packed_decode_mla && packable_decode_mla) {
+        const auto* prefill_mla_reference = std::getenv("INFINILM_DSV4_PREFILL_MLA_REFERENCE");
+        const std::string_view prefill_mla_mode = prefill_mla_reference ? prefill_mla_reference : "";
+        const bool packed_prefill_reference = rt.device().type() == runtime::Device::Type::kHygon &&
+            !rt.isGraphRecording() && !batch.packed_decode && q->dtype() == DataType::kBFloat16 &&
+            heads_ == 8 && tp_size_ == 8 && batch.query_offsets.size() > 2 && rows <= 8192 &&
+            (prefill_mla_mode == "all" || (prefill_mla_mode == "swa" && ratio_ == 0));
+        if (packed_prefill_reference ||
+            (packable_decode_mla && (batch.packed_decode_mla || batch.packed_all_flashmla)) ||
+            (ratio_ == 4 && batch.packed_c4_flashmla)) {
             packed_attention = attend({0, rows});
         } else if (rt.device().type() == runtime::Device::Type::kHygon && !rt.isGraphRecording()
-            && q->dtype() == DataType::kBFloat16 && heads_ == 8 && tp_size_ == 8
+            && !batch.packed_decode && q->dtype() == DataType::kBFloat16 && heads_ == 8 && tp_size_ == 8
             && batch.query_offsets.size() > 2) {
-            constexpr size_t min_request_rows = 4096;
+            // Prefer the wide Hygon kernel once enough prefill rows can share the launch.
+            const size_t min_request_rows = env_enabled("INFINILM_DSV4_PACK_MEDIUM_PREFILL_MLA") ? 1024 : 4096;
+            constexpr size_t min_group_rows = 4096;
             constexpr size_t max_group_rows = 32768;
             const auto *setting = std::getenv("INFINILM_DSV4_PACKED_PREFILL_MLA");
             if (!setting || std::string_view(setting) != "0") {
@@ -574,13 +902,13 @@ public:
                 for_each_request(batch.query_offsets, [&](const RequestRows &part) {
                     long_requests = long_requests && part.count >= min_request_rows;
                 });
-                if (long_requests && rows <= max_group_rows) {
+                if (long_requests && rows >= min_group_rows && rows <= max_group_rows) {
                     packed_attention = attend({0, rows});
                 } else if (env_enabled("INFINILM_DSV4_PACKED_RAGGED_PREFILL_MLA")) {
                     std::vector<RequestRows> group;
                     size_t group_rows = 0;
                     const auto submit_group = [&] {
-                        if (group.size() >= 2) {
+                        if (group.size() >= 2 && group_rows >= min_group_rows) {
                             const auto &first = group.front();
                             const auto &last = group.back();
                             Tensor attended;
@@ -604,7 +932,8 @@ public:
                                 };
                                 attended = sparse_mla(rt, pack(q), cache, pack(batch.swa_indices),
                                                       pack(batch.swa_lengths), sink_, pack(indices),
-                                                      pack(lengths), 1.0 / std::sqrt(double(kV4HeadDim)), {});
+                                                      pack(lengths), 1.0 / std::sqrt(double(kV4HeadDim)), {},
+                                                      batch.first_prefill_page,batch.prefill_pages);
                             }
                             // Keep request order for RoPE and the shape-sensitive wo_a.
                             size_t offset = 0;
@@ -660,7 +989,13 @@ public:
             return attend(part);
         };
         Tensor local;
-        if (batch.direct_decode_wo_a && tp_size_ == 8 && heads_ == 8 &&
+        if (batch.batch_decode_wo_a && heads_ == 8 && tp_size_ == 8) {
+            auto attended = packed_attention ? packed_attention
+                : project_requests(rt, batch.query_offsets, attend_request);
+            apply_rotary_tail(rt, attended, batch.position, frequencies, true);
+            auto flat = attended->view({rows, heads_ * kV4HeadDim});
+            local = wo_a_->forward(rt, flat);
+        } else if (batch.direct_decode_wo_a && tp_size_ == 8 && heads_ == 8 &&
             wo_a_->weight()->size(0) == 1024) {
             const auto weight = wo_a_->weight()->contiguous(rt);
             local = Tensor::empty(rt, {rows, weight->size(0)}, weight->dtype());
@@ -690,7 +1025,42 @@ public:
                 return wo_a_->forward(rt, flattened);
             });
         }
-        auto contribution = static_cast<const nn::BaseLinear&>(*wo_b_).forward(rt,local);
+        Tensor contribution;
+        const bool widen_wo_b = batch.widen_wo_b_prefill && !rt.isGraphRecording() && rows >= 1024;
+        if ((widen_wo_b || batch.native_attention_matrix) &&
+            local->dtype() == DataType::kBFloat16 && local->is_contiguous() &&
+            local->size(1) == 1024 && wo_b_->weight()->size(0) == 4096 &&
+            wo_b_->alpha() == 1.0f && !wo_b_->has_bias() &&
+            wo_b_->weight()->dtype() == DataType::kInt8 && wo_b_->weight()->size(1) == 1024) {
+            auto input_i8 = Tensor::empty(rt,local->shape(),DataType::kInt8);
+            auto scale = Tensor::empty(rt,{rows,1},DataType::kFloat32);
+            contribution = Tensor::empty(rt,{rows,4096},
+                widen_wo_b ? DataType::kFloat32 : DataType::kBFloat16);
+            const auto weight = wo_b_->weight()->permute({1,0});
+            const auto weight_scale = wo_b_->get_parameter_ref("weight_scale").tensor();
+            using Op = infini::ops::I8Gemm;
+            infini::ops::DeepseekV4WoBFloatConfig prefill_config;
+            infini::ops::DeepseekV4WqBMatrixConfig decode_config;
+            auto &config = widen_wo_b ? static_cast<infini::ops::Config &>(prefill_config)
+                                     : static_cast<infini::ops::Config &>(decode_config);
+            config.set_implementation_index(Op::DefaultConfig(rt.device().type()).implementation_index());
+            submit<infini::ops::PerChannelQuantI8>(rt,local,input_i8,scale);
+            execution::submit<Op>(rt,execution::RecordingPolicy::DeviceOnly,config,
+                                  contribution,input_i8,scale,weight,weight_scale,std::optional<Tensor>{});
+            if (widen_wo_b) {
+                if (batch.scatter_attn_prefill) {
+                    return scatter_gather_attn_prefill(rt,contribution,comm_,batch.query_offsets);
+                }
+                return reduce_tp_rounded(rt,contribution,DataType::kBFloat16,comm_,batch.query_offsets,
+                                         batch.packed_decode_collectives || batch.packed_collectives);
+            }
+        } else {
+            contribution = static_cast<const nn::BaseLinear&>(*wo_b_).forward(rt,local);
+        }
+        if (batch.scatter_attn_prefill && !rt.isGraphRecording()) {
+            return scatter_gather_attn_prefill(rt,cast(rt,contribution,DataType::kFloat32),
+                                              comm_,batch.query_offsets);
+        }
         return reduce_tp(rt, contribution, comm_, batch.query_offsets,
                          batch.packed_decode_collectives || batch.packed_collectives);
     }
@@ -813,6 +1183,7 @@ private:
     double eps_;
     Tensor sink_, q_ones_, kv_norm_fp32_;
     std::shared_ptr<Linear> wq_a_, wkv_, index_query_, index_weights_;
+    Tensor joined_qkv_weight_, joined_qkv_scale_;
     std::shared_ptr<ColumnLinear> wq_b_, wo_a_;
     std::shared_ptr<RowLinear> wo_b_;
     std::shared_ptr<RMSNorm> q_norm_, kv_norm_;
@@ -931,6 +1302,28 @@ HyperConnectionMix run_mhc(Runtime &rt, const Tensor &x, const MixWeights &w,
         }
         return out;
     }
+    // The large prefill reference selects its MHC split over the entire token batch.
+    if (iterations > 0 && !batch.packed_decode && !rt.isGraphRecording() &&
+        rt.device().type() == runtime::Device::Type::kHygon &&
+        x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
+        rows >= 8192 && rows <= 65535 && streams == 4 && x->size(2) == 4096 &&
+        env_enabled("INFINIOPS_DSV4_MHC_WIDE_PREFILL_REFERENCE")) {
+        submit_mix(x, out.activation, out.post, out.combination);
+        return out;
+    }
+    if (iterations > 0 && batch.pack_mhc_prefill && !rt.isGraphRecording() &&
+        x->dtype() == DataType::kBFloat16 && x->is_contiguous() &&
+        rows <= 65535 && streams == 4 && x->size(2) == 4096) {
+        // Keep the original 32-way projection and occupancy for short requests.
+        bool all_tiled = true;
+        for_each_request(batch.query_offsets,[&](const RequestRows &part) {
+            all_tiled = all_tiled && part.count > 1024;
+        });
+        if (all_tiled) {
+            submit_mix(x,out.activation,out.post,out.combination);
+            return out;
+        }
+    }
     // Flash BF16 q2–q4 and packed M6–M12 use the same per-row reduction.
     // A contiguous row preserves the alignment of every owner slice.
     if (batch.packed_mhc_pre && rt.device().type() == runtime::Device::Type::kHygon && x->ndim() == 3 && x->dtype() == DataType::kBFloat16 && x->is_contiguous() && rows >= 6 && rows <= 12 && streams == 4 && x->size(2) == 4096) {
@@ -976,7 +1369,7 @@ public:
                    const BatchMetadata &batch, const LayerPagedCache &cache, const Tensor &frequencies,
                    size_t *packed_mhc_calls, bool cache_write_only) const {
         const auto attention = mix(rt, residual, attn_mix_, batch, packed_mhc_calls);
-        const auto normalized = attn_norm_->forward(rt, attention.activation);
+        const auto normalized = normalize_attention(rt, attention.activation, batch.vector_attention_rms);
         if (cache_write_only) {
             attn_->write_swa(rt, normalized, batch, cache, frequencies);
             return {};
@@ -989,6 +1382,21 @@ public:
     }
 
 private:
+    Tensor normalize_attention(Runtime &rt, const Tensor &activation, bool vector_rms) const {
+        if (!vector_rms || activation->dtype() != DataType::kBFloat16 ||
+            activation->ndim() != 2 || activation->size(1) != 4096) {
+            return attn_norm_->forward(rt, activation);
+        }
+        using Op = infini::ops::RmsNorm;
+        infini::ops::DeepseekV4AttentionRmsNormConfig config;
+        config.set_implementation_index(Op::DefaultConfig(rt.device().type()).implementation_index());
+        auto output = Tensor::empty(rt, activation->shape(), activation->dtype());
+        execution::submit<Op>(rt, execution::RecordingPolicy::DeviceOnly, config,
+                              activation, attn_norm_->weight(), float(attn_norm_->eps()), output);
+        INFINILM_TRACE_OP(RMSNorm, output);
+        return output;
+    }
+
     HyperConnectionMix mix(Runtime &rt, const Tensor &x, const MixWeights &w,
                            const BatchMetadata &batch, size_t *packed_mhc_calls) const {
         return run_mhc(rt, x, w, norm_eps_, mix_eps_, iterations_, batch, packed_mhc_calls);
@@ -1119,7 +1527,7 @@ public:
             throw std::invalid_argument("DeepSeek V4 requires initialized paged cache and eager input preparation");
         auto ids = (*input.input_ids)->view({(*input.input_ids)->numel()});
         PagedCacheWriteSet writes;
-        auto batch = make_batch(rt, input, cfg_.classic_mtp_target,
+        auto batch = make_batch(rt, input, cfg_.classic_mtp_target, cfg_.is_mtp, ctx.model_decode_barrier != nullptr,
                                 input.rollback_v4_cache ? &writes : nullptr);
         if (!ctx.model_decode_barrier || cfg_.is_mtp) {
             batch.packed_decode_mla = false;
@@ -1186,6 +1594,36 @@ public:
             batch.batched_decode_mhc_pre = batch.packed_decode_collectives && ids->numel() <= 8 &&
                 env_enabled("INFINILM_DSV4_BATCHED_MHC_PRE") &&
                 (batch.uniform_decode_positions || env_enabled("INFINILM_DSV4_RAGGED_MHC_PRE"));
+            const bool ordinary_hygon = !cfg_.is_mtp && !cfg_.classic_mtp_target &&
+                rt.device().type() == runtime::Device::Type::kHygon &&
+                batch.packed_decode && ids->numel() <= 8;
+            batch.packed_all_flashmla = ordinary_hygon && batch.packed_decode_collectives &&
+                batch.swa_indices->size(1) == 128 && batch.c128_indices->size(1) <= 512 &&
+                env_enabled("INFINIOPS_DSV4_MLA_ALL_SPLITS");
+            if (batch.packed_all_flashmla && env_enabled("INFINILM_DSV4_STABLE_PACKED_MLA_GRAPH")) {
+                // All-split MLA consumes the entire batch, so the request-local
+                // runs cannot contribute. Key the graph on the executed path.
+                batch.packed_decode_mla = true;
+                batch.partial_decode_mla_rows = 0;
+            }
+            batch.packed_c4_flashmla = batch.packed_all_flashmla && batch.reuse_c4_flashmla_schedule;
+            batch.c4_decode_row_shard = ordinary_hygon && batch.packed_decode_collectives &&
+                !batch.c4_sequential && batch.c4_query_begin == 0 &&
+                env_enabled("INFINILM_DSV4_C4_DECODE_ROW_SHARD");
+            batch.fuse_c4_index_key = ordinary_hygon && env_enabled("INFINILM_DSV4_FUSED_C4_INDEX_KEY");
+            batch.batch_decode_wo_a = ordinary_hygon && env_enabled("INFINILM_DSV4_WO_A_BATCH");
+            const auto qkv_rows = ids->numel();
+            const bool q_scale_first = env_enabled("INFINIOPS_DSV4_WQA_DECODE_SCALE_FIRST");
+            const bool kv_scale_first = env_enabled("INFINIOPS_DSV4_WKV_DECODE_SCALE_FIRST");
+            const bool qkv_epilogue_supported = qkv_rows == 1 ? q_scale_first == kv_scale_first :
+                qkv_rows <= 16 && env_enabled("INFINIOPS_DSV4_I8_DECODE_TILE");
+            batch.joined_decode_qkv = ordinary_hygon && qkv_epilogue_supported &&
+                env_enabled("INFINILM_DSV4_GRAPH_QKV_JOIN");
+            batch.joined_qkv_scale_first = batch.joined_decode_qkv && qkv_rows == 1 && q_scale_first;
+            batch.matrix_wq_b = ordinary_hygon && qkv_rows >= 4 &&
+                env_enabled("INFINILM_DSV4_WQ_B_MATRIX");
+            batch.native_attention_matrix = ordinary_hygon && qkv_rows >= 4 &&
+                env_enabled("INFINILM_DSV4_NATIVE_ATTN_MATRIX");
             const bool fused_greedy = ctx.model_decode_greedy && ids->numel() == 1;
             return decode(rt, std::move(ids), std::move(batch), *ctx.model_decode_barrier,
                           fused_greedy);
@@ -1400,6 +1838,21 @@ private:
         return result;
     }
 
+    RoutedExperts decode_shared_expert_route(Runtime &rt, size_t rows) const {
+        if (!decode_shared_experts_.weights || decode_shared_experts_.weights->size(0) < rows) {
+            const std::vector<float> ones(rows, 1.0f);
+            const std::vector<int64_t> zeros(rows, 0);
+            auto weights = Tensor::empty(rt, {rows, 1}, DataType::kFloat32);
+            auto indices = Tensor::empty(rt, {rows, 1}, DataType::kInt64);
+            rt.memcpyH2D(weights->data(), ones.data(), weights->nbytes(), false);
+            rt.memcpyH2D(indices->data(), zeros.data(), indices->nbytes(), false);
+            decode_shared_experts_ = {std::move(weights), std::move(indices)};
+        }
+        // Each plan retains its own slice if a later batch grows the backing buffer.
+        const RequestRows live{0, rows};
+        return {live.slice(decode_shared_experts_.weights), live.slice(decode_shared_experts_.indices)};
+    }
+
     Output decode(Runtime &rt, Tensor ids, BatchMetadata batch, engine::RankBarrier &barrier,
                   bool greedy, const Tensor &target_hc = {}, bool classic_mtp = false,
                   bool return_hc = false, bool packed_direct = false, bool draft_seed_graph = false) const {
@@ -1422,12 +1875,25 @@ private:
             if (!plan || plan->greedy != greedy || plan->return_hc != return_hc ||
                 plan->batch.packed_decode_collectives != batch.packed_decode_collectives ||
                 plan->batch.direct_decode_wo_a != batch.direct_decode_wo_a ||
+                plan->batch.batch_decode_wo_a != batch.batch_decode_wo_a ||
+                plan->batch.joined_decode_qkv != batch.joined_decode_qkv ||
+                plan->batch.joined_qkv_scale_first != batch.joined_qkv_scale_first ||
+                plan->batch.fuse_q_lora_quant != batch.fuse_q_lora_quant ||
+                plan->batch.matrix_wq_b != batch.matrix_wq_b ||
+                plan->batch.native_attention_matrix != batch.native_attention_matrix ||
+                plan->batch.vector_attention_rms != batch.vector_attention_rms ||
+                static_cast<bool>(plan->batch.packed_decode_metadata) !=
+                    static_cast<bool>(batch.packed_decode_metadata) ||
                 plan->batch.packed_moe_gate != batch.packed_moe_gate ||
                 plan->batch.packed_compressor_projection != batch.packed_compressor_projection ||
                 (batch.direct_decode_wo_a && batch.packed_decode_mla &&
                  plan->batch.uniform_decode_positions != batch.uniform_decode_positions) ||
                 plan->batch.packed_decode_mla != batch.packed_decode_mla ||
                 plan->batch.partial_decode_mla_rows != batch.partial_decode_mla_rows ||
+                plan->batch.packed_all_flashmla != batch.packed_all_flashmla ||
+                plan->batch.packed_c4_flashmla != batch.packed_c4_flashmla ||
+                plan->batch.c4_decode_row_shard != batch.c4_decode_row_shard ||
+                plan->batch.fuse_c4_index_key != batch.fuse_c4_index_key ||
                 plan->batch.c4_sequential != batch.c4_sequential ||
                 plan->batch.c4_query_begin != batch.c4_query_begin ||
                 plan->batch.query_offsets != batch.query_offsets ||
@@ -1471,10 +1937,15 @@ private:
                 recent.swap(previous);
             }
             recent->ids->copy_from(rt, ids);
-            const auto held = recent->batch.tensors();
-            for (size_t i = 0; i < held.size(); ++i) {
-                Tensor dest = *held[i];
-                dest->copy_from(rt, *incoming[i]);
+            if (batch.packed_decode_metadata) {
+                recent->batch.position->copy_from(rt,batch.position);
+                recent->batch.packed_decode_metadata->copy_from(rt,batch.packed_decode_metadata);
+            } else {
+                const auto held = recent->batch.tensors();
+                for (size_t i = 0; i < held.size(); ++i) {
+                    Tensor dest = *held[i];
+                    dest->copy_from(rt, *incoming[i]);
+                }
             }
             if (target_hc) {
                 recent->target_hc->copy_from(rt, target_hc);
@@ -1486,10 +1957,9 @@ private:
             // Keep the recorded pointers independent of caller-owned inputs.
             ids = copy_graph_tensor(rt, ids);
             batch.position = copy_graph_tensor(rt, batch.position);
-            // All layers use the same constant shared-expert route. Initialize it before
-            // capture to keep the Hygon Fill provider out of the decode graph.
+            // Keep constant shared-expert routes outside the lifetime of an individual Graph.
             if (!classic_mtp && batch.packed_decode && ids->numel() > 1) {
-                batch.shared_expert_route = make_shared_expert_route(rt, ids->numel());
+                batch.shared_expert_route = decode_shared_expert_route(rt, ids->numel());
             }
             DecodePlan candidate{std::move(ids), std::move(batch),
                                  copy_graph_tensor(rt, target_hc), {}, {}, {}, greedy, return_hc,
@@ -1497,7 +1967,7 @@ private:
             barrier.wait();
             rt.startGraphRecording(true);
             try {
-                if (candidate.batch.share_flashmla_schedule) {
+                if (candidate.batch.share_flashmla_schedule || candidate.batch.packed_all_flashmla) {
                     auto &stable = candidate.batch;
                     const auto swa_width = stable.swa_indices->size(1);
                     for (const auto ratio : cfg_.ratios) {
@@ -1516,7 +1986,16 @@ private:
                         ++candidate.flashmla_schedules_prepared;
                     }
                 }
-                if (candidate.batch.reuse_c4_flashmla_schedule) {
+                if (candidate.batch.packed_c4_flashmla) {
+                    auto &stable = candidate.batch;
+                    auto &c4_schedule = stable.flashmla_schedules[flashmla_schedule_index(4)];
+                    if (!c4_schedule) {
+                        c4_schedule = prepare_sparse_mla_schedule(
+                            rt, stable.swa_lengths, stable.swa_indices->size(1),
+                            stable.c4_sparse_lengths, kC4IndexTopK);
+                        ++candidate.flashmla_schedules_prepared;
+                    }
+                } else if (candidate.batch.reuse_c4_flashmla_schedule) {
                     auto &stable = candidate.batch;
                     // C4 keeps one-query partitions. Every C4 layer sees the same
                     // lengths, so each request can reuse its own scheduler output.
@@ -1560,9 +2039,14 @@ private:
         }
         recent->graph->run();
         if (!classic_mtp && sampling_rank_ && env_enabled("INFINILM_DSV4_GRAPH_PLAN_LOG")) {
-            std::fprintf(stderr, "DSV4_DECODE_PLAN %s rows=%zu slots=%zu operators=%zu\n",
+            std::fprintf(stderr, "DSV4_DECODE_PLAN %s rows=%zu slots=%zu operators=%zu "
+                                 "page_width=%zu c128_width=%zu c4_sequential=%d "
+                                 "packed_all=%d packed_mla=%d partial_mla=%u\n",
                          common_slots ? "hit" : "capture", recent->ids->numel(),
-                         plans.size(), report.operator_count);
+                         plans.size(), report.operator_count, recent->batch.page_table->size(1),
+                         recent->batch.c128_indices->size(1), static_cast<int>(recent->batch.c4_sequential),
+                         static_cast<int>(recent->batch.packed_all_flashmla),
+                         static_cast<int>(recent->batch.packed_decode_mla), recent->batch.partial_decode_mla_rows);
         }
         // Publish a new allocation from the recording worker's stream. Its
         // return-HC completion fence runs before the Draft consumes this tensor.
@@ -1596,6 +2080,7 @@ private:
     Tensor swa_rope_, compressed_rope_;
     // These graphs hold pointers to this model instance's current KV cache.
     // The two most recent shapes cover both sides of adjacent page boundaries.
+    mutable RoutedExperts decode_shared_experts_{};
     mutable std::array<std::optional<DecodePlan>, 2> decode_plans_;
     mutable std::array<std::optional<DecodePlan>, 2> mtp_decode_plans_;
     // State-only and publishing graphs have different operator lists.

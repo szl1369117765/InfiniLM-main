@@ -16,6 +16,13 @@ public:
                             const runtime::Tensor &cos_sin,
                             const std::vector<size_t> &query_offsets, bool packed_projection) const;
 
+    // Returns the C4 indexer's BF16 key with FP32 norm and rotary arithmetic.
+    runtime::Tensor forward_index_key(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                                      const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                                      const runtime::Tensor &state, const runtime::Tensor &positions,
+                                      const runtime::Tensor &cos_sin, const std::vector<size_t> &query_offsets,
+                                      bool packed_projection, bool fuse_norm_rope) const;
+
     void store_paged(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                      const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                      const runtime::Tensor &state, const runtime::Tensor &positions,

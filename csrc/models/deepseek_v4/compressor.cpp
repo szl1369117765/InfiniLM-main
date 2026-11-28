@@ -81,6 +81,30 @@ runtime::Tensor Compressor::forward(runtime::Runtime &runtime, const runtime::Te
     return kv;
 }
 
+runtime::Tensor Compressor::forward_index_key(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
+                                              const runtime::Tensor &sources, const runtime::Tensor &state_slots,
+                                              const runtime::Tensor &state, const runtime::Tensor &positions,
+                                              const runtime::Tensor &cos_sin, const std::vector<size_t> &query_offsets,
+                                              bool packed_projection, bool fuse_norm_rope) const {
+    using runtime::DataType;
+    if (fuse_norm_rope && head_dim_ == 128 && runtime.device().type() == runtime::Device::Type::kHygon) {
+        auto pooled = project_and_pool(runtime, hidden_states, sources, state_slots, state,
+                                       query_offsets, packed_projection);
+        auto key = runtime::Tensor::empty(runtime, pooled->shape(), DataType::kBFloat16);
+        using Op = infini::ops::DeepseekV4QueryNormRope;
+        execution::submit<Op>(runtime, execution::RecordingPolicy::DeviceOnly,
+                              Op::DefaultConfig(runtime.device().type()), pooled, norm_->weight(),
+                              positions, cos_sin, static_cast<float>(norm_->eps()), key);
+        return key;
+    }
+    auto kv = forward(runtime, hidden_states, sources, state_slots, state, positions, cos_sin,
+                      query_offsets, packed_projection);
+    auto key = runtime::Tensor::empty(runtime, kv->shape(), DataType::kBFloat16);
+    using Op = infini::ops::Cast;
+    execution::submit<Op>(runtime, Op::DefaultConfig(runtime.device().type()), kv, key);
+    return key;
+}
+
 void Compressor::store_paged(runtime::Runtime &runtime, const runtime::Tensor &hidden_states,
                              const runtime::Tensor &sources, const runtime::Tensor &state_slots,
                              const runtime::Tensor &state, const runtime::Tensor &positions,
